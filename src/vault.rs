@@ -1,6 +1,3 @@
-// TODO(T6): remove once Vault is wired into mask/proxy; pub API for later tasks.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 use zeroize::Zeroize;
@@ -50,6 +47,7 @@ impl Vault {
     }
 
     /// Longest sentinel currently registered (for the M1 streaming look-back buffer).
+    #[allow(dead_code)] // reserved for M1 streaming restore
     pub fn max_sentinel_len(&self) -> usize {
         self.inner
             .lock()
