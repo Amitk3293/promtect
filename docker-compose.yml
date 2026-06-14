@@ -1,0 +1,11 @@
+services:
+  airlock:
+    image: ghcr.io/amitk3293/airlock-ai:latest
+    build: .
+    ports:
+      - "127.0.0.1:8787:8787"   # loopback only — do NOT change to "8787:8787" (LAN exposure)
+    environment:
+      AIRLOCK_BIND: "0.0.0.0"        # safe: only reachable via the 127.0.0.1-published port above
+      AIRLOCK_UPSTREAM: "https://api.anthropic.com"
+      AIRLOCK_AUDIT: "/home/nonroot/airlock-audit.jsonl"
+    restart: unless-stopped
