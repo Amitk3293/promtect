@@ -1,4 +1,4 @@
-// Items are public API consumed by later tasks (mask, proxy); suppress until wired up.
+// TODO(T6): remove once detect() is wired into mask/proxy; these items are public API for later tasks.
 #![allow(dead_code)]
 
 use regex::Regex;
@@ -85,7 +85,7 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
     fn d(kind: &'static str, pat: &str) -> RegexDetector {
         RegexDetector {
             kind,
-            re: Regex::new(pat).unwrap(),
+            re: Regex::new(pat).expect(kind),
             group: 0,
             guard: false,
         }
@@ -93,7 +93,7 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
     fn dg(kind: &'static str, pat: &str, group: usize, guard: bool) -> RegexDetector {
         RegexDetector {
             kind,
-            re: Regex::new(pat).unwrap(),
+            re: Regex::new(pat).expect(kind),
             group,
             guard,
         }
@@ -231,5 +231,13 @@ mod tests {
     #[test]
     fn ignores_plain_prose() {
         assert!(detect("the quick brown fox jumps over the lazy dog").is_empty());
+    }
+
+    #[test]
+    fn dedup_collapses_overlapping_matches() {
+        // env_secret captures the value; anthropic_key matches the same token.
+        // dedupe_overlaps must keep exactly one hit, not both.
+        let text = "API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwx";
+        assert_eq!(detect(text).len(), 1);
     }
 }
