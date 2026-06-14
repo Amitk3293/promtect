@@ -170,9 +170,14 @@ async fn non_secret_body_passes_through_unchanged() {
 /// A dead upstream port causes Airlock to return HTTP 502 to the client.
 #[tokio::test]
 async fn upstream_error_returns_502() {
-    // Port 9 is the "discard" protocol — connections are refused on most systems.
+    // Reserve an ephemeral port, then drop the listener so the port is closed
+    // at test time — guarantees the upstream connection is refused (502) without
+    // depending on a specific well-known port being free/closed on the host.
+    let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = reserved.local_addr().unwrap();
+    drop(reserved);
     let dead_ctx = airlock::proxy::Ctx {
-        upstream: "http://127.0.0.1:9".to_string(),
+        upstream: format!("http://{dead_addr}"),
         vault: Arc::new(airlock::vault::Vault::new()),
         audit: Arc::new(airlock::audit::Audit::null()),
         client: reqwest::Client::new(),

@@ -16,6 +16,8 @@ struct Inner {
 }
 
 impl Vault {
+    /// Create an empty vault. Secrets are added lazily on first `sentinel_for` and
+    /// wiped on drop.
     pub fn new() -> Self {
         Vault {
             inner: Mutex::new(Inner::default()),
