@@ -49,9 +49,16 @@ async fn main() {
              on a host network — it would expose your secrets proxy to other machines."
         );
     }
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    println!(
-        "airlock listening on http://{addr} -> point ANTHROPIC_BASE_URL at the loopback-published port"
-    );
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| panic!("airlock: failed to bind {addr}: {e}"));
+    let hint = if is_loopback {
+        format!("http://{addr}")
+    } else {
+        format!("http://127.0.0.1:{port}")
+    };
+    println!("airlock listening on {addr} -> point ANTHROPIC_BASE_URL at {hint}");
+    axum::serve(listener, app)
+        .await
+        .expect("airlock: server error");
 }

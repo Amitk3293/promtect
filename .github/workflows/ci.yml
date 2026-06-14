@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, m0-spike, docker-packaging]
+    branches: [main]
   pull_request:
 
 jobs:

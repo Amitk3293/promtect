@@ -1,6 +1,6 @@
 services:
   airlock:
-    image: ghcr.io/amitk3293/airlock-ai:latest
+    image: ghcr.io/amitk3293/airlock-ai:latest   # prebuilt (public at M1); until then use: docker compose up --build
     build: .
     ports:
       - "127.0.0.1:8787:8787"   # loopback only — do NOT change to "8787:8787" (LAN exposure)
@@ -8,4 +8,9 @@ services:
       AIRLOCK_BIND: "0.0.0.0"        # safe: only reachable via the 127.0.0.1-published port above
       AIRLOCK_UPSTREAM: "https://api.anthropic.com"
       AIRLOCK_AUDIT: "/home/nonroot/airlock-audit.jsonl"
+    volumes:
+      - airlock-audit:/home/nonroot
     restart: unless-stopped
+
+volumes:
+  airlock-audit:
