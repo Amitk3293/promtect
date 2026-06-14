@@ -20,8 +20,14 @@ pub fn mask_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) -> 
 
 /// Replace every known sentinel in `text` with its real secret.
 pub fn restore_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) -> String {
+    // De-duplicate tokens first: `find_sentinels` yields a token once per
+    // occurrence, but `str::replace` already replaces ALL occurrences in one
+    // pass. Without dedup, a sentinel appearing N times would log N-1 redundant
+    // no-op `unmask` events. A HashSet collapses them so each distinct sentinel
+    // is restored — and audited — exactly once.
+    let unique: std::collections::HashSet<String> = find_sentinels(text).into_iter().collect();
     let mut out = text.to_string();
-    for token in find_sentinels(text) {
+    for token in unique {
         if let Some(secret) = vault.secret_for(&token) {
             out = out.replace(&token, &secret);
             audit.record("unmask", "sentinel", &token, request_id);
@@ -82,5 +88,52 @@ mod tests {
     #[test]
     fn selftest_passes() {
         assert!(selftest());
+    }
+
+    /// restore_text must write exactly ONE `unmask` audit event per distinct
+    /// sentinel even when that sentinel appears multiple times in the text, and
+    /// the event must record the placeholder id only — never the real secret.
+    /// (Covers FIX 4: de-duplicated audit logging, and FIX 5: unmask event is
+    /// actually emitted and value-free.)
+    #[test]
+    fn restore_logs_one_unmask_event_per_sentinel_without_secret() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("airlock-unmask-{}.jsonl", uuid::Uuid::new_v4()));
+
+        let vault = Vault::new();
+        let audit = Audit::to_file(path.clone());
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+
+        // Register the secret and learn its sentinel via the normal mask path.
+        let masked = mask_text(&format!("key={secret}"), &vault, &audit, "reqX");
+        let sentinel = find_sentinels(&masked)
+            .into_iter()
+            .next()
+            .expect("mask must produce a sentinel");
+
+        // Build text containing the SAME sentinel twice; str::replace handles both
+        // occurrences in one pass, so only one audit event should be recorded.
+        let twice = format!("a {sentinel} b {sentinel} c");
+        let restored = restore_text(&twice, &vault, &audit, "reqX");
+
+        // Both occurrences are expanded back to the real secret.
+        assert_eq!(restored.matches(secret).count(), 2);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Exactly one unmask event for this sentinel — no duplicate no-op records.
+        let unmask_lines = contents.matches("\"action\":\"unmask\"").count();
+        assert_eq!(unmask_lines, 1, "expected exactly one unmask event");
+        // The placeholder id is logged...
+        assert!(
+            contents.contains(&sentinel),
+            "unmask must log the sentinel id"
+        );
+        // ...but the real secret value is NEVER logged.
+        assert!(
+            !contents.contains(secret),
+            "audit must not log the secret value"
+        );
     }
 }

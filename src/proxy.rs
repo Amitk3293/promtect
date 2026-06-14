@@ -10,12 +10,18 @@ use axum::{
 };
 use std::sync::Arc;
 
-/// Shared, cheaply-clonable per-request context for the proxy pipeline:
-/// the upstream base URL, the secret vault, the audit log, and the outbound client.
+/// Shared, cheaply-clonable process-wide context for the proxy pipeline: the
+/// upstream base URL, the (append-only, process-wide) audit log, and the outbound
+/// client.
+///
+/// NOTE: there is deliberately NO vault here. The vault is created fresh per
+/// request inside [`handle`] — a single shared vault would let a sentinel minted
+/// in one request restore a secret belonging to a *different* request
+/// (cross-request secret bleed). Scoping the vault to one request makes that
+/// impossible by construction.
 #[derive(Clone)]
 pub struct Ctx {
     pub upstream: String,
-    pub vault: Arc<Vault>,
     pub audit: Arc<Audit>,
     pub client: reqwest::Client,
 }
@@ -37,11 +43,16 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
         .unwrap_or_default();
     let body_text = String::from_utf8_lossy(&body_bytes).to_string();
 
+    // INVARIANT: one vault per request. The same `&vault` masks the outbound body
+    // and restores the inbound response, so only sentinels minted *for this
+    // request* can ever be expanded back into a secret — no cross-request bleed.
+    let vault = Vault::new();
+
     // Mask request body content. Auth headers forwarded untouched in forward().
-    let masked = mask_text(&body_text, &ctx.vault, &ctx.audit, &request_id);
+    let masked = mask_text(&body_text, &vault, &ctx.audit, &request_id);
 
     match forward(&ctx, method, &uri, &headers, masked.into_bytes()).await {
-        Ok(r) => restore_response(r, &ctx, &request_id).await,
+        Ok(r) => restore_response(r, &ctx, &vault, &request_id).await,
         Err(e) => Response::builder()
             .status(502)
             .body(Body::from(format!("airlock upstream error: {e}")))
@@ -73,13 +84,19 @@ async fn forward(
     builder.send().await
 }
 
-async fn restore_response(r: reqwest::Response, ctx: &Ctx, request_id: &str) -> Response {
+async fn restore_response(
+    r: reqwest::Response,
+    ctx: &Ctx,
+    vault: &Vault,
+    request_id: &str,
+) -> Response {
     let status = r.status();
     let resp_headers = r.headers().clone();
 
     let bytes = r.bytes().await.unwrap_or_default();
     let text = String::from_utf8_lossy(&bytes).to_string();
-    let restored = restore_text(&text, &ctx.vault, &ctx.audit, request_id);
+    // Restore against the SAME per-request vault that did the masking above.
+    let restored = restore_text(&text, vault, &ctx.audit, request_id);
 
     let mut out = Response::builder().status(status);
     for (name, value) in resp_headers.iter() {

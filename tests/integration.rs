@@ -40,7 +40,6 @@ async fn canary_secret_never_reaches_upstream() {
     use airlock::proxy::{Ctx, app};
     let ctx = Ctx {
         upstream: upstream_url.clone(),
-        vault: Arc::new(airlock::vault::Vault::new()),
         audit: Arc::new(airlock::audit::Audit::null()),
         client: reqwest::Client::new(),
     };
