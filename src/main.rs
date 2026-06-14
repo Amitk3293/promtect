@@ -46,9 +46,18 @@ async fn main() {
             audit_path: std::sync::Arc::new(audit_path.into()),
         });
         let addr = format!("{bind}:{port}");
-        let listener = tokio::net::TcpListener::bind(&addr)
-            .await
-            .unwrap_or_else(|e| panic!("airlock dashboard: failed to bind {addr}: {e}"));
+        // Graceful exit (not a panic/backtrace) when the port is taken — a common,
+        // recoverable misconfiguration deserves a clear message, not a crash.
+        let listener = match tokio::net::TcpListener::bind(&addr).await {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!(
+                    "airlock dashboard: cannot bind {addr} ({e}).\n\
+                     That port is already in use — set AIRLOCK_DASHBOARD_PORT to a free port and retry."
+                );
+                std::process::exit(1);
+            }
+        };
         println!(
             "airlock dashboard on http://{}:{port}  (UI: /, JSON: /api/metrics, Prometheus: /metrics)",
             if airlock::net::is_loopback(&bind) {
@@ -90,9 +99,17 @@ async fn main() {
              on a host network — it would expose your secrets proxy to other machines."
         );
     }
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap_or_else(|e| panic!("airlock: failed to bind {addr}: {e}"));
+    // Graceful exit (not a panic/backtrace) when the port is taken.
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "airlock: cannot bind {addr} ({e}).\n\
+                 That port is already in use — set AIRLOCK_PORT to a free port and retry."
+            );
+            std::process::exit(1);
+        }
+    };
     let hint = if is_loopback {
         format!("http://{addr}")
     } else {
