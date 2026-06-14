@@ -237,4 +237,58 @@ mod tests {
         let text = "API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwx";
         assert_eq!(detect(text).len(), 1);
     }
+
+    /// Helper: does `detect(text)` produce any match of the given kind?
+    fn has_kind(text: &str, kind: &str) -> bool {
+        detect(text).iter().any(|m| m.kind == kind)
+    }
+
+    #[test]
+    fn detects_each_provider_token_kind() {
+        // Invariant: each provider detector fires on a valid-shaped synthetic token.
+        let github_token = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"; // ghp_ + 36
+        assert!(has_kind(github_token, "github_token"), "github_token");
+
+        let github_pat = format!("github_pat_{}", "A".repeat(82)); // github_pat_ + 82
+        assert!(has_kind(&github_pat, "github_pat"), "github_pat");
+
+        let gitlab_pat = "glpat-ABCDEFGHIJKLMNOPQRST"; // glpat- + 20
+        assert!(has_kind(gitlab_pat, "gitlab_pat"), "gitlab_pat");
+
+        assert!(has_kind("xoxb-1234567890", "slack_token"), "slack_token");
+        assert!(has_kind("xapp-1234567890", "slack_app"), "slack_app");
+
+        let google_api = "AIzaSyA1234567890abcdefghijklmnopqrstuv"; // AIza + 35
+        assert!(has_kind(google_api, "google_api"), "google_api");
+
+        let sendgrid_key = format!("SG.{}.{}", "A".repeat(22), "B".repeat(43));
+        assert!(has_kind(&sendgrid_key, "sendgrid_key"), "sendgrid_key");
+
+        let hf_token = format!("hf_{}", "A".repeat(34));
+        assert!(has_kind(&hf_token, "hf_token"), "hf_token");
+
+        let npm_token = format!("npm_{}", "A".repeat(36));
+        assert!(has_kind(&npm_token, "npm_token"), "npm_token");
+
+        let stripe_key = format!("sk_live_{}", "A".repeat(24));
+        assert!(has_kind(&stripe_key, "stripe_key"), "stripe_key");
+
+        let openai_key = format!("sk-proj-{}", "A".repeat(20));
+        assert!(has_kind(&openai_key, "openai_key"), "openai_key");
+
+        let anthropic_key = format!("sk-ant-{}", "a".repeat(20));
+        assert!(has_kind(&anthropic_key, "anthropic_key"), "anthropic_key");
+
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.ABCDEFGHIJ_signature_pad";
+        assert!(has_kind(jwt, "jwt"), "jwt");
+    }
+
+    #[test]
+    fn ignores_innocuous_text() {
+        // Invariant: common log/prose strings never trigger any detector.
+        assert!(detect("the build finished in 1.23s").is_empty());
+        assert!(detect("GET /api/users?id=42").is_empty());
+        assert!(detect("version 1.2.3 released").is_empty());
+        assert!(detect("lorem ipsum dolor sit amet").is_empty());
+    }
 }
