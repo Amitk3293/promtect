@@ -298,4 +298,67 @@ mod tests {
         let got = run_chunked(Arc::clone(&vault), body.as_bytes(), 2);
         assert_eq!(String::from_utf8(got).unwrap(), body);
     }
+
+    #[test]
+    fn empty_input_is_handled() {
+        let (vault, _s) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
+        let mut sr = StreamRestorer::new(vault, Audit::null().into(), "r".into());
+        assert!(sr.push(b"").is_empty());
+        assert!(sr.finish().is_empty());
+    }
+
+    /// Two sentinels back-to-back (no separator) must each restore correctly at
+    /// EVERY split point — including a cut landing exactly between `»` and `«`.
+    #[test]
+    fn adjacent_sentinels_split_at_boundary_restore() {
+        let vault = Arc::new(Vault::new());
+        let s1 = vault.sentinel_for("aws_key", "AKIAIOSFODNN7EXAMPLE");
+        let s2 = vault.sentinel_for("anthropic_key", "sk-ant-api03-secretvalue123456");
+        let body = format!("{s1}{s2}");
+        let expected = restore_text(&body, &vault, &Audit::null(), "r");
+        for size in 1..=body.len() {
+            let got = run_chunked(Arc::clone(&vault), body.as_bytes(), size);
+            assert_eq!(
+                String::from_utf8(got).unwrap(),
+                expected,
+                "mismatch at chunk size {size}"
+            );
+        }
+        assert!(expected.contains("AKIAIOSFODNN7EXAMPLE"));
+        assert!(expected.contains("sk-ant-api03-secretvalue123456"));
+        assert!(!expected.contains("«promtect:"));
+    }
+
+    /// On a mid-stream upstream error with bytes still HELD in the carry, those
+    /// bytes are flushed (emitted verbatim) BEFORE the error — never silently
+    /// dropped — exercising the `St::Erroring` path.
+    #[tokio::test]
+    async fn upstream_error_flushes_held_carry_then_errors() {
+        #[derive(Debug)]
+        struct TestErr;
+        let (vault, _s) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
+        let sr = StreamRestorer::new(vault, Audit::null().into(), "r".into());
+        // First chunk opens a sentinel that is held in carry; then the error.
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, TestErr>(Bytes::from("x «promtect:aws_key:00")),
+            Err(TestErr),
+        ])
+        .boxed();
+        let items: Vec<Result<Bytes, TestErr>> = restore_stream(upstream, sr).collect().await;
+
+        assert!(
+            matches!(items.last(), Some(Err(_))),
+            "must end with the error"
+        );
+        let emitted: Vec<u8> = items
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .flat_map(|b| b.to_vec())
+            .collect();
+        assert_eq!(
+            String::from_utf8(emitted).unwrap(),
+            "x «promtect:aws_key:00",
+            "held carry bytes must be flushed, not dropped, before the error"
+        );
+    }
 }

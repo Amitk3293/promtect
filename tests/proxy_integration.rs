@@ -650,3 +650,109 @@ async fn binary_response_is_not_restored() {
         "binary response must not have the secret re-inserted: {text:?}"
     );
 }
+
+// ── Response encoding + method/empty-body handling ──────────────────────────
+
+/// Mock that echoes the request body back labelled `content-encoding: gzip`
+/// (the bytes aren't really gzipped — we only need the header present).
+async fn mock_compressed(State(seen): State<Seen>, body: String) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    axum::response::Response::builder()
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn spawn_compressed_mock() -> (String, Seen) {
+    let seen = Seen::default();
+    let app = Router::new()
+        .route("/", post(mock_compressed))
+        .with_state(seen.clone());
+    (spawn(app).await, seen)
+}
+
+/// A compressed (content-encoding) response is streamed through verbatim — NOT
+/// run through the restorer (which would scan ciphertext) — and keeps its
+/// content-encoding header so the client can still decode it.
+#[tokio::test]
+async fn compressed_response_is_passed_through_not_restored() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"{aws}"}}"#);
+
+    let (mock_url, _seen) = spawn_compressed_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let enc = resp
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let text = resp.text().await.unwrap();
+
+    assert_eq!(
+        enc.as_deref(),
+        Some("gzip"),
+        "content-encoding must be preserved for the client to decode"
+    );
+    assert!(
+        text.contains("«promtect:aws_key:"),
+        "a compressed response must NOT be restored: {text:?}"
+    );
+    assert!(!text.contains(aws));
+}
+
+/// Echo mock that accepts ANY method and records "<METHOD> <body>".
+async fn mock_any(
+    State(seen): State<Seen>,
+    method: axum::http::Method,
+    body: String,
+) -> Json<Value> {
+    *seen.body.lock().unwrap() = format!("{method} {body}");
+    Json(json!({ "ok": true }))
+}
+
+async fn spawn_any_mock() -> (String, Seen) {
+    let seen = Seen::default();
+    let app = Router::new().fallback(mock_any).with_state(seen.clone());
+    (spawn(app).await, seen)
+}
+
+/// A GET request (no body) and a POST with an empty body both proxy cleanly —
+/// the method is forwarded and an empty body never panics or 413s.
+#[tokio::test]
+async fn get_and_empty_body_requests_are_handled() {
+    let (mock_url, seen) = spawn_any_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+    let client = reqwest::Client::new();
+
+    // GET, no body → method forwarded.
+    let resp = client.get(format!("{promtect_url}/")).send().await.unwrap();
+    assert!(resp.status().is_success());
+    assert!(
+        seen.body.lock().unwrap().starts_with("GET"),
+        "GET method must be forwarded"
+    );
+
+    // POST with an empty body → success, upstream sees an empty body.
+    let resp = client
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body("")
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    assert_eq!(
+        seen.body.lock().unwrap().as_str(),
+        "POST ",
+        "empty POST body must forward as empty"
+    );
+}
