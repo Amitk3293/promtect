@@ -39,8 +39,19 @@ async fn main() {
     };
 
     let app = proxy::app(ctx);
-    let addr = format!("127.0.0.1:{port}");
+    let bind = std::env::var("AIRLOCK_BIND").unwrap_or_else(|_| "127.0.0.1".into());
+    let addr = format!("{bind}:{port}");
+    let is_loopback = bind == "127.0.0.1" || bind == "::1" || bind == "localhost";
+    if !is_loopback {
+        eprintln!(
+            "WARNING: airlock is binding a non-loopback address ({bind}). This is only safe \
+             inside a container whose port is published to 127.0.0.1. Do NOT run this directly \
+             on a host network — it would expose your secrets proxy to other machines."
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    println!("airlock listening on http://{addr} -> set ANTHROPIC_BASE_URL to it");
+    println!(
+        "airlock listening on http://{addr} -> point ANTHROPIC_BASE_URL at the loopback-published port"
+    );
     axum::serve(listener, app).await.unwrap();
 }
