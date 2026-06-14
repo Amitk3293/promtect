@@ -90,36 +90,20 @@ async fn main() {
     let audit_path =
         std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
 
-    // Operator-tunable body cap; defaults to 32 MiB. Bounds the memory a single
-    // request can force Promtect to buffer while scanning for secrets. Fail closed
-    // on a present-but-invalid value (or 0) rather than silently reverting to the
-    // default — an operator who lowered the cap shouldn't get the large default
-    // because of a typo, and 0 would reject every request.
-    let max_body_bytes: usize = match std::env::var("PROMTECT_MAX_BODY_BYTES") {
-        Err(_) => proxy::DEFAULT_MAX_BODY_BYTES,
-        Ok(s) => match s.trim().parse::<usize>() {
-            Ok(n) if n > 0 => n,
-            _ => {
-                eprintln!(
-                    "promtect: PROMTECT_MAX_BODY_BYTES must be a positive integer (got {s:?})"
-                );
+    // Operator-tunable body cap (default 32 MiB); fail closed on an invalid value.
+    let max_body_bytes =
+        match proxy::parse_max_body_bytes(std::env::var("PROMTECT_MAX_BODY_BYTES").ok().as_deref())
+        {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("promtect: {e}");
                 std::process::exit(1);
             }
-        },
-    };
+        };
 
-    // Restore real secrets in the response (transparent mode) by default. Set
-    // PROMTECT_RESTORE to a falsey value for strict mode, where the masked body
-    // is forwarded verbatim and secrets never re-enter the response.
-    let restore = std::env::var("PROMTECT_RESTORE")
-        .ok()
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
-        .unwrap_or(true);
+    // Restore secrets in the response (transparent mode) by default; PROMTECT_RESTORE
+    // falsey → strict mode (secrets never re-enter the response).
+    let restore = proxy::parse_restore(std::env::var("PROMTECT_RESTORE").ok().as_deref());
 
     let upstream_for_log = upstream.clone();
     let ctx = Ctx {

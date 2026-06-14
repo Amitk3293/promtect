@@ -447,13 +447,12 @@ mod tests {
         assert!(has_kind(jwt, "jwt"), "jwt");
     }
 
-    /// Every extended (Phase 3) detector fires on a synthetic token of its shape.
-    /// Synthetic values are structural only — they are not real credentials.
-    #[test]
-    fn detects_each_extended_kind() {
+    /// Synthetic (structural, NOT real) tokens for every extended detector, paired
+    /// with the kind each must report. Shared by the detection and no-leak tests.
+    fn extended_kind_cases() -> Vec<(String, &'static str)> {
         let a = |n: usize| "A".repeat(n); // alphanumeric filler
         let h = |n: usize| "a".repeat(n); // hex-safe filler
-        let cases: Vec<(String, &str)> = vec![
+        vec![
             (format!("gsk_{}", a(40)), "groq_key"),
             (format!("sk-or-v1-{}", h(40)), "openrouter_key"),
             (format!("r8_{}", a(32)), "replicate_key"),
@@ -527,10 +526,68 @@ mod tests {
                     .to_string(),
                 "teams_webhook",
             ),
-        ];
-        for (token, kind) in &cases {
+        ]
+    }
+
+    /// Every extended (Phase 3) detector fires on a synthetic token of its shape.
+    #[test]
+    fn detects_each_extended_kind() {
+        for (token, kind) in &extended_kind_cases() {
             assert!(has_kind(token, kind), "{kind} did not fire on {token}");
         }
+    }
+
+    /// NO-LEAK: every extended detector not only *fires* but actually *masks* — the
+    /// secret value is absent from the masked output and a sentinel replaces it.
+    /// Detection with a wrong span/capture-group would still leak; this proves the
+    /// no-leak invariant for every detector, not just the three the property test
+    /// exercises.
+    #[test]
+    fn masking_removes_every_extended_kind() {
+        use crate::audit::Audit;
+        use crate::mask::mask_text;
+        use crate::vault::Vault;
+        for (token, kind) in &extended_kind_cases() {
+            let vault = Vault::new();
+            let masked = mask_text(token, &vault, &Audit::null(), "r");
+            assert!(
+                !masked.contains(token.as_str()),
+                "{kind}: secret survived masking — {masked:?}"
+            );
+            assert!(
+                masked.contains("«promtect:"),
+                "{kind}: nothing was masked — {masked:?}"
+            );
+        }
+    }
+
+    /// Overlapping detectors must resolve to the RIGHT kind with the FULL span —
+    /// a wrong winner with a shorter/shifted span would leak the uncovered prefix.
+    #[test]
+    fn detector_precedence_on_overlaps() {
+        // A Mapbox secret token embeds a single `eyJ…` segment; it must report
+        // `mapbox_token` over `jwt`, covering the `sk.` prefix (not starting at eyJ).
+        let mapbox = format!("sk.eyJ{}.{}", "A".repeat(20), "B".repeat(20));
+        let hits = detect(&mapbox);
+        assert_eq!(hits.len(), 1, "mapbox overlap not deduped: {hits:?}");
+        assert_eq!(
+            hits[0].kind, "mapbox_token",
+            "mapbox lost to {}",
+            hits[0].kind
+        );
+        assert_eq!(
+            &mapbox[hits[0].start..hits[0].end],
+            mapbox,
+            "span must cover the whole token including the sk. prefix"
+        );
+
+        // An OpenRouter key shares the `sk-` lead with openai_key but the hyphens
+        // mean openai_key cannot match; it must report `openrouter_key` in full.
+        let openrouter = format!("sk-or-v1-{}", "a".repeat(40));
+        let hits = detect(&openrouter);
+        assert_eq!(hits.len(), 1, "openrouter overlap not deduped: {hits:?}");
+        assert_eq!(hits[0].kind, "openrouter_key");
+        assert_eq!(&openrouter[hits[0].start..hits[0].end], openrouter);
     }
 
     /// The OSS registry ships broad coverage of known credential formats.

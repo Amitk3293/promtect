@@ -96,6 +96,33 @@ pub fn resolve_upstream(
     }
 }
 
+/// Parse `PROMTECT_RESTORE`. Restore is on by default; only an explicit falsey
+/// value (`0`/`false`/`no`/`off`, case-insensitive) disables it (strict mode).
+pub fn parse_restore(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => true,
+    }
+}
+
+/// Parse `PROMTECT_MAX_BODY_BYTES`. Unset → the default. A present-but-invalid
+/// value (non-numeric, or `0`) is an error — we fail closed rather than silently
+/// reverting to the large default, which would defeat an operator who lowered it.
+pub fn parse_max_body_bytes(value: Option<&str>) -> Result<usize, String> {
+    match value {
+        None => Ok(DEFAULT_MAX_BODY_BYTES),
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "PROMTECT_MAX_BODY_BYTES must be a positive integer (got {s:?})"
+            )),
+        },
+    }
+}
+
 async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().clone();
@@ -359,5 +386,33 @@ mod tests {
         let err = resolve_upstream(Some("gemini"), None).unwrap_err();
         assert!(err.contains("unknown PROMTECT_MODE"));
         assert!(err.contains("gemini"));
+    }
+
+    #[test]
+    fn parse_restore_default_on_and_falsey_off() {
+        assert!(super::parse_restore(None));
+        assert!(super::parse_restore(Some("true")));
+        assert!(super::parse_restore(Some("1")));
+        assert!(super::parse_restore(Some("whatever")));
+        for falsey in ["0", "false", "no", "off", "FALSE", "  Off "] {
+            assert!(
+                !super::parse_restore(Some(falsey)),
+                "{falsey} should disable"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_max_body_bytes_fails_closed() {
+        assert_eq!(
+            super::parse_max_body_bytes(None).unwrap(),
+            super::DEFAULT_MAX_BODY_BYTES
+        );
+        assert_eq!(super::parse_max_body_bytes(Some(" 1024 ")).unwrap(), 1024);
+        // Present-but-invalid or zero must error, not silently default.
+        assert!(super::parse_max_body_bytes(Some("0")).is_err());
+        assert!(super::parse_max_body_bytes(Some("banana")).is_err());
+        assert!(super::parse_max_body_bytes(Some("-5")).is_err());
+        assert!(super::parse_max_body_bytes(Some("")).is_err());
     }
 }
