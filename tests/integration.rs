@@ -42,6 +42,7 @@ async fn canary_secret_never_reaches_upstream() {
         upstream: upstream_url.clone(),
         audit: Arc::new(airlock::audit::Audit::null()),
         client: reqwest::Client::new(),
+        max_body_bytes: airlock::proxy::DEFAULT_MAX_BODY_BYTES,
     };
     let airlock_url = spawn(app(ctx)).await;
 
