@@ -1,6 +1,3 @@
-// TODO(T6): remove once Audit is wired into mask/proxy; pub API for later tasks.
-#![allow(dead_code)]
-
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,6 +17,7 @@ impl Audit {
     }
 
     /// A logger that discards everything (for tests).
+    #[allow(dead_code)] // used in unit tests only; not reachable from the binary
     pub fn null() -> Self {
         Audit {
             sink: Mutex::new(None),

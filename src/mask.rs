@@ -1,6 +1,3 @@
-// TODO(T6): remove once mask is wired into proxy/selftest; pub API for later tasks.
-#![allow(dead_code)]
-
 use crate::audit::Audit;
 use crate::detect;
 use crate::vault::Vault;

@@ -1,6 +1,3 @@
-// TODO(T6): remove once detect() is wired into mask/proxy; these items are public API for later tasks.
-#![allow(dead_code)]
-
 use regex::Regex;
 use std::sync::LazyLock;
 
