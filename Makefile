@@ -1,6 +1,6 @@
 PORT ?= 8787
 
-.PHONY: build test lint fmt run selftest smoke docker-build docker-run up down clean
+.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run up down clean
 
 build:
 	cargo build --release
@@ -22,6 +22,14 @@ selftest:
 
 smoke:
 	bash scripts/smoke.sh
+
+# Coverage targets — require `cargo install cargo-llvm-cov` on the local machine.
+# CI runs these in a report-only job (never gates the build).
+coverage:        ## Text coverage summary (needs: cargo install cargo-llvm-cov)
+	cargo llvm-cov --summary-only
+
+coverage-html:   ## Full HTML coverage report under target/llvm-cov/html
+	cargo llvm-cov --html
 
 docker-build:
 	docker build -t airlock-ai .
