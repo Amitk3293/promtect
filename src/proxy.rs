@@ -1,4 +1,5 @@
 use crate::audit::Audit;
+use crate::detect;
 use crate::mask::{mask_text, restore_text};
 use crate::vault::Vault;
 use axum::{
@@ -50,6 +51,21 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
 
     // Mask request body content. Auth headers forwarded untouched in forward().
     let masked = mask_text(&body_text, &vault, &ctx.audit, &request_id);
+
+    // Second detect pass for the per-request summary (cheap; same input). This
+    // avoids changing mask_text's signature while still producing an accurate
+    // "caught vs clean" event. Secret values are never included in the summary.
+    let hits = detect::detect(&body_text);
+    let mut kinds: Vec<&str> = hits.iter().map(|m| m.kind).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    ctx.audit.record_request(
+        &request_id,
+        hits.len(),
+        &kinds,
+        body_bytes.len(),
+        masked.len(),
+    );
 
     match forward(&ctx, method, &uri, &headers, masked.into_bytes()).await {
         Ok(r) => restore_response(r, &ctx, &vault, &request_id).await,
