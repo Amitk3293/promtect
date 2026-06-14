@@ -545,33 +545,79 @@ async fn spawn_octet_mock() -> (String, Seen) {
     (url, seen)
 }
 
-/// A request with a binary content-type is forwarded byte-for-byte without
-/// masking — the proxy must not corrupt a binary upload.
+/// SECURITY: masking is decided by the body's actual UTF-8 validity, NOT the
+/// client-declared content-type — so a secret cannot bypass masking by labelling
+/// a JSON body as `application/octet-stream`.
 #[tokio::test]
-async fn binary_request_body_is_not_masked() {
+async fn mislabeled_binary_request_is_still_masked() {
     let aws = "AKIAIOSFODNN7EXAMPLE";
-    let body = format!(r#"{{"content":"{aws}"}}"#);
+    let body = format!(r#"{{"content":"{aws}"}}"#); // valid UTF-8 text
 
     let (mock_url, seen) = spawn_mock().await;
     let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
-    // application/octet-stream → guard skips scanning.
     reqwest::Client::new()
         .post(format!("{promtect_url}/"))
-        .header("content-type", "application/octet-stream")
-        .body(body.clone())
+        .header("content-type", "application/octet-stream") // the lie
+        .body(body)
         .send()
         .await
         .unwrap();
 
     let upstream_saw = seen.body.lock().unwrap().clone();
-    assert_eq!(
-        upstream_saw, body,
-        "binary body must be forwarded byte-for-byte"
+    assert!(
+        !upstream_saw.contains(aws),
+        "a mislabelled-binary text body must NOT bypass masking"
     );
     assert!(
+        upstream_saw.contains("«promtect:aws_key:"),
+        "the secret should have been masked"
+    );
+}
+
+/// Raw-bytes mock upstream (the default `String`-body mock rejects non-UTF-8).
+async fn mock_raw(State(seen): State<Seen>, body: bytes::Bytes) -> axum::response::Response {
+    *seen.body.lock().unwrap() = String::from_utf8_lossy(&body).into_owned();
+    axum::response::Response::builder()
+        .status(200)
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+async fn spawn_raw_mock() -> (String, Seen) {
+    let seen = Seen::default();
+    let app = Router::new()
+        .route("/", post(mock_raw))
+        .with_state(seen.clone());
+    (spawn(app).await, seen)
+}
+
+/// A genuinely binary (non-UTF-8) body is forwarded unscanned and byte-for-byte,
+/// so the proxy never corrupts a binary upload.
+#[tokio::test]
+async fn non_utf8_binary_request_is_forwarded_unscanned() {
+    let (mock_url, seen) = spawn_raw_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    // 0xFF 0xFE are never valid UTF-8 → treated as binary, forwarded verbatim.
+    let body = vec![0xFF, 0xFE, b'A', b'K', b'I', b'A'];
+    let resp = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(resp.status().is_success());
+    let upstream_saw = seen.body.lock().unwrap().clone();
+    assert!(
         !upstream_saw.contains("«promtect:"),
-        "binary body must not be masked"
+        "a non-UTF-8 binary body must not be scanned/masked"
+    );
+    assert!(
+        upstream_saw.contains("AKIA"),
+        "the binary body must be forwarded unscanned"
     );
 }
 

@@ -24,25 +24,57 @@ pub fn mask_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) -> 
     out
 }
 
+/// Compiled matcher for a Promtect sentinel token `«promtect:KIND:HEX»`.
+/// The kind segment allows digits so a kind like "s3_key" still round-trips; the
+/// counter segment is lowercase hex from `format!("{:04x}")`.
+static SENTINEL_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"«promtect:[a-z0-9_]+:[0-9a-f]+»").expect("promtect sentinel regex")
+});
+
+/// Replace every known sentinel in `text` with its real secret in a SINGLE pass,
+/// auditing each distinct sentinel once (tracked in `audited`, which the streaming
+/// caller threads across chunks). Unknown sentinels are emitted verbatim.
+///
+/// Single-pass rebuild — rather than a cascade of `str::replace` calls — is
+/// deliberate: repeated replacement could re-expand a secret whose value happens
+/// to equal another sentinel's literal text, corrupting output and making the
+/// result depend on iteration order. Scanning once replaces each token exactly
+/// once, with no cascade and no order dependence.
+pub(crate) fn restore_scan(
+    text: &str,
+    vault: &Vault,
+    audit: &Audit,
+    request_id: &str,
+    audited: &mut std::collections::HashSet<String>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for m in SENTINEL_RE.find_iter(text) {
+        out.push_str(&text[last..m.start()]);
+        let token = m.as_str();
+        match vault.secret_for(token) {
+            Some(secret) => {
+                out.push_str(&secret);
+                // Log the detector kind carried in the sentinel (e.g. "aws_key"),
+                // not a flat "sentinel" literal, so unmask events are attributable
+                // by detector exactly like the corresponding mask events.
+                if audited.insert(token.to_string()) {
+                    audit.record("unmask", sentinel_kind(token), token, request_id);
+                }
+            }
+            // Unknown sentinel (not minted for this request): leave it verbatim.
+            None => out.push_str(token),
+        }
+        last = m.end();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 /// Replace every known sentinel in `text` with its real secret.
 pub fn restore_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) -> String {
-    // De-duplicate tokens first: `find_sentinels` yields a token once per
-    // occurrence, but `str::replace` already replaces ALL occurrences in one
-    // pass. Without dedup, a sentinel appearing N times would log N-1 redundant
-    // no-op `unmask` events. A HashSet collapses them so each distinct sentinel
-    // is restored — and audited — exactly once.
-    let unique: std::collections::HashSet<String> = find_sentinels(text).into_iter().collect();
-    let mut out = text.to_string();
-    for token in unique {
-        if let Some(secret) = vault.secret_for(&token) {
-            out = out.replace(&token, &secret);
-            // Log the detector kind carried in the sentinel (e.g. "aws_key"), not a
-            // flat "sentinel" literal, so unmask events are attributable by detector
-            // exactly like the corresponding mask events.
-            audit.record("unmask", sentinel_kind(&token), &token, request_id);
-        }
-    }
-    out
+    let mut audited = std::collections::HashSet::new();
+    restore_scan(text, vault, audit, request_id, &mut audited)
 }
 
 /// Extract the detector kind from a sentinel token `«promtect:KIND:HEX»`.
@@ -59,15 +91,10 @@ pub(crate) fn sentinel_kind(token: &str) -> &str {
 
 /// Extract candidate sentinel tokens `«promtect:...»` from text.
 pub fn find_sentinels(text: &str) -> Vec<String> {
-    use regex::Regex;
-    use std::sync::LazyLock;
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        // Kind segment allows digits ([a-z0-9_]) so a future detector kind such as
-        // "s3_key" or "base64" still round-trips through restore. The counter
-        // segment is lowercase hex from `format!("{:04x}")`.
-        Regex::new(r"«promtect:[a-z0-9_]+:[0-9a-f]+»").expect("promtect sentinel regex")
-    });
-    RE.find_iter(text).map(|m| m.as_str().to_string()).collect()
+    SENTINEL_RE
+        .find_iter(text)
+        .map(|m| m.as_str().to_string())
+        .collect()
 }
 
 /// Local proof: mask a canary secret, confirm it is gone from the masked text,
@@ -99,6 +126,22 @@ mod tests {
         assert!(masked.contains("«promtect:aws_key:"));
         let restored = restore_text(&masked, &vault, &audit, "req1");
         assert_eq!(restored, original);
+    }
+
+    /// Restore is single-pass: if one secret's VALUE equals another secret's
+    /// sentinel literal, restoring must NOT re-expand the injected text. A naive
+    /// cascade of `str::replace` calls would corrupt this; the single-pass scan
+    /// replaces each token exactly once.
+    #[test]
+    fn restore_does_not_cascade() {
+        let vault = Vault::new();
+        let s1 = vault.sentinel_for("aws_key", "AKIA0000");
+        // s2's real value is the literal text of s1's sentinel.
+        let s2 = vault.sentinel_for("env_secret", &s1);
+        let text = format!("{s1} {s2}");
+        let got = restore_text(&text, &vault, &Audit::null(), "req");
+        // s1 → its secret; s2 → the literal s1 text, NOT re-expanded into AKIA0000.
+        assert_eq!(got, format!("AKIA0000 {s1}"));
     }
 
     #[test]
