@@ -30,6 +30,7 @@ the smallest units in isolation.
 | Masker (`mask.rs`) | Span-level splice — correct sentinel substitution and index arithmetic |
 | Audit (`audit.rs`) | Log entries are value-free (no secret value ever written) |
 | Net (`net.rs`) | `is_loopback` classification |
+| Metrics (`metrics.rs`) | Value-free aggregation of the audit log → totals, caught-vs-clean, by-detector, byte totals, Prometheus + JSON rendering; never surfaces a secret value |
 
 **Run:** `cargo test`
 
@@ -50,6 +51,12 @@ They verify behavior that spans the full request/response pipeline.
 | Stable sentinel | The same secret in the same request always maps to the same sentinel |
 
 **Run:** `cargo test` (all L2) or `cargo test --test integration` / `cargo test --test proxy_integration` individually
+
+**Dashboard server** (`tests/dashboard.rs`): starts the observability server on an
+ephemeral port and asserts `/api/metrics` (JSON), `/metrics` (Prometheus text), and
+`/` (the embedded offline UI) each respond correctly, and that a missing audit file
+yields zeroed metrics rather than an error. The metrics it serves are value-free
+(counts, detector names, byte totals — never a secret). **Run:** `cargo test --test dashboard`.
 
 ---
 
