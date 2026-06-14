@@ -7,14 +7,9 @@
   <meta name="description" content="Promtect is a local proxy that masks secrets out of your AI coding tool's requests before they reach the model, and restores them in the response. Open source. No cloud. No root CA." />
   <meta property="og:title" content="Promtect — your API keys never reach the LLM" />
   <meta property="og:description" content="A local proxy that masks secrets before the LLM sees them and restores them in the response. Open source, no cloud, no root CA." />
-  <!-- PREVIEW ONLY: the Tailwind Play CDN is a JIT compiler served dynamically,
-       so Subresource Integrity (SRI) cannot be pinned. Before deploying to
-       promtect.dev, replace this with a built static stylesheet
-       (`npx tailwindcss -o site/styles.css --minify`) and drop this <script>. -->
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = { theme: { extend: { colors: { ink: '#0a0a0f', panel: '#12121a', accent: '#7c5cff', mint: '#43e0a8' }, fontFamily: { mono: ['ui-monospace','SFMono-Regular','Menlo','monospace'] } } } }
-  </script>
+  <!-- Static, prebuilt Tailwind (no CDN, no runtime JIT). Rebuild after editing
+       classes with:  cd site && npx tailwindcss@3 -c tailwind.config.js -i input.css -o styles.css --minify -->
+  <link rel="stylesheet" href="styles.css" />
   <style>
     .term-line{opacity:0;animation:rise .5s forwards}
     @keyframes rise{to{opacity:1;transform:translateY(0)}}

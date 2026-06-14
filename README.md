@@ -10,9 +10,13 @@ response — so the AI still works perfectly and your secrets never travel.
 **Open source. Runs entirely on your machine. No cloud, no telemetry, no root
 certificate. Secrets are never written to disk.**
 
-<!-- Demo GIF: generate with `vhs docs/demo.tape` → docs/demo.gif, then uncomment:
-![Promtect masks a secret and restores it](docs/demo.gif)
--->
+```text
+you ▸ fix the upload in s3.py            # s3.py contains AKIAIOSFODNN7EXAMPLE
+  promtect ▸ masked aws_key → «promtect:aws_key:0001»   (the model never sees your key)
+  claude   ▸ here's the fix, using AKIAIOSFODNN7EXAMPLE  (restored in the response — answer just works)
+```
+
+<sub>A 30-second terminal recording lives in [`docs/demo.tape`](docs/demo.tape) — render it with [`vhs`](https://github.com/charmbracelet/vhs): `vhs docs/demo.tape`.</sub>
 
 ```sh
 brew install promtect/tap/promtect      # or: cargo install --path .
