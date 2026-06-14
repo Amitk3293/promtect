@@ -1,11 +1,10 @@
-mod audit;
-mod detect;
-mod mask;
-mod proxy;
-mod vault;
-
-use proxy::Ctx;
 use std::sync::Arc;
+
+use airlock::{
+    audit,
+    proxy::{self, Ctx},
+    vault,
+};
 
 #[tokio::main]
 async fn main() {
