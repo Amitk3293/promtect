@@ -26,6 +26,19 @@ jobs:
       - name: Test
         run: cargo test
 
+  audit:
+    runs-on: ubuntu-latest
+    # Fails the build on any dependency with a known security advisory (RUSTSEC).
+    # A security proxy must never ship a vulnerable dependency.
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@91534edaf9fd796a162759d80d49cdff574bff2c # cargo-audit
+        with:
+          tool: cargo-audit
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
+
   coverage:
     runs-on: ubuntu-latest
     # Report-only: prints the coverage summary on every run; never fails the build.

@@ -3,12 +3,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 PORT="${PORT:-18787}"
-AUDIT="$(mktemp -t airlock-smoke.XXXXXX.jsonl)"
+AUDIT="$(mktemp -t promtect-smoke.XXXXXX.jsonl)"
 PID=""
 trap 'kill "$PID" 2>/dev/null || true; rm -f "$AUDIT"' EXIT
 cargo build -q
-AIRLOCK_UPSTREAM=http://127.0.0.1:9 AIRLOCK_AUDIT="$AUDIT" AIRLOCK_PORT="$PORT" \
-  ./target/debug/airlock >/tmp/airlock-smoke.log 2>&1 &
+PROMTECT_UPSTREAM=http://127.0.0.1:9 PROMTECT_AUDIT="$AUDIT" PROMTECT_PORT="$PORT" \
+  ./target/debug/promtect >/tmp/promtect-smoke.log 2>&1 &
 PID=$!
 code=$(curl -s --retry 15 --retry-connrefused --retry-delay 1 -o /dev/null -w "%{http_code}" \
   -X POST "http://127.0.0.1:${PORT}/v1/messages" -H 'content-type: application/json' \

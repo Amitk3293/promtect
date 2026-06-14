@@ -1,4 +1,4 @@
-//! Network-address helpers for deciding how Airlock may bind.
+//! Network-address helpers for deciding how Promtect may bind.
 
 /// True if `bind` is a loopback address that is safe to listen on directly
 /// (only the local host can reach it). Anything else (e.g. `0.0.0.0`) is only
@@ -13,7 +13,7 @@ mod tests {
 
     #[test]
     fn loopback_addresses_are_recognised() {
-        // The three forms Airlock treats as host-only.
+        // The three forms Promtect treats as host-only.
         for b in ["127.0.0.1", "::1", "localhost"] {
             assert!(is_loopback(b), "{b} should be loopback");
         }

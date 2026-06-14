@@ -1,22 +1,22 @@
 services:
-  airlock:
-    image: ghcr.io/amitk3293/airlock-ai:latest   # prebuilt (public at M1); until then use: docker compose up --build
+  promtect:
+    image: ghcr.io/amitk3293/promtect:latest   # prebuilt (public at M1); until then use: docker compose up --build
     build: .
     ports:
-      - "127.0.0.1:8787:8787"   # loopback only — do NOT change to "8787:8787" (LAN exposure)
+      - "127.0.0.1:${PROMTECT_HOST_PORT:-8787}:8787"   # loopback only — do NOT change to "8787:8787" (LAN exposure)
     environment:
-      AIRLOCK_BIND: "0.0.0.0"        # safe: only reachable via the 127.0.0.1-published port above
-      AIRLOCK_UPSTREAM: "https://api.anthropic.com"
-      AIRLOCK_AUDIT: "/home/nonroot/airlock-audit.jsonl"
+      PROMTECT_BIND: "0.0.0.0"        # safe: only reachable via the 127.0.0.1-published port above
+      PROMTECT_UPSTREAM: "https://api.anthropic.com"
+      PROMTECT_AUDIT: "/home/nonroot/promtect-audit.jsonl"
     volumes:
       # Named volume for audit-log persistence across container restarts.
       # Empirically verified (2024-06): Docker creates the volume with the
       # ownership of the first writing process (nonroot, uid 65532), so the
-      # container can write /home/nonroot/airlock-audit.jsonl without error.
+      # container can write /home/nonroot/promtect-audit.jsonl without error.
       # To use a host directory instead: replace with a bind-mount and set
       # --user $(id -u) so the host path is writable by your account.
-      - airlock-audit:/home/nonroot
+      - promtect-audit:/home/nonroot
     restart: unless-stopped
 
 volumes:
-  airlock-audit:
+  promtect-audit:
