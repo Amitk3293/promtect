@@ -1,6 +1,6 @@
 // Spins up a mock "upstream" that records the exact body it received, starts
-// Airlock pointed at it, sends a request containing a fake AWS key THROUGH
-// Airlock, and asserts the key never reached the upstream and the response was
+// Promtect pointed at it, sends a request containing a fake AWS key THROUGH
+// Promtect, and asserts the key never reached the upstream and the response was
 // restored.
 
 use std::sync::{Arc, Mutex};
@@ -36,22 +36,22 @@ async fn canary_secret_never_reaches_upstream() {
         .with_state(seen.clone());
     let upstream_url = spawn(upstream_app).await;
 
-    // 2. Airlock pointed at the mock upstream.
-    use airlock::proxy::{Ctx, app};
+    // 2. Promtect pointed at the mock upstream.
+    use promtect::proxy::{Ctx, app};
     let ctx = Ctx {
         upstream: upstream_url.clone(),
-        audit: Arc::new(airlock::audit::Audit::null()),
+        audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
-        max_body_bytes: airlock::proxy::DEFAULT_MAX_BODY_BYTES,
+        max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
     };
-    let airlock_url = spawn(app(ctx)).await;
+    let promtect_url = spawn(app(ctx)).await;
 
-    // 3. Send a request containing the fake key THROUGH Airlock.
+    // 3. Send a request containing the fake key THROUGH Promtect.
     //    (reqwest has no `json` feature enabled, so build the body manually.)
     let payload =
         json!({ "messages": [{ "role": "user", "content": format!("my key is {FAKE_KEY}") }] });
     let resp = reqwest::Client::new()
-        .post(format!("{airlock_url}/v1/messages"))
+        .post(format!("{promtect_url}/v1/messages"))
         .header("content-type", "application/json")
         .body(serde_json::to_string(&payload).unwrap())
         .send()
@@ -66,7 +66,7 @@ async fn canary_secret_never_reaches_upstream() {
         "LEAK: upstream received the real key"
     );
     assert!(
-        upstream_saw.contains("«airlock:aws_key:"),
+        upstream_saw.contains("«promtect:aws_key:"),
         "upstream should have seen a sentinel"
     );
 

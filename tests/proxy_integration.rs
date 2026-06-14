@@ -1,4 +1,4 @@
-//! Integration tests for the Airlock proxy: header forwarding, multi-secret masking,
+//! Integration tests for the Promtect proxy: header forwarding, multi-secret masking,
 //! 502 on upstream error, sentinel deduplication, and response restore invariants.
 
 use std::sync::{Arc, Mutex};
@@ -33,14 +33,14 @@ async fn spawn(app: Router) -> String {
     format!("http://{addr}")
 }
 
-/// Build a fresh Airlock proxy `Ctx` pointing at `upstream_url`.
+/// Build a fresh Promtect proxy `Ctx` pointing at `upstream_url`.
 /// No vault field: the proxy mints a per-request vault internally.
-fn ctx(upstream_url: &str) -> airlock::proxy::Ctx {
-    airlock::proxy::Ctx {
+fn ctx(upstream_url: &str) -> promtect::proxy::Ctx {
+    promtect::proxy::Ctx {
         upstream: upstream_url.to_string(),
-        audit: Arc::new(airlock::audit::Audit::null()),
+        audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
-        max_body_bytes: airlock::proxy::DEFAULT_MAX_BODY_BYTES,
+        max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
     }
 }
 
@@ -54,10 +54,10 @@ async fn spawn_mock() -> (String, Seen) {
     (url, seen)
 }
 
-/// POST JSON body through Airlock; return the response body text.
-async fn post_through(airlock_url: &str, body: &str) -> (reqwest::StatusCode, String) {
+/// POST JSON body through Promtect; return the response body text.
+async fn post_through(promtect_url: &str, body: &str) -> (reqwest::StatusCode, String) {
     let resp = reqwest::Client::new()
-        .post(format!("{airlock_url}/"))
+        .post(format!("{promtect_url}/"))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
@@ -74,11 +74,11 @@ async fn post_through(airlock_url: &str, body: &str) -> (reqwest::StatusCode, St
 #[tokio::test]
 async fn auth_header_forwarded_untouched() {
     let (mock_url, seen) = spawn_mock().await;
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
     let client = reqwest::Client::new();
     client
-        .post(format!("{airlock_url}/"))
+        .post(format!("{promtect_url}/"))
         .header("content-type", "application/json")
         .header("x-api-key", "sk-ant-api03-thisisafakeapikeyvalue00")
         .body(r#"{"role":"user","content":"hello"}"#)
@@ -106,9 +106,9 @@ async fn multiple_distinct_secrets_masked_and_restored() {
     let body = format!(r#"{{"aws":"{aws}","ant":"{ant}","db":"{db}"}}"#);
 
     let (mock_url, seen) = spawn_mock().await;
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
-    let (_, resp_text) = post_through(&airlock_url, &body).await;
+    let (_, resp_text) = post_through(&promtect_url, &body).await;
 
     let upstream_saw = seen.body.lock().unwrap().clone();
 
@@ -125,7 +125,7 @@ async fn multiple_distinct_secrets_masked_and_restored() {
 
     // Upstream must see sentinel tokens.
     assert!(
-        upstream_saw.contains("«airlock:"),
+        upstream_saw.contains("«promtect:"),
         "upstream should contain sentinels"
     );
 
@@ -147,9 +147,9 @@ async fn non_secret_body_passes_through_unchanged() {
     let body = r#"{"messages":[{"role":"user","content":"hello world, no secrets here"}]}"#;
 
     let (mock_url, seen) = spawn_mock().await;
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
-    let (_, resp_text) = post_through(&airlock_url, body).await;
+    let (_, resp_text) = post_through(&promtect_url, body).await;
 
     let upstream_saw = seen.body.lock().unwrap().clone();
 
@@ -168,7 +168,7 @@ async fn non_secret_body_passes_through_unchanged() {
     );
 }
 
-/// A dead upstream port causes Airlock to return HTTP 502 to the client.
+/// A dead upstream port causes Promtect to return HTTP 502 to the client.
 #[tokio::test]
 async fn upstream_error_returns_502() {
     // Reserve an ephemeral port, then drop the listener so the port is closed
@@ -177,16 +177,16 @@ async fn upstream_error_returns_502() {
     let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = reserved.local_addr().unwrap();
     drop(reserved);
-    let dead_ctx = airlock::proxy::Ctx {
+    let dead_ctx = promtect::proxy::Ctx {
         upstream: format!("http://{dead_addr}"),
-        audit: Arc::new(airlock::audit::Audit::null()),
+        audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
-        max_body_bytes: airlock::proxy::DEFAULT_MAX_BODY_BYTES,
+        max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
     };
-    let airlock_url = spawn(airlock::proxy::app(dead_ctx)).await;
+    let promtect_url = spawn(promtect::proxy::app(dead_ctx)).await;
 
     let resp = reqwest::Client::new()
-        .post(format!("{airlock_url}/"))
+        .post(format!("{promtect_url}/"))
         .header("content-type", "application/json")
         .body(r#"{"ping":true}"#)
         .send()
@@ -204,9 +204,9 @@ async fn same_secret_twice_uses_one_sentinel() {
     let body = format!(r#"{{"a":"{aws}","b":"{aws}"}}"#);
 
     let (mock_url, seen) = spawn_mock().await;
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
-    let (_, resp_text) = post_through(&airlock_url, &body).await;
+    let (_, resp_text) = post_through(&promtect_url, &body).await;
 
     let upstream_saw = seen.body.lock().unwrap().clone();
 
@@ -217,7 +217,7 @@ async fn same_secret_twice_uses_one_sentinel() {
     );
 
     // Extract all sentinel tokens from the upstream body.
-    let sentinel_re = regex::Regex::new(r"«airlock:[a-z_]+:[0-9a-f]+»").unwrap();
+    let sentinel_re = regex::Regex::new(r"«promtect:[a-z_]+:[0-9a-f]+»").unwrap();
     let sentinels: Vec<&str> = sentinel_re
         .find_iter(&upstream_saw)
         .map(|m| m.as_str())
@@ -249,9 +249,9 @@ async fn response_body_sentinel_is_restored() {
     let body = format!(r#"{{"key":"{aws}"}}"#);
 
     let (mock_url, seen) = spawn_mock().await;
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
-    let (_, resp_text) = post_through(&airlock_url, &body).await;
+    let (_, resp_text) = post_through(&promtect_url, &body).await;
 
     let upstream_saw = seen.body.lock().unwrap().clone();
     // Confirm the upstream saw a sentinel, not the real key.
@@ -260,7 +260,7 @@ async fn response_body_sentinel_is_restored() {
         "key must be masked before reaching upstream"
     );
     assert!(
-        upstream_saw.contains("«airlock:"),
+        upstream_saw.contains("«promtect:"),
         "upstream must receive a sentinel"
     );
 
@@ -270,7 +270,7 @@ async fn response_body_sentinel_is_restored() {
         "real key must be restored in client response"
     );
     assert!(
-        !resp_text.contains("«airlock:"),
+        !resp_text.contains("«promtect:"),
         "sentinel must not leak into client response"
     );
 }
@@ -285,14 +285,14 @@ async fn response_body_sentinel_is_restored() {
 #[tokio::test]
 async fn forwarded_content_length_matches_masked_body() {
     let aws = "AKIAIOSFODNN7EXAMPLE";
-    // A sentinel like «airlock:aws_key:0001» is longer than the original key,
+    // A sentinel like «promtect:aws_key:0001» is longer than the original key,
     // so masking changes the byte length.
     let body = format!(r#"{{"key":"{aws}"}}"#);
 
     let (mock_url, seen) = spawn_mock().await;
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
-    post_through(&airlock_url, &body).await;
+    post_through(&promtect_url, &body).await;
 
     let upstream_body = seen.body.lock().unwrap().clone();
     let upstream_headers = seen.headers.lock().unwrap().clone();
@@ -322,14 +322,14 @@ async fn forwarded_content_length_matches_masked_body() {
             "upstream must receive a non-empty masked body"
         );
         assert!(
-            upstream_body.contains("«airlock:"),
+            upstream_body.contains("«promtect:"),
             "chunked-encoded body must still contain the sentinel"
         );
     }
 }
 
 /// A sentinel from one request must never restore a secret from another. The
-/// vault is per-request, so a `«airlock:aws_key:0001»` minted while masking
+/// vault is per-request, so a `«promtect:aws_key:0001»` minted while masking
 /// request 1's real key cannot be expanded back into that key when the SAME
 /// literal sentinel appears in request 2's response. This pins the cross-request
 /// secret-bleed fix: one shared `Ctx` (and thus one shared upstream/audit) but a
@@ -339,14 +339,14 @@ async fn vault_does_not_bleed_secrets_across_requests() {
     let aws = "AKIAIOSFODNN7EXAMPLE";
     // The deterministic sentinel: the first secret minted in a fresh vault is
     // always counter 1 -> 0001, kind aws_key.
-    let sentinel = "«airlock:aws_key:0001»";
+    let sentinel = "«promtect:aws_key:0001»";
 
     let (mock_url, _seen) = spawn_mock().await;
     // ONE Ctx shared across both requests, exactly as the running server uses it.
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
 
     // Request 1: a real AWS key is masked to `0001` inside request 1's vault.
-    let (_, resp1) = post_through(&airlock_url, &format!(r#"{{"key":"{aws}"}}"#)).await;
+    let (_, resp1) = post_through(&promtect_url, &format!(r#"{{"key":"{aws}"}}"#)).await;
     assert!(
         resp1.contains(aws),
         "request 1 must restore its own secret in its own response"
@@ -355,7 +355,7 @@ async fn vault_does_not_bleed_secrets_across_requests() {
     // Request 2: the body literally contains request 1's sentinel. It is not a
     // detectable secret, so it passes through to the (echoing) upstream unchanged
     // and comes back in the response, where restore runs against request 2's vault.
-    let (_, resp2) = post_through(&airlock_url, &format!(r#"{{"note":"{sentinel}"}}"#)).await;
+    let (_, resp2) = post_through(&promtect_url, &format!(r#"{{"note":"{sentinel}"}}"#)).await;
 
     // With a per-request vault, request 2's vault never learned `0001`, so the
     // sentinel stays literal and request 1's real key cannot leak.
@@ -370,23 +370,23 @@ async fn vault_does_not_bleed_secrets_across_requests() {
 }
 
 /// A request body larger than the configured cap is refused with 413 and never
-/// reaches the upstream — Airlock must not buffer unbounded input. A tiny cap
+/// reaches the upstream — Promtect must not buffer unbounded input. A tiny cap
 /// plus a small (4 KiB) fixture exercises this deterministically: the body fits
 /// the socket buffer, so the client finishes sending and reads a clean 413
 /// rather than racing a connection reset.
 #[tokio::test]
 async fn oversized_body_is_rejected_with_413() {
     let (mock_url, seen) = spawn_mock().await;
-    let small_cap = airlock::proxy::Ctx {
+    let small_cap = promtect::proxy::Ctx {
         upstream: mock_url.clone(),
-        audit: Arc::new(airlock::audit::Audit::null()),
+        audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
         max_body_bytes: 64,
     };
-    let airlock_url = spawn(airlock::proxy::app(small_cap)).await;
+    let promtect_url = spawn(promtect::proxy::app(small_cap)).await;
 
     let body = "x".repeat(4096); // far over the 64-byte cap, still tiny
-    let (status, _text) = post_through(&airlock_url, &body).await;
+    let (status, _text) = post_through(&promtect_url, &body).await;
 
     assert_eq!(status, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     // Rejected before forwarding: the upstream must never have seen the body.
@@ -401,8 +401,8 @@ async fn oversized_body_is_rejected_with_413() {
 #[tokio::test]
 async fn body_within_cap_passes_through() {
     let (mock_url, seen) = spawn_mock().await;
-    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await; // default 32 MiB cap
-    let (status, _text) = post_through(&airlock_url, r#"{"content":"hello world"}"#).await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await; // default 32 MiB cap
+    let (status, _text) = post_through(&promtect_url, r#"{"content":"hello world"}"#).await;
 
     assert!(status.is_success());
     assert!(

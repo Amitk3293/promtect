@@ -101,7 +101,7 @@ mod tests {
     fn record_request_writes_value_free_summary_line() {
         // record_request must write one JSONL line with counts/kinds, never secret values.
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("airlock-req-{}.jsonl", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("promtect-req-{}.jsonl", uuid::Uuid::new_v4()));
         let audit = Audit::to_file(path.clone());
         audit.record_request("req-abc", 2, &["aws_key", "anthropic_key"], 512, 498);
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -121,9 +121,9 @@ mod tests {
     #[test]
     fn writes_jsonl_without_secret_value() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("airlock-audit-{}.jsonl", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("promtect-audit-{}.jsonl", uuid::Uuid::new_v4()));
         let audit = Audit::to_file(path.clone());
-        audit.record("mask", "aws_key", "«airlock:aws_key:0001»", "req-xyz");
+        audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "req-xyz");
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("\"action\":\"mask\""));
         assert!(contents.contains("req-xyz"));

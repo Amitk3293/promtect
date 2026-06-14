@@ -44,7 +44,7 @@ impl Vault {
             return s.clone();
         }
         g.counter += 1;
-        let sentinel = format!("«airlock:{}:{:04x}»", kind, g.counter);
+        let sentinel = format!("«promtect:{}:{:04x}»", kind, g.counter);
         g.by_secret.insert(secret.to_string(), sentinel.clone());
         g.by_sentinel.insert(sentinel.clone(), secret.to_string());
         sentinel

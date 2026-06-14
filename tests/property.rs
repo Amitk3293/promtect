@@ -4,9 +4,9 @@
 //! Inputs are built from random "safe" text (printable ASCII EXCLUDING the
 //! guillemet sentinel delimiters « ») interleaved with synthetic secrets, so the
 //! input can never accidentally collide with a generated sentinel. (Adversarial
-//! inputs that embed a literal `«airlock:...»` are a documented out-of-scope edge.)
+//! inputs that embed a literal `«promtect:...»` are a documented out-of-scope edge.)
 
-use airlock::{
+use promtect::{
     audit::Audit,
     mask::{mask_text, restore_text},
     vault::Vault,

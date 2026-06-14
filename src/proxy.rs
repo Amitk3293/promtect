@@ -11,15 +11,15 @@ use axum::{
 };
 use std::sync::Arc;
 
-/// Default cap on the request body Airlock will buffer in memory before masking.
+/// Default cap on the request body Promtect will buffer in memory before masking.
 /// A masking proxy has to read the whole body to scan it, so an unbounded read
 /// is a memory-exhaustion vector. 32 MiB comfortably exceeds any real Anthropic
 /// request while bounding the blast radius of a hostile or runaway client. The
 /// effective limit lives on [`Ctx::max_body_bytes`] so it is both operator-tunable
-/// (`AIRLOCK_MAX_BODY_BYTES`) and testable without a multi-megabyte fixture.
+/// (`PROMTECT_MAX_BODY_BYTES`) and testable without a multi-megabyte fixture.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-/// Build a plain-text response without ever panicking. Used for Airlock's own
+/// Build a plain-text response without ever panicking. Used for Promtect's own
 /// error replies (413/502), where we fully control status and headers. The
 /// fallback arm only fires for an impossible invalid-status case and still
 /// yields a valid `Response`, never a panic in the request path.
@@ -51,7 +51,7 @@ pub struct Ctx {
     pub max_body_bytes: usize,
 }
 
-/// Build the Airlock Axum router: a catch-all fallback that masks the request
+/// Build the Promtect Axum router: a catch-all fallback that masks the request
 /// body, forwards to `upstream`, and restores secrets in the response.
 pub fn app(ctx: Ctx) -> Router {
     Router::new().fallback(handle).with_state(ctx)
@@ -73,7 +73,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             return text_response(
                 413,
                 format!(
-                    "airlock: request body exceeds the {}-byte limit (or could not be read)",
+                    "promtect: request body exceeds the {}-byte limit (or could not be read)",
                     ctx.max_body_bytes
                 ),
             );
@@ -106,7 +106,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
 
     match forward(&ctx, method, &uri, &headers, masked.into_bytes()).await {
         Ok(r) => restore_response(r, &ctx, &vault, &request_id).await,
-        Err(e) => text_response(502, format!("airlock upstream error: {e}")),
+        Err(e) => text_response(502, format!("promtect upstream error: {e}")),
     }
 }
 
@@ -163,5 +163,5 @@ async fn restore_response(
     // this build cannot realistically fail; fall back to a clean 502 rather than
     // panic if it ever does.
     out.body(Body::from(restored))
-        .unwrap_or_else(|_| text_response(502, "airlock: could not assemble upstream response"))
+        .unwrap_or_else(|_| text_response(502, "promtect: could not assemble upstream response"))
 }

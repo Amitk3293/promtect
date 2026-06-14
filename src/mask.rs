@@ -45,19 +45,19 @@ pub fn restore_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) 
     out
 }
 
-/// Extract the detector kind from a sentinel token `«airlock:KIND:HEX»`.
+/// Extract the detector kind from a sentinel token `«promtect:KIND:HEX»`.
 /// Falls back to `"sentinel"` for a malformed token — `find_sentinels` only ever
 /// yields well-formed tokens, but restore must never panic on adversarial
 /// upstream content, so this stays total.
 fn sentinel_kind(token: &str) -> &str {
     token
-        .strip_prefix("«airlock:")
+        .strip_prefix("«promtect:")
         .and_then(|rest| rest.split(':').next())
         .filter(|kind| !kind.is_empty())
         .unwrap_or("sentinel")
 }
 
-/// Extract candidate sentinel tokens `«airlock:...»` from text.
+/// Extract candidate sentinel tokens `«promtect:...»` from text.
 pub fn find_sentinels(text: &str) -> Vec<String> {
     use regex::Regex;
     use std::sync::LazyLock;
@@ -65,7 +65,7 @@ pub fn find_sentinels(text: &str) -> Vec<String> {
         // Kind segment allows digits ([a-z0-9_]) so a future detector kind such as
         // "s3_key" or "base64" still round-trips through restore. The counter
         // segment is lowercase hex from `format!("{:04x}")`.
-        Regex::new(r"«airlock:[a-z0-9_]+:[0-9a-f]+»").expect("airlock sentinel regex")
+        Regex::new(r"«promtect:[a-z0-9_]+:[0-9a-f]+»").expect("promtect sentinel regex")
     });
     RE.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
@@ -96,7 +96,7 @@ mod tests {
         let original = r#"{"messages":[{"role":"user","content":"key is AKIAIOSFODNN7EXAMPLE"}]}"#;
         let masked = mask_text(original, &vault, &audit, "req1");
         assert!(!masked.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(masked.contains("«airlock:aws_key:"));
+        assert!(masked.contains("«promtect:aws_key:"));
         let restored = restore_text(&masked, &vault, &audit, "req1");
         assert_eq!(restored, original);
     }
@@ -105,7 +105,7 @@ mod tests {
     fn restore_ignores_unknown_sentinels() {
         let vault = Vault::new();
         let audit = Audit::null();
-        let text = "unknown «airlock:aws_key:9999» stays";
+        let text = "unknown «promtect:aws_key:9999» stays";
         assert_eq!(restore_text(text, &vault, &audit, "req1"), text);
     }
 
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn mask_logs_one_event_per_unique_sentinel() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("airlock-mask-{}.jsonl", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("promtect-mask-{}.jsonl", uuid::Uuid::new_v4()));
 
         let vault = Vault::new();
         let audit = Audit::to_file(path.clone());
@@ -156,7 +156,7 @@ mod tests {
     #[test]
     fn restore_logs_one_unmask_event_per_sentinel_without_secret() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("airlock-unmask-{}.jsonl", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("promtect-unmask-{}.jsonl", uuid::Uuid::new_v4()));
 
         let vault = Vault::new();
         let audit = Audit::to_file(path.clone());
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn unmask_event_records_real_detector_kind() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("airlock-kind-{}.jsonl", uuid::Uuid::new_v4()));
+        let path = dir.join(format!("promtect-kind-{}.jsonl", uuid::Uuid::new_v4()));
 
         let vault = Vault::new();
         let audit = Audit::to_file(path.clone());
@@ -231,8 +231,8 @@ mod tests {
     /// silently leave it un-expanded.
     #[test]
     fn find_sentinels_matches_digit_bearing_kind() {
-        let toks = find_sentinels("a «airlock:s3_key:000a» b");
-        assert_eq!(toks, vec!["«airlock:s3_key:000a»".to_string()]);
-        assert_eq!(sentinel_kind("«airlock:s3_key:000a»"), "s3_key");
+        let toks = find_sentinels("a «promtect:s3_key:000a» b");
+        assert_eq!(toks, vec!["«promtect:s3_key:000a»".to_string()]);
+        assert_eq!(sentinel_kind("«promtect:s3_key:000a»"), "s3_key");
     }
 }
