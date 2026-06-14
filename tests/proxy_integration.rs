@@ -523,3 +523,84 @@ async fn strict_mode_does_not_restore_secrets() {
         "strict mode must NOT restore the real secret: {text:?}"
     );
 }
+
+// ── Content-type guard ──────────────────────────────────────────────────────
+
+/// Mock upstream that echoes the request body back with a binary content-type.
+async fn mock_octet(State(seen): State<Seen>, body: String) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    axum::response::Response::builder()
+        .header("content-type", "application/octet-stream")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+/// Spawn an octet-stream mock upstream and return its URL plus the `Seen` handle.
+async fn spawn_octet_mock() -> (String, Seen) {
+    let seen = Seen::default();
+    let app = Router::new()
+        .route("/", post(mock_octet))
+        .with_state(seen.clone());
+    let url = spawn(app).await;
+    (url, seen)
+}
+
+/// A request with a binary content-type is forwarded byte-for-byte without
+/// masking — the proxy must not corrupt a binary upload.
+#[tokio::test]
+async fn binary_request_body_is_not_masked() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"{aws}"}}"#);
+
+    let (mock_url, seen) = spawn_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    // application/octet-stream → guard skips scanning.
+    reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/octet-stream")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+
+    let upstream_saw = seen.body.lock().unwrap().clone();
+    assert_eq!(
+        upstream_saw, body,
+        "binary body must be forwarded byte-for-byte"
+    );
+    assert!(
+        !upstream_saw.contains("«promtect:"),
+        "binary body must not be masked"
+    );
+}
+
+/// A response with a binary content-type is streamed back unchanged — never run
+/// through the restorer (which would lossily corrupt it). The request itself is
+/// still masked, so the sentinel survives in the binary response.
+#[tokio::test]
+async fn binary_response_is_not_restored() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"{aws}"}}"#);
+
+    let (mock_url, seen) = spawn_octet_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    let (status, text) = post_through(&promtect_url, &body).await;
+    assert!(status.is_success());
+
+    // The JSON request WAS masked: upstream saw a sentinel, not the key.
+    assert!(
+        !seen.body.lock().unwrap().contains(aws),
+        "request should still be masked"
+    );
+    // The octet-stream response is NOT restored: sentinel stays, key absent.
+    assert!(
+        text.contains("«promtect:aws_key:"),
+        "binary response must not be restored: {text:?}"
+    );
+    assert!(
+        !text.contains(aws),
+        "binary response must not have the secret re-inserted: {text:?}"
+    );
+}
