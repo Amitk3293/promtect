@@ -91,8 +91,11 @@ value.**
 ## Trust properties
 
 - Secrets exist only in memory and are zeroized on drop.
-- Loopback-only bind (`127.0.0.1`); the upstream auth header is forwarded
-  untouched (Airlock masks request **bodies**, never headers).
+- Binds loopback (`127.0.0.1`) by default. In Docker the container binds
+  `0.0.0.0`, and the loopback guarantee then comes from publishing the port to
+  `127.0.0.1:` (see the Docker security note above) — never from the bind alone.
+- The upstream auth header is forwarded untouched (Airlock masks request
+  **bodies**, never headers).
 - Exactly one outbound connection per request; no telemetry.
 
 ## Develop
@@ -102,7 +105,8 @@ make test          # cargo test
 make lint          # fmt --check + clippy -D warnings
 make smoke         # prove the built binary masks + writes a value-free audit log
 make docker-build  # build the distroless image
-make up / make down  # docker compose up -d / down
+make up            # docker compose up -d
+make down          # docker compose down
 ```
 
 ## Scope & limitations (M0)

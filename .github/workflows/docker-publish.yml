@@ -26,7 +26,9 @@ jobs:
           images: ghcr.io/amitk3293/airlock-ai
           tags: |
             type=semver,pattern={{version}}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
       - uses: docker/build-push-action@v6
         with:
           context: .
