@@ -1,22 +1,672 @@
-<!doctype html><html><head><meta charset="utf-8"><title>Airlock — Dashboard</title>
-<style>body{font-family:system-ui,sans-serif;margin:2rem;background:#0b0e14;color:#e6e6e6}
-.stat{display:inline-block;margin:1rem 2rem 1rem 0}.n{font-size:2rem;font-weight:700}
-.l{opacity:.7;font-size:.85rem}table{border-collapse:collapse;margin-top:1rem}
-td,th{padding:.3rem .8rem;text-align:left;border-bottom:1px solid #222}</style></head>
-<body><h1>&#x1F512; Airlock</h1><div id="stats">loading&#x2026;</div>
-<h2>Secrets masked by type</h2><table id="bytype"><tbody></tbody></table>
-<script>
-async function load(){
-  const m = await (await fetch('/api/metrics')).json();
-  document.getElementById('stats').innerHTML =
-    `<div class="stat"><div class="n">${m.secrets_masked_total}</div><div class="l">secrets blocked</div></div>`+
-    `<div class="stat"><div class="n">${m.requests_with_secrets}</div><div class="l">requests protected</div></div>`+
-    `<div class="stat"><div class="n">${m.requests_total}</div><div class="l">requests total</div></div>`+
-    `<div class="stat"><div class="n">${m.requests_clean}</div><div class="l">clean</div></div>`;
-  const tb=document.querySelector('#bytype tbody'); tb.innerHTML='';
-  for(const [k,v] of Object.entries(m.by_detector||{})){
-    const tr=document.createElement('tr'); tr.innerHTML=`<td>${k}</td><td>${v}</td>`; tb.appendChild(tr);
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Airlock — Mission Control</title>
+<!--
+  Airlock dashboard — a single self-contained file. All CSS + JS inline.
+  NO external network of any kind (no CDN fonts, no chart libs): Airlock is a
+  privacy tool, so the dashboard that watches your secrets must never phone home.
+  Charts are hand-rolled with inline SVG / CSS. Data: GET /api/metrics, polled 3s.
+-->
+<style>
+  /* ─────────────────────────────────────────────────────────────────────────
+     Design tokens — dark security-console. Teal = "protected", amber = caution.
+     ───────────────────────────────────────────────────────────────────────── */
+  :root {
+    --bg:        #070a0f;
+    --bg-2:      #0a0f17;
+    --panel:     #0d141e;
+    --panel-2:   #111a26;
+    --line:      #1c2836;
+    --line-soft: #16212e;
+
+    --ink:       #e8f0f7;   /* primary text   */
+    --ink-dim:   #8da3b8;   /* secondary text */
+    --ink-faint: #51677c;   /* tertiary text  */
+
+    --teal:      #2ee6c4;   /* protected / live accent */
+    --teal-deep: #11a98e;
+    --teal-glow: rgba(46, 230, 196, .55);
+    --cyan:      #38bdf8;
+    --amber:     #f5b14c;   /* caution emphasis only   */
+    --slate:     #3a4d63;   /* "clean / passed" neutral */
+
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+
+    --r:   14px;
+    --r-sm: 9px;
+    --ease: cubic-bezier(.22,.61,.36,1);
   }
-}
-load(); setInterval(load, 3000);
-</script></body></html>
+
+  * { box-sizing: border-box; }
+
+  html, body { height: 100%; }
+
+  body {
+    margin: 0;
+    font-family: var(--sans);
+    color: var(--ink);
+    background:
+      radial-gradient(1100px 620px at 78% -10%, rgba(46,230,196,.10), transparent 60%),
+      radial-gradient(900px 560px at 8% 8%, rgba(56,189,248,.07), transparent 55%),
+      linear-gradient(180deg, var(--bg-2), var(--bg) 55%);
+    background-attachment: fixed;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    line-height: 1.5;
+  }
+
+  /* faint scanline / grid texture — pure CSS, no images */
+  body::before {
+    content: "";
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(var(--line-soft) 1px, transparent 1px),
+      linear-gradient(90deg, var(--line-soft) 1px, transparent 1px);
+    background-size: 46px 46px;
+    -webkit-mask-image: radial-gradient(circle at 50% 0%, #000 0%, transparent 78%);
+            mask-image: radial-gradient(circle at 50% 0%, #000 0%, transparent 78%);
+    opacity: .35;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .wrap {
+    position: relative;
+    z-index: 1;
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 34px clamp(18px, 4vw, 40px) 64px;
+  }
+
+  /* ── top bar ──────────────────────────────────────────────────────────── */
+  header.top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    margin-bottom: 30px;
+  }
+  .brand { display: flex; align-items: center; gap: 13px; }
+  .brand .lock {
+    width: 40px; height: 40px;
+    display: grid; place-items: center;
+    border-radius: 11px;
+    background: linear-gradient(160deg, rgba(46,230,196,.16), rgba(56,189,248,.05));
+    border: 1px solid rgba(46,230,196,.30);
+    box-shadow: inset 0 0 18px rgba(46,230,196,.12), 0 0 22px rgba(46,230,196,.08);
+  }
+  .brand .lock svg { width: 21px; height: 21px; }
+  .brand .word { font-size: 20px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .brand .word b { color: var(--teal); font-weight: 700; }
+  .brand .tag {
+    font-family: var(--mono);
+    font-size: 10.5px; letter-spacing: .22em; text-transform: uppercase;
+    color: var(--ink-faint);
+    margin-top: 1px;
+  }
+
+  .live {
+    display: inline-flex; align-items: center; gap: 9px;
+    font-family: var(--mono);
+    font-size: 11px; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--ink-dim);
+    padding: 8px 14px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: rgba(13,20,30,.7);
+    backdrop-filter: blur(6px);
+  }
+  .live .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--teal);
+    box-shadow: 0 0 0 0 var(--teal-glow);
+    animation: pulse 2.4s var(--ease) infinite;
+  }
+  .live.stale .dot { background: var(--amber); animation: none; box-shadow: none; }
+  .live.stale { color: var(--amber); }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 var(--teal-glow); opacity: 1; }
+    70%  { box-shadow: 0 0 0 9px rgba(46,230,196,0); opacity: .85; }
+    100% { box-shadow: 0 0 0 0 rgba(46,230,196,0); opacity: 1; }
+  }
+
+  /* ── hero ─────────────────────────────────────────────────────────────── */
+  .hero {
+    position: relative;
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    padding: 38px clamp(22px, 4vw, 46px);
+    margin-bottom: 22px;
+    overflow: hidden;
+    background:
+      radial-gradient(620px 280px at 50% -40%, rgba(46,230,196,.16), transparent 70%),
+      linear-gradient(180deg, var(--panel-2), var(--panel));
+  }
+  .hero::after {
+    content: "";
+    position: absolute; left: 0; right: 0; top: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--teal-glow), transparent);
+  }
+  .hero .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px; letter-spacing: .26em; text-transform: uppercase;
+    color: var(--teal); opacity: .85;
+    margin: 0 0 12px;
+  }
+  .hero .figure {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(58px, 13vw, 132px);
+    line-height: .9;
+    letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums;
+    color: #eafffb;
+    text-shadow: 0 0 38px var(--teal-glow), 0 0 90px rgba(46,230,196,.25);
+  }
+  .hero .figure .unit { font-size: .26em; color: var(--ink-dim); text-shadow: none; margin-left: .35em; letter-spacing: .04em; }
+  .hero .sub {
+    margin-top: 14px;
+    font-size: clamp(14px, 1.6vw, 17px);
+    color: var(--ink-dim);
+    max-width: 46ch;
+  }
+  .hero .sub b { color: var(--ink); font-weight: 600; }
+
+  /* ── grid ─────────────────────────────────────────────────────────────── */
+  .grid { display: grid; gap: 22px; }
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+  .card {
+    border: 1px solid var(--line);
+    border-radius: var(--r);
+    background: linear-gradient(180deg, var(--panel), var(--bg-2));
+    padding: 18px 20px;
+    transition: border-color .25s var(--ease), transform .25s var(--ease);
+  }
+  .card:hover { border-color: rgba(46,230,196,.32); transform: translateY(-2px); }
+  .stat .k {
+    font-family: var(--mono);
+    font-size: 10.5px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .stat .v {
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: clamp(26px, 3.4vw, 34px);
+    margin-top: 9px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .stat .v.accent { color: var(--teal); }
+  .stat .meta { font-size: 12px; color: var(--ink-faint); margin-top: 5px; font-family: var(--mono); }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: minmax(300px, 360px) 1fr;
+    gap: 22px;
+    margin-bottom: 22px;
+  }
+
+  .panel { border: 1px solid var(--line); border-radius: var(--r);
+           background: linear-gradient(180deg, var(--panel), var(--bg-2)); padding: 22px 24px; }
+  .panel h2 {
+    font-size: 12px; font-weight: 600; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--ink-dim); margin: 0 0 18px;
+    display: flex; align-items: center; gap: 9px;
+  }
+  .panel h2 .pip { width: 6px; height: 6px; border-radius: 50%; background: var(--teal); box-shadow: 0 0 8px var(--teal-glow); }
+
+  /* ── donut (caught vs clean) ──────────────────────────────────────────── */
+  .donut-wrap { display: flex; align-items: center; gap: 22px; }
+  .donut { position: relative; width: 168px; height: 168px; flex: none; }
+  .donut svg { transform: rotate(-90deg); display: block; }
+  .donut .ring-bg { stroke: var(--line); }
+  .donut .ring-fg {
+    stroke: url(#tealgrad);
+    stroke-linecap: round;
+    filter: drop-shadow(0 0 6px var(--teal-glow));
+    transition: stroke-dashoffset .9s var(--ease);
+  }
+  .donut .center {
+    position: absolute; inset: 0;
+    display: grid; place-content: center; text-align: center;
+  }
+  .donut .center .pct {
+    font-family: var(--mono); font-weight: 700; font-size: 32px;
+    color: var(--teal); font-variant-numeric: tabular-nums; line-height: 1;
+  }
+  .donut .center .lbl {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-faint); margin-top: 6px;
+  }
+  .legend { display: grid; gap: 13px; flex: 1; min-width: 0; }
+  .legend .row { display: flex; align-items: baseline; gap: 10px; }
+  .legend .sw { width: 11px; height: 11px; border-radius: 3px; flex: none; align-self: center; }
+  .legend .sw.caught { background: var(--teal); box-shadow: 0 0 8px var(--teal-glow); }
+  .legend .sw.clean  { background: var(--slate); }
+  .legend .name { font-size: 13px; color: var(--ink-dim); }
+  .legend .num  { margin-left: auto; font-family: var(--mono); font-weight: 700; color: var(--ink);
+                  font-variant-numeric: tabular-nums; }
+
+  /* ── detector bars ────────────────────────────────────────────────────── */
+  .bars { display: grid; gap: 14px; }
+  .bar .head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 7px; }
+  .bar .det {
+    font-family: var(--mono); font-size: 13px; color: var(--ink);
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .bar .det .badge {
+    font-size: 10px; letter-spacing: .04em; color: var(--teal);
+    border: 1px solid rgba(46,230,196,.3); border-radius: 5px; padding: 1px 6px;
+    background: rgba(46,230,196,.06);
+  }
+  .bar .cnt { font-family: var(--mono); font-weight: 700; color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+  .bar .track { height: 9px; border-radius: 99px; background: var(--line-soft); overflow: hidden; }
+  .bar .fill {
+    height: 100%; border-radius: 99px; width: 0;
+    background: linear-gradient(90deg, var(--teal-deep), var(--teal));
+    box-shadow: 0 0 10px var(--teal-glow);
+    transition: width .9s var(--ease);
+  }
+
+  /* ── recent table ─────────────────────────────────────────────────────── */
+  .recent { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    text-align: left; font-family: var(--mono);
+    font-size: 10px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--ink-faint); font-weight: 500;
+    padding: 0 14px 12px; border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  thead th.num { text-align: right; }
+  tbody td { padding: 13px 14px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { transition: background .2s var(--ease); }
+  tbody tr:hover { background: rgba(46,230,196,.035); }
+  td.time { font-family: var(--mono); font-size: 12.5px; color: var(--ink-dim); white-space: nowrap; }
+  td.id   { font-family: var(--mono); font-size: 12.5px; color: var(--ink-faint); }
+  td.masked { text-align: right; font-family: var(--mono); font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.masked .pill {
+    display: inline-block; min-width: 26px; text-align: center;
+    padding: 2px 9px; border-radius: 99px; font-size: 12px;
+  }
+  td.masked .pill.hit   { color: var(--teal); background: rgba(46,230,196,.10); border: 1px solid rgba(46,230,196,.28); }
+  td.masked .pill.zero  { color: var(--ink-faint); background: var(--line-soft); border: 1px solid var(--line); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip {
+    font-family: var(--mono); font-size: 11px;
+    color: var(--ink-dim); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px;
+    white-space: nowrap;
+  }
+  .chip.empty { color: var(--ink-faint); border-style: dashed; }
+
+  /* ── empty state ──────────────────────────────────────────────────────── */
+  .empty {
+    text-align: center;
+    padding: 56px 24px;
+    border: 1px dashed var(--line);
+    border-radius: var(--r);
+    background: radial-gradient(520px 220px at 50% 0%, rgba(46,230,196,.06), transparent 70%);
+  }
+  .empty .icon {
+    width: 60px; height: 60px; margin: 0 auto 20px;
+    display: grid; place-items: center;
+    border-radius: 16px; border: 1px solid rgba(46,230,196,.28);
+    background: rgba(46,230,196,.05);
+  }
+  .empty .icon svg { width: 30px; height: 30px; }
+  .empty h3 { margin: 0 0 10px; font-size: 19px; color: var(--ink); font-weight: 600; }
+  .empty p { margin: 0 auto; max-width: 52ch; color: var(--ink-dim); font-size: 14px; }
+  .empty code {
+    font-family: var(--mono); font-size: 13px; color: var(--teal);
+    background: rgba(46,230,196,.08); border: 1px solid rgba(46,230,196,.22);
+    border-radius: 6px; padding: 2px 7px;
+  }
+
+  .hidden { display: none !important; }
+
+  footer.foot {
+    margin-top: 34px; text-align: center;
+    font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
+    color: var(--ink-faint);
+  }
+  footer.foot b { color: var(--ink-dim); font-weight: 600; }
+
+  /* ── responsive (looks right ~900px → full width) ─────────────────────── */
+  @media (max-width: 920px) {
+    .stat-row { grid-template-columns: repeat(2, 1fr); }
+    .two-col { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 560px) {
+    .stat-row { grid-template-columns: 1fr 1fr; }
+    .donut-wrap { flex-direction: column; align-items: flex-start; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- ── top bar ──────────────────────────────────────────────────────── -->
+  <header class="top">
+    <div class="brand">
+      <span class="lock" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#2ee6c4" stroke-width="1.7"
+             stroke-linecap="round" stroke-linejoin="round">
+          <rect x="4.5" y="10.5" width="15" height="10" rx="2.2"></rect>
+          <path d="M8 10.5V7.2a4 4 0 0 1 8 0v3.3"></path>
+          <circle cx="12" cy="15.4" r="1.4" fill="#2ee6c4" stroke="none"></circle>
+        </svg>
+      </span>
+      <div>
+        <div class="word">Air<b>lock</b></div>
+        <div class="tag">Secret-Masking Proxy · Mission Control</div>
+      </div>
+    </div>
+    <div class="live" id="live" title="Auto-refreshing every 3 seconds">
+      <span class="dot"></span><span id="live-label">Live · monitoring</span>
+    </div>
+  </header>
+
+  <!-- ── hero ─────────────────────────────────────────────────────────── -->
+  <section class="hero" id="hero">
+    <p class="eyebrow">Secrets blocked from reaching the LLM</p>
+    <div class="figure"><span id="hero-num">0</span><span class="unit">blocked</span></div>
+    <p class="sub">Every credential below was caught and replaced with a sentinel
+       <b>before</b> the request left your machine. The model never saw the real value.</p>
+  </section>
+
+  <!-- ── live dashboard (hidden in empty state) ───────────────────────── -->
+  <div id="dash">
+    <!-- stat row -->
+    <section class="stat-row">
+      <div class="card stat">
+        <div class="k">Requests protected</div>
+        <div class="v accent" id="s-protected">0</div>
+        <div class="meta" id="s-protected-meta">contained ≥1 secret</div>
+      </div>
+      <div class="card stat">
+        <div class="k">Requests total</div>
+        <div class="v" id="s-total">0</div>
+        <div class="meta">through the proxy</div>
+      </div>
+      <div class="card stat">
+        <div class="k">Passed clean</div>
+        <div class="v" id="s-clean-pct">0%</div>
+        <div class="meta" id="s-clean-meta">0 of 0 requests</div>
+      </div>
+      <div class="card stat">
+        <div class="k">Body throughput</div>
+        <div class="v" id="s-bytes">0 B</div>
+        <div class="meta" id="s-bytes-meta">in / out</div>
+      </div>
+    </section>
+
+    <div class="two-col">
+      <!-- caught vs clean donut -->
+      <div class="panel">
+        <h2><span class="pip"></span>Caught vs clean</h2>
+        <div class="donut-wrap">
+          <div class="donut">
+            <svg width="168" height="168" viewBox="0 0 168 168" aria-hidden="true">
+              <defs>
+                <linearGradient id="tealgrad" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0" stop-color="#11a98e"></stop>
+                  <stop offset="1" stop-color="#2ee6c4"></stop>
+                </linearGradient>
+              </defs>
+              <circle class="ring-bg" cx="84" cy="84" r="68" fill="none" stroke-width="16"></circle>
+              <circle class="ring-fg" id="donut-fg" cx="84" cy="84" r="68" fill="none"
+                      stroke-width="16" stroke-dasharray="427.26" stroke-dashoffset="427.26"></circle>
+            </svg>
+            <div class="center">
+              <div class="pct" id="donut-pct">0%</div>
+              <div class="lbl">protected</div>
+            </div>
+          </div>
+          <div class="legend">
+            <div class="row">
+              <span class="sw caught"></span>
+              <span class="name">Protected (secrets caught)</span>
+              <span class="num" id="lg-caught">0</span>
+            </div>
+            <div class="row">
+              <span class="sw clean"></span>
+              <span class="name">Clean (passed through)</span>
+              <span class="num" id="lg-clean">0</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- by-detector bars -->
+      <div class="panel">
+        <h2><span class="pip"></span>What we catch · by detector</h2>
+        <div class="bars" id="bars"></div>
+      </div>
+    </div>
+
+    <!-- recent activity -->
+    <div class="panel">
+      <h2><span class="pip"></span>Recent activity</h2>
+      <div class="recent">
+        <table>
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Request</th>
+              <th>Detectors</th>
+              <th class="num">Masked</th>
+            </tr>
+          </thead>
+          <tbody id="recent-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── empty state (shown when requests_total === 0) ────────────────── -->
+  <div id="empty" class="empty hidden">
+    <div class="icon" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="#2ee6c4" stroke-width="1.6"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2.5l7.5 3v5.2c0 4.7-3.2 8.4-7.5 9.8-4.3-1.4-7.5-5.1-7.5-9.8V5.5z"></path>
+        <path d="M9 12l2 2 4-4.5"></path>
+      </svg>
+    </div>
+    <h3>No traffic yet — Airlock is armed and listening</h3>
+    <p>Point Claude Code at Airlock by setting <code>ANTHROPIC_BASE_URL</code> to the
+       local proxy. As soon as it handles a request, every masked secret will show up
+       here in real time.</p>
+  </div>
+
+  <footer class="foot">
+    <b>Airlock</b> runs entirely on-device · this dashboard makes <b>zero</b> external requests
+  </footer>
+
+</div>
+
+<script>
+"use strict";
+(function () {
+  // ── helpers ──────────────────────────────────────────────────────────────
+  var $ = function (id) { return document.getElementById(id); };
+
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + " B";
+    var u = ["KB", "MB", "GB", "TB"], i = -1;
+    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+    return (n >= 10 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+  }
+
+  function fmtNum(n) { return (Number(n) || 0).toLocaleString("en-US"); }
+
+  // Relative time from epoch-ms, e.g. "just now", "12s ago", "4m ago", "2h ago".
+  function relTime(ms) {
+    var diff = Date.now() - Number(ms);
+    if (!isFinite(diff) || diff < 0) diff = 0;
+    var s = Math.floor(diff / 1000);
+    if (s < 3)   return "just now";
+    if (s < 60)  return s + "s ago";
+    var m = Math.floor(s / 60);
+    if (m < 60)  return m + "m ago";
+    var h = Math.floor(m / 60);
+    if (h < 24)  return h + "h ago";
+    var d = Math.floor(h / 24);
+    return d + "d ago";
+  }
+
+  // Count-up animation on the hero number when it changes.
+  var heroShown = 0, heroRaf = null;
+  function animateHero(target) {
+    target = Number(target) || 0;
+    if (target === heroShown) return;
+    var from = heroShown, start = null, dur = 650;
+    if (heroRaf) cancelAnimationFrame(heroRaf);
+    var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduce) { heroShown = target; $("hero-num").textContent = fmtNum(target); return; }
+    function step(t) {
+      if (start === null) start = t;
+      var p = Math.min(1, (t - start) / dur);
+      var eased = 1 - Math.pow(1 - p, 3);            // ease-out cubic
+      var val = Math.round(from + (target - from) * eased);
+      $("hero-num").textContent = fmtNum(val);
+      if (p < 1) heroRaf = requestAnimationFrame(step);
+      else heroShown = target;
+    }
+    heroRaf = requestAnimationFrame(step);
+  }
+
+  var DONUT_CIRC = 2 * Math.PI * 68;                 // r = 68 → ~427.26
+
+  // ── render ───────────────────────────────────────────────────────────────
+  function render(m) {
+    var total = Number(m.requests_total) || 0;
+
+    // Empty state toggle.
+    if (total === 0) {
+      $("dash").classList.add("hidden");
+      $("empty").classList.remove("hidden");
+      animateHero(0);
+      $("donut-fg").style.strokeDashoffset = DONUT_CIRC;
+      return;
+    }
+    $("dash").classList.remove("hidden");
+    $("empty").classList.add("hidden");
+
+    // Hero.
+    animateHero(m.secrets_masked_total);
+
+    // Stat row.
+    var protectedN = Number(m.requests_with_secrets) || 0;
+    var cleanN = Number(m.requests_clean) || 0;
+    var cleanPct = total ? Math.round((cleanN / total) * 100) : 0;
+
+    $("s-protected").textContent = fmtNum(protectedN);
+    $("s-total").textContent = fmtNum(total);
+    $("s-clean-pct").textContent = cleanPct + "%";
+    $("s-clean-meta").textContent = fmtNum(cleanN) + " of " + fmtNum(total) + " requests";
+    $("s-bytes").textContent = fmtBytes(m.bytes_in_total);
+    $("s-bytes-meta").textContent = fmtBytes(m.bytes_in_total) + " in · " + fmtBytes(m.bytes_out_total) + " out";
+
+    // Donut — protected share of all requests.
+    var protPct = total ? (protectedN / total) : 0;
+    $("donut-fg").style.strokeDashoffset = DONUT_CIRC * (1 - protPct);
+    $("donut-pct").textContent = Math.round(protPct * 100) + "%";
+    $("lg-caught").textContent = fmtNum(protectedN);
+    $("lg-clean").textContent = fmtNum(cleanN);
+
+    // By-detector bars (sorted descending).
+    var det = m.by_detector || {};
+    var entries = Object.keys(det).map(function (k) { return [k, Number(det[k]) || 0]; })
+                        .sort(function (a, b) { return b[1] - a[1]; });
+    var max = entries.reduce(function (mx, e) { return Math.max(mx, e[1]); }, 0) || 1;
+    var bars = $("bars");
+    if (entries.length === 0) {
+      bars.innerHTML = '<div class="chip empty" style="align-self:start">No detector hits yet</div>';
+    } else {
+      bars.innerHTML = entries.map(function (e) {
+        var pct = Math.max(4, Math.round((e[1] / max) * 100));
+        return '<div class="bar">' +
+                 '<div class="head">' +
+                   '<span class="det">' + esc(e[0]) + ' <span class="badge">' + fmtNum(e[1]) + '</span></span>' +
+                   '<span class="cnt">' + Math.round((e[1] / (sum(entries)) ) * 100) + '%</span>' +
+                 '</div>' +
+                 '<div class="track"><div class="fill" style="width:' + pct + '%"></div></div>' +
+               '</div>';
+      }).join("");
+    }
+
+    // Recent activity (already newest-first from the server).
+    var recent = Array.isArray(m.recent) ? m.recent : [];
+    var body = $("recent-body");
+    if (recent.length === 0) {
+      body.innerHTML = '<tr><td colspan="4" class="id" style="text-align:center;padding:26px">' +
+                       'Waiting for the next request…</td></tr>';
+    } else {
+      body.innerHTML = recent.map(function (r) {
+        var id = String(r.request_id || "").slice(0, 8) || "—";
+        var masked = Number(r.masked) || 0;
+        var dets = Array.isArray(r.detectors) ? r.detectors : [];
+        var chips = dets.length
+          ? dets.map(function (d) { return '<span class="chip">' + esc(d) + '</span>'; }).join("")
+          : '<span class="chip empty">clean</span>';
+        var pillCls = masked > 0 ? "hit" : "zero";
+        return '<tr>' +
+                 '<td class="time">' + relTime(r.ts_ms) + '</td>' +
+                 '<td class="id">' + esc(id) + '</td>' +
+                 '<td><div class="chips">' + chips + '</div></td>' +
+                 '<td class="masked"><span class="pill ' + pillCls + '">' + masked + '</span></td>' +
+               '</tr>';
+      }).join("");
+    }
+  }
+
+  function sum(entries) {
+    return entries.reduce(function (s, e) { return s + e[1]; }, 0) || 1;
+  }
+
+  // Escape detector/id strings before injecting into HTML (defence in depth —
+  // they are [a-z_]+ / uuids server-side, but never trust rendered data blindly).
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  // ── liveness indicator ───────────────────────────────────────────────────
+  function setLive(ok) {
+    var el = $("live");
+    if (ok) { el.classList.remove("stale"); $("live-label").textContent = "Live · monitoring"; }
+    else { el.classList.add("stale"); $("live-label").textContent = "Reconnecting…"; }
+  }
+
+  // ── poll loop ────────────────────────────────────────────────────────────
+  function load() {
+    fetch('/api/metrics')
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (m) { setLive(true); render(m); })
+      .catch(function () { setLive(false); });
+  }
+
+  load();
+  setInterval(load, 3000);
+})();
+</script>
+</body>
+</html>
