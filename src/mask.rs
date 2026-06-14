@@ -3,17 +3,23 @@ use crate::detect;
 use crate::vault::Vault;
 
 /// Replace every detected secret in `text` with its vault sentinel.
-/// Records one audit event per masked secret. Returns the masked text.
+/// Records one audit event per unique sentinel (not per occurrence). Returns the masked text.
 pub fn mask_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) -> String {
     // detect() returns non-overlapping spans sorted by start. Splice from the END
     // so earlier byte offsets stay valid as we mutate the string.
     let mut matches = detect::detect(text);
     matches.sort_by_key(|m| std::cmp::Reverse(m.start));
     let mut out = text.to_string();
+    // Track sentinels already audited this call: conversation history causes the same
+    // value to appear many times in one request body, producing one sentinel but many
+    // occurrences. Audit once per unique sentinel, not once per occurrence.
+    let mut audited: std::collections::HashSet<String> = std::collections::HashSet::new();
     for m in matches {
         let sentinel = vault.sentinel_for(m.kind, &m.value);
         out.replace_range(m.start..m.end, &sentinel);
-        audit.record("mask", m.kind, &sentinel, request_id);
+        if audited.insert(sentinel.clone()) {
+            audit.record("mask", m.kind, &sentinel, request_id);
+        }
     }
     out
 }
@@ -88,6 +94,40 @@ mod tests {
     #[test]
     fn selftest_passes() {
         assert!(selftest());
+    }
+
+    /// mask_text must write exactly ONE `mask` audit event per unique sentinel even
+    /// when the same secret value appears multiple times in the input (e.g. repeated
+    /// in conversation history).
+    #[test]
+    fn mask_logs_one_event_per_unique_sentinel() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("airlock-mask-{}.jsonl", uuid::Uuid::new_v4()));
+
+        let vault = Vault::new();
+        let audit = Audit::to_file(path.clone());
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+
+        // Same secret appearing 3 times in one request body — same value → same sentinel.
+        let text = format!("key={secret} again={secret} third={secret}");
+        let masked = mask_text(&text, &vault, &audit, "req1");
+
+        // All occurrences replaced.
+        assert!(!masked.contains(secret));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Only one mask event logged, not three.
+        let mask_lines = contents.matches("\"action\":\"mask\"").count();
+        assert_eq!(
+            mask_lines, 1,
+            "expected exactly one mask event per unique sentinel"
+        );
+        assert!(
+            !contents.contains(secret),
+            "audit must not log the secret value"
+        );
     }
 
     /// restore_text must write exactly ONE `unmask` audit event per distinct
