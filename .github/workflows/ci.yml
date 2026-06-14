@@ -24,6 +24,9 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     # Report-only: prints the coverage summary on every run; never fails the build.
+    # continue-on-error ensures a cargo-llvm-cov install or invocation failure
+    # does not block merges — coverage is a visibility tool, not a gate.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

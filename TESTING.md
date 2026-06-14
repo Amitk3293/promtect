@@ -9,7 +9,7 @@ CI enforces all of them on every push and pull request.
 
 Tests are first-class. Every change keeps the whole suite green **and** adds or
 updates tests for the behavior it changes (test-driven by default). CI enforces
-`cargo fmt --check`, `cargo clippy -D warnings`, and the full test suite on every
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and the full test suite on every
 push and pull request. Coverage is reported on every run but is never used to
 gate a build — the goal is visibility, not bureaucracy.
 
@@ -26,7 +26,7 @@ the smallest units in isolation.
 | Area | What is tested |
 |---|---|
 | Detectors (`detect.rs`) | Per-provider positive and negative cases (true hit / no false-positive) |
-| Vault (`vault.rs`) | Zeroize-on-drop and round-trip storage |
+| Vault (`vault.rs`) | Dedup (same secret → same sentinel), distinct secrets → distinct sentinels, round-trip lookup (sentinel → secret) |
 | Masker (`mask.rs`) | Span-level splice — correct sentinel substitution and index arithmetic |
 | Audit (`audit.rs`) | Log entries are value-free (no secret value ever written) |
 | Net (`net.rs`) | `is_loopback` classification |
@@ -49,7 +49,7 @@ They verify behavior that spans the full request/response pipeline.
 | 502 on upstream error | A dead upstream produces a clean 502, not a panic |
 | Stable sentinel | The same secret in the same request always maps to the same sentinel |
 
-**Run:** `cargo test --test proxy_integration`
+**Run:** `cargo test` (all L2) or `cargo test --test integration` / `cargo test --test proxy_integration` individually
 
 ---
 
@@ -116,6 +116,7 @@ make lint                           # cargo fmt --check + clippy -D warnings
 make coverage                       # text coverage summary (needs cargo-llvm-cov)
 make smoke                          # smoke-test the compiled binary
 
+cargo test --test integration       # L2 canary integration tests only
 cargo test --test proxy_integration # L2 proxy integration tests only
 cargo test --test property          # L3 property tests only
 cargo run -- selftest               # binary-level canary (no network)
