@@ -9,6 +9,12 @@ services:
       AIRLOCK_UPSTREAM: "https://api.anthropic.com"
       AIRLOCK_AUDIT: "/home/nonroot/airlock-audit.jsonl"
     volumes:
+      # Named volume for audit-log persistence across container restarts.
+      # Empirically verified (2024-06): Docker creates the volume with the
+      # ownership of the first writing process (nonroot, uid 65532), so the
+      # container can write /home/nonroot/airlock-audit.jsonl without error.
+      # To use a host directory instead: replace with a bind-mount and set
+      # --user $(id -u) so the host path is writable by your account.
       - airlock-audit:/home/nonroot
     restart: unless-stopped
 
