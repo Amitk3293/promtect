@@ -88,11 +88,25 @@ async fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(proxy::DEFAULT_MAX_BODY_BYTES);
 
+    // Restore real secrets in the response (transparent mode) by default. Set
+    // PROMTECT_RESTORE to a falsey value for strict mode, where the masked body
+    // is forwarded verbatim and secrets never re-enter the response.
+    let restore = std::env::var("PROMTECT_RESTORE")
+        .ok()
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true);
+
     let ctx = Ctx {
         upstream,
         audit: Arc::new(audit::Audit::to_file(audit_path.into())),
         client: reqwest::Client::new(),
         max_body_bytes,
+        restore,
     };
 
     let app = proxy::app(ctx);

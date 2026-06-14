@@ -9,9 +9,11 @@
 use promtect::{
     audit::Audit,
     mask::{mask_text, restore_text},
+    stream::StreamRestorer,
     vault::Vault,
 };
 use proptest::prelude::*;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Strategies
@@ -143,6 +145,20 @@ fn assemble(segs: &[Segment]) -> (String, Vec<String>) {
     (parts.join(""), secrets)
 }
 
+/// Restore `masked` through the streaming restorer, fed in `size`-byte chunks.
+/// This is the streaming-path equivalent of `restore_text` on the whole buffer.
+fn stream_restore(vault: Arc<Vault>, masked: &str, size: usize) -> String {
+    let mut sr = StreamRestorer::new(vault, Arc::new(Audit::null()), "prop".into());
+    let mut out = Vec::new();
+    for chunk in masked.as_bytes().chunks(size.max(1)) {
+        let restored = sr.push(chunk);
+        out.extend_from_slice(restored.as_ref());
+    }
+    let tail = sr.finish();
+    out.extend_from_slice(tail.as_ref());
+    String::from_utf8(out).expect("restored stream is valid UTF-8")
+}
+
 // ---------------------------------------------------------------------------
 // Property tests
 // ---------------------------------------------------------------------------
@@ -178,5 +194,27 @@ proptest! {
                 "leaked: {secret}"
             );
         }
+    }
+
+    /// Streaming proof: restoring the masked body chunk-by-chunk at ANY byte
+    /// boundary yields exactly the same result as restoring the whole buffer —
+    /// which is the original input. This is the correctness guarantee for SSE
+    /// streaming, where sentinels are split across arbitrary chunk boundaries.
+    #[test]
+    fn streaming_restore_equals_whole_buffer(
+        segs in segments_with_secret(),
+        chunk in 1usize..40,
+    ) {
+        let (input, planted) = assemble(&segs);
+        prop_assume!(!planted.is_empty());
+        let vault = Arc::new(Vault::new());
+        let audit = Audit::null();
+        let masked = mask_text(&input, &vault, &audit, "prop");
+
+        let whole = restore_text(&masked, &vault, &audit, "prop");
+        let streamed = stream_restore(Arc::clone(&vault), &masked, chunk);
+
+        prop_assert_eq!(&streamed, &whole, "chunked != whole at chunk size {}", chunk);
+        prop_assert_eq!(&streamed, &input, "round-trip broken at chunk size {}", chunk);
     }
 }

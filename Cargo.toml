@@ -12,6 +12,8 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 axum = "0.8.9"
+bytes = "1.10.1"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 regex = "1.12.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }

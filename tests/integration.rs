@@ -43,6 +43,7 @@ async fn canary_secret_never_reaches_upstream() {
         audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
         max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
+        restore: true,
     };
     let promtect_url = spawn(app(ctx)).await;
 
