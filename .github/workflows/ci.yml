@@ -20,3 +20,15 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+
+  coverage:
+    runs-on: ubuntu-latest
+    # Report-only: prints the coverage summary on every run; never fails the build.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage summary (report-only)
+        run: cargo llvm-cov --workspace --summary-only

@@ -104,10 +104,13 @@ value.**
 make test          # cargo test
 make lint          # fmt --check + clippy -D warnings
 make smoke         # prove the built binary masks + writes a value-free audit log
+make coverage      # text coverage summary (needs: cargo install cargo-llvm-cov)
 make docker-build  # build the distroless image
 make up            # docker compose up -d
 make down          # docker compose down
 ```
+
+See [TESTING.md](TESTING.md) for the layered test strategy and the contract for keeping tests aligned with every change.
 
 ## Scope & limitations (M0)
 
