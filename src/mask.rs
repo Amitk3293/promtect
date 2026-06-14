@@ -40,6 +40,21 @@ pub fn find_sentinels(text: &str) -> Vec<String> {
     RE.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
 
+/// Local proof: mask a canary secret, confirm it is gone from the masked text,
+/// then confirm restore returns the original. Pure in-memory, no network.
+pub fn selftest() -> bool {
+    let vault = Vault::new();
+    let audit = Audit::null();
+    let canary = "AKIAIOSFODNN7EXAMPLE";
+    let text = format!("canary secret: {canary}");
+    let masked = mask_text(&text, &vault, &audit, "selftest");
+    if masked.contains(canary) {
+        return false; // leak
+    }
+    let restored = restore_text(&masked, &vault, &audit, "selftest");
+    restored == text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,5 +77,10 @@ mod tests {
         let audit = Audit::null();
         let text = "unknown «airlock:aws_key:9999» stays";
         assert_eq!(restore_text(text, &vault, &audit, "req1"), text);
+    }
+
+    #[test]
+    fn selftest_passes() {
+        assert!(selftest());
     }
 }

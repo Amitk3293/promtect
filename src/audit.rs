@@ -16,8 +16,7 @@ impl Audit {
         }
     }
 
-    /// A logger that discards everything (for tests).
-    #[allow(dead_code)] // used in unit tests only; not reachable from the binary
+    /// A logger that discards everything (for tests and the selftest subcommand).
     pub fn null() -> Self {
         Audit {
             sink: Mutex::new(None),
