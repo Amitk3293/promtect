@@ -5,6 +5,7 @@
 pub mod audit;
 pub mod detect;
 pub mod mask;
+pub mod metrics;
 pub mod net;
 pub mod proxy;
 pub mod vault;
