@@ -11,6 +11,27 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Default cap on the request body Airlock will buffer in memory before masking.
+/// A masking proxy has to read the whole body to scan it, so an unbounded read
+/// is a memory-exhaustion vector. 32 MiB comfortably exceeds any real Anthropic
+/// request while bounding the blast radius of a hostile or runaway client. The
+/// effective limit lives on [`Ctx::max_body_bytes`] so it is both operator-tunable
+/// (`AIRLOCK_MAX_BODY_BYTES`) and testable without a multi-megabyte fixture.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Build a plain-text response without ever panicking. Used for Airlock's own
+/// error replies (413/502), where we fully control status and headers. The
+/// fallback arm only fires for an impossible invalid-status case and still
+/// yields a valid `Response`, never a panic in the request path.
+fn text_response(status: u16, msg: impl Into<String>) -> Response {
+    let msg = msg.into();
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(msg.clone()))
+        .unwrap_or_else(|_| Response::new(Body::from(msg)))
+}
+
 /// Shared, cheaply-clonable process-wide context for the proxy pipeline: the
 /// upstream base URL, the (append-only, process-wide) audit log, and the outbound
 /// client.
@@ -25,6 +46,9 @@ pub struct Ctx {
     pub upstream: String,
     pub audit: Arc<Audit>,
     pub client: reqwest::Client,
+    /// Max request-body bytes buffered before the proxy returns 413. Defaults to
+    /// [`DEFAULT_MAX_BODY_BYTES`]; lower it in tests to exercise the cap cheaply.
+    pub max_body_bytes: usize,
 }
 
 /// Build the Airlock Axum router: a catch-all fallback that masks the request
@@ -39,9 +63,22 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     let uri = req.uri().clone();
     let headers = req.headers().clone();
 
-    let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
-        .await
-        .unwrap_or_default();
+    // Buffer the body with a hard cap. `to_bytes` returns Err once the stream
+    // exceeds the limit, so we refuse oversized bodies with 413 instead of
+    // silently forwarding an empty/truncated one (the old `.unwrap_or_default()`
+    // behaviour) or buffering without bound.
+    let body_bytes = match axum::body::to_bytes(req.into_body(), ctx.max_body_bytes).await {
+        Ok(b) => b,
+        Err(_) => {
+            return text_response(
+                413,
+                format!(
+                    "airlock: request body exceeds the {}-byte limit (or could not be read)",
+                    ctx.max_body_bytes
+                ),
+            );
+        }
+    };
     let body_text = String::from_utf8_lossy(&body_bytes).to_string();
 
     // INVARIANT: one vault per request. The same `&vault` masks the outbound body
@@ -69,10 +106,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
 
     match forward(&ctx, method, &uri, &headers, masked.into_bytes()).await {
         Ok(r) => restore_response(r, &ctx, &vault, &request_id).await,
-        Err(e) => Response::builder()
-            .status(502)
-            .body(Body::from(format!("airlock upstream error: {e}")))
-            .unwrap(),
+        Err(e) => text_response(502, format!("airlock upstream error: {e}")),
     }
 }
 
@@ -125,5 +159,9 @@ async fn restore_response(
         }
         out = out.header(name.clone(), value.clone());
     }
-    out.body(Body::from(restored)).unwrap()
+    // Headers and status are copied from an already-parsed upstream response, so
+    // this build cannot realistically fail; fall back to a clean 502 rather than
+    // panic if it ever does.
+    out.body(Body::from(restored))
+        .unwrap_or_else(|_| text_response(502, "airlock: could not assemble upstream response"))
 }
