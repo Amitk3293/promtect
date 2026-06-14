@@ -76,8 +76,17 @@ async fn main() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(8787);
-    let upstream =
-        std::env::var("PROMTECT_UPSTREAM").unwrap_or_else(|_| "https://api.anthropic.com".into());
+    // Upstream selection: PROMTECT_UPSTREAM (explicit override / chaining knob)
+    // wins; otherwise PROMTECT_MODE picks a known provider; default Anthropic.
+    let mode = std::env::var("PROMTECT_MODE").ok();
+    let upstream_override = std::env::var("PROMTECT_UPSTREAM").ok();
+    let upstream = match proxy::resolve_upstream(mode.as_deref(), upstream_override.as_deref()) {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("promtect: {e}");
+            std::process::exit(1);
+        }
+    };
     let audit_path =
         std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
 
@@ -101,6 +110,7 @@ async fn main() {
         })
         .unwrap_or(true);
 
+    let upstream_for_log = upstream.clone();
     let ctx = Ctx {
         upstream,
         audit: Arc::new(audit::Audit::to_file(audit_path.into())),
@@ -137,7 +147,14 @@ async fn main() {
     } else {
         format!("http://127.0.0.1:{port}")
     };
-    println!("promtect listening on {addr} -> point ANTHROPIC_BASE_URL at {hint}");
+    let restore_note = if restore {
+        ""
+    } else {
+        "  [strict: restore off]"
+    };
+    println!(
+        "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}"
+    );
     axum::serve(listener, app)
         .await
         .expect("promtect: server error");

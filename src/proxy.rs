@@ -64,6 +64,38 @@ pub fn app(ctx: Ctx) -> Router {
     Router::new().fallback(handle).with_state(ctx)
 }
 
+/// Resolve the upstream origin (scheme + host) from an explicit override or a
+/// named mode. An explicit `PROMTECT_UPSTREAM` always wins — it is the chaining
+/// knob, letting Promtect sit in front of another proxy (Headroom, LiteLLM, a
+/// corporate proxy) or any custom endpoint. Otherwise `PROMTECT_MODE` selects a
+/// known provider; the default is Anthropic.
+///
+/// Upstreams are origins only: the client's full request path is appended
+/// verbatim (the proxy is path-transparent), so the caller points its tool's
+/// base URL — including any `/v1` segment that tool expects — at Promtect.
+/// Returns `Err` for an unrecognised mode.
+pub fn resolve_upstream(
+    mode: Option<&str>,
+    upstream_override: Option<&str>,
+) -> Result<String, String> {
+    if let Some(u) = upstream_override {
+        let u = u.trim();
+        if !u.is_empty() {
+            return Ok(u.trim_end_matches('/').to_string());
+        }
+    }
+    match mode.map(|m| m.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("") | Some("anthropic") => Ok("https://api.anthropic.com".to_string()),
+        Some("openai") => Ok("https://api.openai.com".to_string()),
+        Some("ollama") => Ok("http://localhost:11434".to_string()),
+        Some("openrouter") => Ok("https://openrouter.ai".to_string()),
+        Some(other) => Err(format!(
+            "unknown PROMTECT_MODE '{other}' (expected anthropic|openai|ollama|openrouter); \
+             or set PROMTECT_UPSTREAM to a custom URL"
+        )),
+    }
+}
+
 async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().clone();
@@ -231,4 +263,68 @@ async fn restore_response(
     // build cannot realistically fail; fall back to a clean 502 rather than panic.
     out.body(body)
         .unwrap_or_else(|_| text_response(502, "promtect: could not assemble upstream response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_upstream;
+
+    #[test]
+    fn default_mode_is_anthropic() {
+        assert_eq!(
+            resolve_upstream(None, None).unwrap(),
+            "https://api.anthropic.com"
+        );
+        assert_eq!(
+            resolve_upstream(Some("anthropic"), None).unwrap(),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn known_modes_resolve_to_origins() {
+        assert_eq!(
+            resolve_upstream(Some("openai"), None).unwrap(),
+            "https://api.openai.com"
+        );
+        assert_eq!(
+            resolve_upstream(Some("ollama"), None).unwrap(),
+            "http://localhost:11434"
+        );
+        assert_eq!(
+            resolve_upstream(Some("openrouter"), None).unwrap(),
+            "https://openrouter.ai"
+        );
+        // Case- and whitespace-insensitive.
+        assert_eq!(
+            resolve_upstream(Some("  OpenAI "), None).unwrap(),
+            "https://api.openai.com"
+        );
+    }
+
+    #[test]
+    fn explicit_upstream_overrides_mode_and_is_the_chaining_knob() {
+        // Override wins even when a mode is set (e.g. chaining through Headroom).
+        assert_eq!(
+            resolve_upstream(Some("openai"), Some("http://127.0.0.1:8788")).unwrap(),
+            "http://127.0.0.1:8788"
+        );
+        // Trailing slash is trimmed so path joining stays correct.
+        assert_eq!(
+            resolve_upstream(None, Some("http://localhost:4000/")).unwrap(),
+            "http://localhost:4000"
+        );
+        // An empty override falls back to the mode default.
+        assert_eq!(
+            resolve_upstream(None, Some("   ")).unwrap(),
+            "https://api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn unknown_mode_is_an_error() {
+        let err = resolve_upstream(Some("gemini"), None).unwrap_err();
+        assert!(err.contains("unknown PROMTECT_MODE"));
+        assert!(err.contains("gemini"));
+    }
 }
