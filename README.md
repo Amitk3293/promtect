@@ -1,25 +1,40 @@
 # Promtect
 
-**Ship code, not secrets.** Promtect is a local proxy that intercepts every request
-your AI coding tool sends to the cloud, masks credentials out of the body *before*
-they reach the LLM, and restores them in the response. The model answers normally —
-it just never sees your real secrets.
+### Your AI coding tool just saw your AWS key. Promtect makes sure it never happens again.
 
-Free. Open-source. Runs entirely on your machine. No cloud, no telemetry, no root CA,
-and secrets are never written to disk.
+Promtect is a local proxy that sits between your AI tool and the model. It
+catches API keys, tokens, and passwords **before** they leave your laptop, swaps
+them for harmless placeholders, and (optionally) puts the real values back in the
+response — so the AI still works perfectly and your secrets never travel.
+
+**Open source. Runs entirely on your machine. No cloud, no telemetry, no root
+certificate. Secrets are never written to disk.**
+
+<!-- Demo GIF: generate with `vhs docs/demo.tape` → docs/demo.gif, then uncomment:
+![Promtect masks a secret and restores it](docs/demo.gif)
+-->
+
+```sh
+brew install promtect/tap/promtect      # or: cargo install --path .
+promtect selftest                       # → promtect selftest: PASS — no leak
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 promtect & claude "refactor my S3 upload"
+```
 
 ---
 
-## The problem
+## Why
 
-Every AI coding tool — Claude Code, GitHub Copilot, Cursor — sends your full
-conversation to a remote LLM. That conversation routinely contains secrets: API keys
-pasted into prompts, tokens read from files, database passwords echoed by shell
-commands. One careless paste and your credentials are in a cloud model's training
-pipeline.
+You pasted a `.env` into Claude to debug it. You asked Cursor to "fix the S3
+upload" — and the file had your access key in it. You let an agent read your
+config.
 
-Promtect sits on the loopback interface and fixes this transparently. You use your AI
-tool exactly as before. The secrets stay home.
+That key is now in a request log on a server you don't own, in a country you
+didn't choose, under a retention policy you never read. You can rotate it. You
+can't un-send it.
+
+**28 million secrets leaked to public repos in 2025; AI-assisted commits leak at
+~2× the baseline rate.** The prompt box is the new leak surface — and nothing is
+watching it. Promtect watches it.
 
 ---
 
@@ -32,210 +47,178 @@ Your AI tool ──http──▶ Promtect :8787 ──https──▶ api.anthrop
 ```
 
 1. Your tool sends a plaintext HTTP request to Promtect on loopback.
-2. Promtect scans the request body, replaces each detected secret with an opaque
+2. Promtect scans the body and replaces each detected secret with an opaque
    sentinel (`«promtect:aws_key:0001»`).
 3. Promtect re-originates the request as HTTPS to the upstream API.
-4. On the way back, every sentinel in the response is swapped for the real value
-   before your tool reads it.
+4. As the response **streams back**, every sentinel is swapped for the real
+   value before your tool reads it — token by token, no buffering, no hang.
 
 No TLS interception. No root certificate. The auth header (`x-api-key`,
 `Authorization`) is forwarded verbatim — only the body is ever touched.
 
 ---
 
+## How Promtect compares
+
+|  | **Promtect** | Veil | LiteLLM masking |
+|---|:---:|:---:|:---:|
+| **Restore masked values in the response** | ✅ optional toggle | ❌ cannot | ❌ cannot |
+| Detect secrets in transit | ✅ 72 detectors | ⚠️ limited | ✅ |
+| Streaming (SSE) restore | ✅ per-token | ❌ | ❌ |
+| No root CA required | ✅ | ❌ installs a CA | n/a |
+| Memory-safe secrets (Rust + zeroize) | ✅ | ❌ | ❌ |
+| Value-free audit log | ✅ | ❌ logs to SQLite | ❌ |
+| Runs locally / no cloud | ✅ | ✅ | ❌ server-side |
+| Open source | ✅ Apache-2.0 | ✅ | ✅ |
+
+**The gap no one else fills:** other tools hand the model `[REDACTED]` and you
+get useless code back. Promtect is the only one that can restore — and it lets
+you choose: transparent restore for usable answers, or strict mode where the
+secret never comes back at all.
+
+---
+
 ## Quickstart
 
-### Docker — 30 seconds
+### Native
 
 ```sh
-docker-compose up --build
+cargo run            # binds 127.0.0.1:8787, upstream → api.anthropic.com
+# in another shell:
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
+
+### Docker
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-claude           # use Claude Code as normal — Promtect is transparent
+docker compose up --build
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
 
-> **Security:** Always publish the port to `127.0.0.1:8787:8787`, not `8787:8787`.
+> **Security:** publish the port to `127.0.0.1:8787:8787`, never `8787:8787`.
 > The bundled `docker-compose.yml` does this correctly by default.
-
-### Native (Rust)
-
-```sh
-cargo run        # binds 127.0.0.1:8787, upstream → api.anthropic.com
-```
-
-```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-claude
-```
 
 ### Prove it works (no network needed)
 
 ```sh
-cargo run -- selftest   # → promtect selftest: PASS — no leak
-cargo test              # 55 unit + integration + property tests
+promtect selftest    # masks a canary secret, confirms it never leaks, restores it
 ```
 
 ---
 
-## Works with any setup
+## Works with your whole stack
 
-By default Promtect connects directly to `https://api.anthropic.com` — no other
-tools required. If you already have an intermediate proxy (for context compression,
-rate limiting, corporate egress, etc.) just point `PROMTECT_UPSTREAM` at it:
+Promtect protects more than Claude Code. Pick a provider with `PROMTECT_MODE`, or
+point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 
-```sh
-# Default: straight to Anthropic — works for everyone out of the box
-PROMTECT_UPSTREAM=https://api.anthropic.com          # default
+| Tool | Setup |
+|------|-------|
+| **Claude Code** | `promtect` then `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` |
+| **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8787/v1` |
+| **OpenAI Codex** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
+| **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
+| **OpenRouter** | `PROMTECT_MODE=openrouter promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/api/v1` |
+| **Headroom / LiteLLM / corp proxy** | `PROMTECT_UPSTREAM=<their-url> promtect` (Promtect goes first) |
 
-# Chained through Headroom (context-compression proxy)
-PROMTECT_UPSTREAM=http://127.0.0.1:8788
+Full guides: [`docs/integrations/`](docs/integrations/README.md). It doesn't
+matter whether you're using Claude, GPT, DeepSeek, or a local model — Promtect
+masks your secrets before any of them see them.
 
-# Chained through LiteLLM or any OpenAI-compatible gateway
-PROMTECT_UPSTREAM=http://localhost:4000
-
-# Through a corporate HTTPS gateway
-PROMTECT_UPSTREAM=https://ai-gateway.corp.internal
-```
-
-Promtect is upstream-agnostic: it forwards all headers (including auth) unchanged
-and handles the HTTP↔HTTPS boundary regardless of what sits behind it.
-
-### Full env-var reference
+### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROMTECT_PORT` | `8787` | Local port to bind |
-| `PROMTECT_UPSTREAM` | `https://api.anthropic.com` | Upstream URL |
-| `PROMTECT_AUDIT` | `promtect-audit.jsonl` | Audit log path |
+| `PROMTECT_PORT` | `8787` | Local port to bind (loopback) |
+| `PROMTECT_MODE` | `anthropic` | Upstream preset: `anthropic` / `openai` / `ollama` / `openrouter` |
+| `PROMTECT_UPSTREAM` | — | Explicit upstream URL; overrides mode (chaining) |
+| `PROMTECT_RESTORE` | `true` | `false` = strict mode: secrets are never re-inserted |
+| `PROMTECT_AUDIT` | `promtect-audit.jsonl` | Value-free audit log path |
 | `PROMTECT_BIND` | `127.0.0.1` | Bind address (loopback by default) |
-| `PROMTECT_DASHBOARD_PORT` | `8799` | Dashboard port (dashboard subcommand) |
+| `PROMTECT_MAX_BODY_BYTES` | `33554432` | Request-body cap (32 MiB) before a 413 |
+| `PROMTECT_DASHBOARD_PORT` | `8799` | Dashboard port (`promtect dashboard`) |
+
+---
+
+## Two modes, you choose
+
+- **Transparent (default):** secret masked outbound, real value seamlessly back
+  in the answer → AI output is directly usable.
+- **Strict (`PROMTECT_RESTORE=false`):** secret masked and *never* re-inserted —
+  provably never touches the response, logs, or terminal. Maximum paranoia for
+  security-strict teams.
 
 ---
 
 ## What it detects
 
-18 detectors ship out of the box, grouped by pattern type:
+**72 detectors** ship in the open-source core, covering known credential formats:
 
-**Provider tokens** (prefix-anchored): AWS access keys (`AKIA`/`ASIA`), Anthropic
-`sk-ant-`, OpenAI `sk-`, Stripe live/test keys, GitHub PATs and fine-grained tokens,
-GitLab PATs, Slack tokens (`xox*`), Google API keys (`AIza`), SendGrid, HuggingFace,
-npm.
+- **AI/LLM:** Anthropic, OpenAI, Groq, OpenRouter, Replicate, Perplexity,
+  Fireworks, NVIDIA, HuggingFace, Google AI
+- **Cloud/infra:** AWS (keys + secret), GCP, Azure Storage, DigitalOcean,
+  Doppler, HashiCorp Vault, Terraform, Databricks, PlanetScale, Tailscale
+- **Dev tools:** GitHub, GitLab, npm, PyPI, Docker Hub, Shopify, Linear,
+  Atlassian, Figma, Notion, Airtable, RubyGems, Postman, SonarQube, CircleCI
+- **SaaS/pay:** Slack, Discord, Twilio, SendGrid, Mailgun, Stripe, Square,
+  Razorpay
+- **AI infra:** Pinecone, LangSmith, MCP-style bearer tokens
+- **Structural:** JWTs, PEM / OpenSSH / PGP private keys, DB-URL passwords,
+  `.env`-style `KEY=value` pairs (with a placeholder + code-expression guard)
 
-**Structural secrets**: JWTs, PEM private-key blocks, database URL passwords (Postgres,
-MySQL, Redis).
+Adding a detector is ~one line in `src/detect.rs` — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-**Context-keyed values**: `.env`-style `KEY=value` pairs where the key contains
-`SECRET`, `TOKEN`, `PASSWORD`, `API_KEY`, or similar — with a placeholder guard that
-ignores obvious defaults like `changeme`, `example`, `null`.
-
-Adding a new detector is one line in `src/detect.rs`.
-
----
-
-## How Promtect compares
-
-Verified against primary sources (LiteLLM docs, Veil README, Velar README) in June 2025:
-
-|  | **Promtect** | LiteLLM Enterprise | Veil | Velar |
-|---|:---:|:---:|:---:|:---:|
-| Detects secrets in transit | ✅ 18 detectors | ✅ | ⚠️ Bearer tokens only | ✅ |
-| Masks before the LLM sees it | ✅ | ✅ (`[REDACTED]`) | ❌ | ✅ |
-| **Restores real values in response** | ✅ | ❌ stays `[REDACTED]` | ❌ | ❌ streaming gap |
-| Runs locally / no cloud | ✅ | ❌ server-side | ✅ | ✅ |
-| Free & open-source | ✅ | ❌ Enterprise tier | ✅ | ✅ |
-| Works with Claude Code out of the box | ✅ | ✅ | ⚠️ | ⚠️ |
-| Streaming response restore | ⚠️ M1 | — | — | ❌ explicit gap¹ |
-| No root CA required | ✅ | ✅ | ✅ | ✅ |
-
-¹ Velar's README states: *"Streaming responses are forwarded but content is not modified."*
-Since Claude Code, Copilot, and Cursor all default to streaming, this means Velar's masking
-is bypassed for the primary use case.
-
-**The key gap no competitor fills:** detect in transit + mask before the LLM + restore the
-real value in the response. LiteLLM comes closest but permanently replaces secrets with
-`[REDACTED]` — your output is broken, not protected.
-
----
-
-## Dashboard
-
-```sh
-PROMTECT_DASHBOARD_PORT=8799 \
-PROMTECT_AUDIT=promtect-audit.jsonl \
-  cargo run -- dashboard
-```
-
-Opens `http://127.0.0.1:8799` with:
-- **`/`** — browser UI: total requests, secrets caught, per-detector breakdown, recent events
-- **`/api/metrics`** — JSON (same data, machine-readable)
-- **`/metrics`** — Prometheus text exposition
-
----
-
-## Audit log
-
-Every mask and unmask event is appended to `promtect-audit.jsonl` as one JSON object
-per line. The log records timestamps, action, detector kind, sentinel ID, and request
-ID. **It never contains the real secret value** — only the opaque placeholder.
-
-```jsonl
-{"ts_ms":1781462180047,"action":"mask","detector":"aws_key","placeholder":"«promtect:aws_key:0001»","request_id":"f829fe7d"}
-{"ts_ms":1781462180047,"action":"mask","detector":"stripe_key","placeholder":"«promtect:stripe_key:0002»","request_id":"f829fe7d"}
-{"ts_ms":1781462180049,"action":"unmask","detector":"sentinel","placeholder":"«promtect:aws_key:0001»","request_id":"f829fe7d"}
-```
+> **Free vs Pro.** Free stops the keys you *know* about. Pro adds a different
+> capability class: entropy detection for unknown-format secrets, scanning the
+> model's *response* for leaked secrets, and PII/PHI/PCI compliance detection —
+> plus fleet enforcement and audit aggregation. *Free protects a developer; Pro
+> protects the company — and proves it.*
 
 ---
 
 ## Trust model
 
 - **Memory-only.** Secrets exist only in RAM and are zeroized on drop via the
-  `zeroize` crate — no heap dump, no swap residue beyond what the OS guarantees.
-- **Per-request vault.** Each request gets a fresh vault. A sentinel minted for
+  `zeroize` crate.
+- **Per-request vault.** Each request gets a fresh vault; a sentinel minted for
   request A cannot restore a secret from request B — cross-request bleed is
   impossible by construction.
-- **Headers untouched.** Auth headers (`x-api-key`, `Authorization`) are forwarded
-  verbatim. Promtect scans request bodies only.
-- **Upstream TLS.** Outbound connections use rustls with the platform certificate
-  verifier (OS trust store). No custom CA, no certificate pinning bypassed.
-- **Loopback-only by default.** `PROMTECT_BIND` defaults to `127.0.0.1`. In Docker
-  the container binds `0.0.0.0`, and the guarantee comes from publishing the port to
-  `127.0.0.1:PORT:PORT` on the host — the bundled compose file does this.
-- **No telemetry.** Exactly one outbound connection per proxied request. Nothing else
-  leaves the machine.
+- **Round-trip proven.** `restore(mask(x)) == x` is a property test, and the
+  streaming restorer is proven byte-for-byte identical to whole-buffer restore at
+  every chunk boundary.
+- **Headers untouched.** Auth headers are forwarded verbatim; Promtect scans
+  request bodies only.
+- **No telemetry.** Exactly one outbound connection per proxied request.
+
+---
+
+## Dashboard & audit
+
+```sh
+promtect dashboard      # http://127.0.0.1:8799 — UI, /api/metrics (JSON), /metrics (Prometheus)
+```
+
+Every mask/unmask event is appended to `promtect-audit.jsonl` — timestamp,
+action, detector kind, sentinel ID, request ID. **It never records the real
+secret value**, only the opaque placeholder. SOC 2 evidence, on tap.
 
 ---
 
 ## Develop
 
 ```sh
-make test          # cargo test (55 tests: unit + integration + property)
-make lint          # cargo fmt --check + clippy --all-targets -D warnings
-make smoke         # compile + run binary: prove masking + value-free audit log
-make coverage      # text coverage summary (needs: cargo install cargo-llvm-cov)
-make docker-build  # build the distroless image
-make up            # docker compose up -d
-make down          # docker compose down
+make test     # cargo test — 81 unit + integration + property tests
+make lint     # cargo fmt --check + clippy --all-targets -D warnings
+make smoke    # build + run: prove masking + value-free audit
 ```
 
-See [TESTING.md](TESTING.md) for the layered test strategy and the contract for
-keeping tests aligned with every change.
-
----
-
-## Limitations & roadmap
-
-| Item | Status |
-|---|---|
-| **SSE streaming restore** | **M1** — responses are buffered; secrets in streamed tokens are restored after the full response arrives, not per-token |
-| Linux native binary | Roadmap |
-| Custom always-mask vault (user-defined secrets) | M2 |
-| Entropy-based unknown-secret detection | M2 |
-| DB URL password containing literal `@` | Truncated at first `@`; encode as `%40` to work around |
+See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
+[SECURITY.md](SECURITY.md).
 
 ---
 
 ## License
 
-MIT. Contributions welcome — open an issue before sending a large PR.
+Apache-2.0. The open-source core is the whole free product — there is no crippled
+tier. Paid Promtect features (compliance, fleet, entropy, response scanning) are
+licensed separately. See [ADRs/ADR-002](ADRs/ADR-002-open-core-repo-architecture.md).
