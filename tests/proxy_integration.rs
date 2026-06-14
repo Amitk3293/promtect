@@ -34,10 +34,10 @@ async fn spawn(app: Router) -> String {
 }
 
 /// Build a fresh Airlock proxy `Ctx` pointing at `upstream_url`.
+/// No vault field: the proxy mints a per-request vault internally.
 fn ctx(upstream_url: &str) -> airlock::proxy::Ctx {
     airlock::proxy::Ctx {
         upstream: upstream_url.to_string(),
-        vault: Arc::new(airlock::vault::Vault::new()),
         audit: Arc::new(airlock::audit::Audit::null()),
         client: reqwest::Client::new(),
     }
@@ -178,7 +178,6 @@ async fn upstream_error_returns_502() {
     drop(reserved);
     let dead_ctx = airlock::proxy::Ctx {
         upstream: format!("http://{dead_addr}"),
-        vault: Arc::new(airlock::vault::Vault::new()),
         audit: Arc::new(airlock::audit::Audit::null()),
         client: reqwest::Client::new(),
     };
@@ -325,4 +324,45 @@ async fn forwarded_content_length_matches_masked_body() {
             "chunked-encoded body must still contain the sentinel"
         );
     }
+}
+
+/// A sentinel from one request must never restore a secret from another. The
+/// vault is per-request, so a `«airlock:aws_key:0001»` minted while masking
+/// request 1's real key cannot be expanded back into that key when the SAME
+/// literal sentinel appears in request 2's response. This pins the cross-request
+/// secret-bleed fix: one shared `Ctx` (and thus one shared upstream/audit) but a
+/// fresh vault per request.
+#[tokio::test]
+async fn vault_does_not_bleed_secrets_across_requests() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    // The deterministic sentinel: the first secret minted in a fresh vault is
+    // always counter 1 -> 0001, kind aws_key.
+    let sentinel = "«airlock:aws_key:0001»";
+
+    let (mock_url, _seen) = spawn_mock().await;
+    // ONE Ctx shared across both requests, exactly as the running server uses it.
+    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await;
+
+    // Request 1: a real AWS key is masked to `0001` inside request 1's vault.
+    let (_, resp1) = post_through(&airlock_url, &format!(r#"{{"key":"{aws}"}}"#)).await;
+    assert!(
+        resp1.contains(aws),
+        "request 1 must restore its own secret in its own response"
+    );
+
+    // Request 2: the body literally contains request 1's sentinel. It is not a
+    // detectable secret, so it passes through to the (echoing) upstream unchanged
+    // and comes back in the response, where restore runs against request 2's vault.
+    let (_, resp2) = post_through(&airlock_url, &format!(r#"{{"note":"{sentinel}"}}"#)).await;
+
+    // With a per-request vault, request 2's vault never learned `0001`, so the
+    // sentinel stays literal and request 1's real key cannot leak.
+    assert!(
+        resp2.contains(sentinel),
+        "request 2 must keep the literal sentinel (its vault never minted it)"
+    );
+    assert!(
+        !resp2.contains(aws),
+        "request 1's real secret must NOT bleed into request 2's response"
+    );
 }

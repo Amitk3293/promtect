@@ -3,7 +3,6 @@ use std::sync::Arc;
 use airlock::{
     audit,
     proxy::{self, Ctx},
-    vault,
 };
 
 #[tokio::main]
@@ -33,7 +32,6 @@ async fn main() {
 
     let ctx = Ctx {
         upstream,
-        vault: Arc::new(vault::Vault::new()),
         audit: Arc::new(audit::Audit::to_file(audit_path.into())),
         client: reqwest::Client::new(),
     };

@@ -109,6 +109,19 @@ fn segments() -> impl Strategy<Value = Vec<Segment>> {
     )
 }
 
+/// Like `segments()` but GUARANTEES at least one `Secret` segment.
+///
+/// The plain `segments()` strategy frequently yields zero secrets, which makes
+/// the no-leak property vacuous (its loop iterates over an empty `planted_secrets`
+/// and asserts nothing). Here we prepend a mandatory `synthetic_secret()` so the
+/// assembled input always contains a real secret to hide.
+fn segments_with_secret() -> impl Strategy<Value = Vec<Segment>> {
+    (synthetic_secret(), segments()).prop_map(|(s, mut rest)| {
+        rest.insert(0, Segment::Secret(s));
+        rest
+    })
+}
+
 /// Build the full input string and the list of planted secrets from a segment vec.
 /// Adjacent segments are joined with a single space so that no two secrets run
 /// together; this prevents the (documented) edge case where overlapping detector
@@ -149,9 +162,13 @@ proptest! {
     }
 
     #[test]
-    fn masked_body_hides_every_planted_secret(segs in segments()) {
+    fn masked_body_hides_every_planted_secret(segs in segments_with_secret()) {
         // No-leak invariant: a detected secret value never survives masking.
         let (input, planted_secrets) = assemble(&segs);
+        // Precondition: `segments_with_secret()` guarantees a secret, so the loop
+        // below always asserts something. This guards against the property going
+        // vacuous (passing trivially because there was nothing to check).
+        prop_assume!(!planted_secrets.is_empty());
         let vault = Vault::new();
         let audit = Audit::null();
         let masked = mask_text(&input, &vault, &audit, "prop");

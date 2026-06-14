@@ -129,15 +129,23 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             1,
             false,
         ),
+        // PASSWORD capture excludes only `@` (the userinfo/host separator) and
+        // whitespace. A `/` is legal inside a password and must NOT abort the
+        // match; the username class keeps `/` excluded so the `user:pass` split is
+        // unambiguous. (Passwords containing a literal `@` remain a known gap.)
         dg(
             "db_password",
-            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@/\s]+)@",
+            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@\s]+)@",
             1,
             true,
         ),
+        // `[a-z0-9_]*` allows a compound prefix (e.g. `DB_`, `MY_`) before the
+        // keyword: `\b` does not match across `_`, so the old `\b`-anchored form
+        // missed `DB_PASSWORD`, `MY_TOKEN`, `APP_SECRET`. The keyword group stays
+        // NON-capturing so the value remains capture group 1.
         dg(
             "env_secret",
-            r#"(?i)\b(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)\b["']?\s*[:=]\s*["']?([^\s"',}]{8,})"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}]{8,})"#,
             1,
             true,
         ),
@@ -214,6 +222,18 @@ mod tests {
         );
     }
 
+    /// A `/` inside the password must not abort the whole-URL match: the password
+    /// capture excludes only `@` and whitespace, so `p4ss/word` is captured intact.
+    #[test]
+    fn db_password_allows_slash_in_password() {
+        let hits = detect("DATABASE_URL=postgres://app:p4ss/word@db:5432/x");
+        assert!(
+            hits.iter()
+                .any(|m| m.kind == "db_password" && m.value == "p4ss/word"),
+            "password containing '/' must still be detected"
+        );
+    }
+
     #[test]
     fn env_secret_is_guarded_against_placeholders() {
         assert!(detect("PASSWORD=changeme").is_empty());
@@ -222,6 +242,25 @@ mod tests {
             detect("API_KEY=A9f83Kd0parealtoken")
                 .iter()
                 .any(|m| m.kind == "env_secret")
+        );
+    }
+
+    /// Compound env-var keys (a prefix joined by `_` to the keyword, like
+    /// `DB_PASSWORD` or `MY_TOKEN`) are the most common real-world secret names;
+    /// `\b` does not match across `_`, so the old anchor missed them entirely.
+    #[test]
+    fn env_secret_matches_compound_keys() {
+        assert!(
+            detect("DB_PASSWORD=S3cretValue123")
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value == "S3cretValue123"),
+            "DB_PASSWORD compound key must be detected"
+        );
+        assert!(
+            detect("MY_TOKEN=realtoken456789")
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value == "realtoken456789"),
+            "MY_TOKEN compound key must be detected"
         );
     }
 
