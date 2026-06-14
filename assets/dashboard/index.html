@@ -826,7 +826,7 @@
       if (!d.recent.length) {
         rows = el("tr", null, el("td", { colspan: "5" }, el("div", { class: "al-empty" }, [
           el("div", { class: "al-empty__title" }, "No requests yet"),
-          el("div", { class: "al-note" }, "Point Claude Code at Promtect to see live traffic.")
+          el("div", { class: "al-note" }, "Point your AI tool at the Promtect proxy to see live traffic.")
         ])));
       } else {
         rows = d.recent.map(function (r) {
@@ -908,7 +908,7 @@
       return Card("al-panel", [
         el("div", { class: "al-empty" }, [
           el("div", { class: "al-empty__title" }, "No traffic yet"),
-          el("p", { class: "al-note" }, "Point Claude Code at Promtect (127.0.0.1:8799) and your secrets will be masked at the door. Counts, detector kinds and byte sizes appear here — never a secret value.")
+          el("p", { class: "al-note" }, "Point your AI tool at the Promtect proxy (default 127.0.0.1:8787) and your secrets are masked at the door. Counts, detector kinds and byte sizes appear here — never a secret value.")
         ])
       ]);
     }

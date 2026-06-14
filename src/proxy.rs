@@ -118,8 +118,6 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             );
         }
     };
-    let body_text = String::from_utf8_lossy(&body_bytes).to_string();
-
     // INVARIANT: one vault per request. The same vault masks the outbound body
     // and restores the inbound response, so only sentinels minted *for this
     // request* can ever be expanded back into a secret — no cross-request bleed.
@@ -127,36 +125,40 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // polls after this handler returns.
     let vault = Arc::new(Vault::new());
 
-    // Content-type guard: scan textual bodies only. A binary/opaque body — a
-    // multipart upload, an audio/image payload to an OpenAI endpoint — is
-    // forwarded byte-for-byte, so the proxy never corrupts it by lossy UTF-8
-    // conversion or a mistaken substitution. Default is to scan (secure).
-    let forward_bytes = if is_binary_body(&headers) {
-        // Pass through unscanned, but still record it as traffic (zero secrets)
-        // so the request appears in metrics.
-        ctx.audit
-            .record_request(&request_id, 0, &[], body_bytes.len(), body_bytes.len());
-        body_bytes.to_vec()
-    } else {
-        // Mask request body content. Auth headers forwarded untouched in forward().
-        let masked = mask_text(&body_text, &vault, &ctx.audit, &request_id);
+    // Scan the body only when it is genuinely text. We decide this from the ACTUAL
+    // bytes (valid UTF-8?), NOT the client-declared `Content-Type` — otherwise a
+    // request could bypass masking and leak a secret simply by mislabelling a JSON
+    // body as `application/octet-stream`. A body that is not valid UTF-8 is binary
+    // (or mislabelled binary) and is forwarded byte-for-byte, so the proxy never
+    // corrupts it by lossy conversion or a mistaken substitution.
+    let forward_bytes = match std::str::from_utf8(&body_bytes) {
+        Ok(text) => {
+            // Mask request body content. Auth headers forwarded untouched in forward().
+            let masked = mask_text(text, &vault, &ctx.audit, &request_id);
 
-        // Second detect pass for the per-request summary (cheap; same input). This
-        // avoids changing mask_text's signature while still producing an accurate
-        // "caught vs clean" event. Secret values are never included in the summary.
-        let hits = detect::detect(&body_text);
-        let mut kinds: Vec<&str> = hits.iter().map(|m| m.kind).collect();
-        kinds.sort_unstable();
-        kinds.dedup();
-        ctx.audit.record_request(
-            &request_id,
-            hits.len(),
-            &kinds,
-            body_bytes.len(),
-            masked.len(),
-        );
+            // Second detect pass for the per-request summary (cheap; same input).
+            // Secret values are never included in the summary.
+            let hits = detect::detect(text);
+            let mut kinds: Vec<&str> = hits.iter().map(|m| m.kind).collect();
+            kinds.sort_unstable();
+            kinds.dedup();
+            ctx.audit.record_request(
+                &request_id,
+                hits.len(),
+                &kinds,
+                body_bytes.len(),
+                masked.len(),
+            );
 
-        masked.into_bytes()
+            masked.into_bytes()
+        }
+        Err(_) => {
+            // Non-UTF-8 (binary) body: forward unscanned, but record it as traffic
+            // (zero secrets) so the request still appears in metrics.
+            ctx.audit
+                .record_request(&request_id, 0, &[], body_bytes.len(), body_bytes.len());
+            body_bytes.to_vec()
+        }
     };
 
     match forward(&ctx, method, &uri, &headers, forward_bytes).await {
@@ -165,12 +167,15 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     }
 }
 
-/// Whether a body is a known binary/opaque type that must NOT be scanned or
-/// restored. Masking such a body would corrupt it (lossy UTF-8 conversion or a
-/// mistaken substitution), so binary requests are forwarded and binary responses
-/// are streamed back byte-for-byte. The default is *not* binary — an absent or
-/// unrecognised content-type is still scanned, so a secret is never skipped just
-/// because the type is missing (secure default).
+/// Whether a *response* is a known binary/opaque type that must NOT be run
+/// through the restorer — lossy UTF-8 handling of a binary body (e.g. an image
+/// endpoint) would corrupt it, so it is streamed back byte-for-byte. The default
+/// is *not* binary — an absent or unrecognised type is still restored (it only
+/// ever re-inserts this request's own sentinels, never a cross-request value).
+///
+/// Note: the *request* side does NOT use this — masking is decided by actual
+/// UTF-8 validity of the body, so a secret cannot bypass masking via a mislabelled
+/// `Content-Type` (see `handle`).
 fn is_binary_body(headers: &HeaderMap) -> bool {
     let Some(value) = headers.get(axum::http::header::CONTENT_TYPE) else {
         return false; // absent → treat as textual and scan it
@@ -192,6 +197,20 @@ fn is_binary_body(headers: &HeaderMap) -> bool {
         || s.starts_with("application/grpc")
 }
 
+/// Whether a response carries a non-identity `Content-Encoding` (gzip, br, …). A
+/// compressed body must not be run through the restorer (it would scan ciphertext)
+/// and must keep its encoding header so the client can decode it.
+fn is_compressed(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            let s = s.trim();
+            !s.is_empty() && !s.eq_ignore_ascii_case("identity")
+        })
+        .unwrap_or(false)
+}
+
 async fn forward(
     ctx: &Ctx,
     method: Method,
@@ -205,8 +224,13 @@ async fn forward(
     let mut builder = ctx.client.request(method, url.as_str()).body(body);
     for (name, value) in headers.iter() {
         let n = name.as_str();
+        // reqwest sets Host/Content-Length for the new target and frames the body
+        // itself, so forwarding the client's hop-by-hop framing would conflict.
+        // accept-encoding is dropped so the upstream replies uncompressed (we scan
+        // and restore the plaintext body).
         if n.eq_ignore_ascii_case("host")
             || n.eq_ignore_ascii_case("content-length")
+            || n.eq_ignore_ascii_case("transfer-encoding")
             || n.eq_ignore_ascii_case("accept-encoding")
         {
             continue;
@@ -225,26 +249,35 @@ async fn restore_response(
     let status = r.status();
     let resp_headers = r.headers().clone();
 
+    // Restore only when enabled, the response is textual, AND it is not
+    // compressed. We strip `accept-encoding` outbound so a compliant upstream
+    // replies uncompressed; but if one compresses anyway, restoring would scan
+    // ciphertext (finding nothing) and then we'd mislabel the body — so a
+    // compressed response is streamed through verbatim WITH its content-encoding.
+    let will_restore =
+        ctx.restore && !is_binary_body(&resp_headers) && !is_compressed(&resp_headers);
+
     let mut out = Response::builder().status(status);
     for (name, value) in resp_headers.iter() {
         let n = name.as_str();
-        // Drop length/encoding framing: the body is re-chunked and its length
-        // changes when sentinels expand to real secrets, so a copied
-        // content-length or transfer-encoding would describe the wrong body.
-        if n.eq_ignore_ascii_case("content-length")
-            || n.eq_ignore_ascii_case("content-encoding")
-            || n.eq_ignore_ascii_case("transfer-encoding")
-        {
+        // content-length and transfer-encoding are always dropped: we re-chunk the
+        // body and its length changes when sentinels expand to real secrets.
+        if n.eq_ignore_ascii_case("content-length") || n.eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        // content-encoding is dropped only when we restore (we emit identity
+        // plaintext). When passing a compressed body through verbatim we KEEP it so
+        // the client can still decode.
+        if will_restore && n.eq_ignore_ascii_case("content-encoding") {
             continue;
         }
         out = out.header(name.clone(), value.clone());
     }
 
-    // Restore only when enabled AND the response is textual. A binary response
-    // (e.g. an image endpoint) must stream back byte-for-byte — running it
-    // through the restorer would lossily corrupt it. `text/event-stream` is
-    // textual, so SSE is restored.
-    let body = if ctx.restore && !is_binary_body(&resp_headers) {
+    // A binary response (e.g. an image endpoint) must stream back byte-for-byte —
+    // running it through the restorer would lossily corrupt it. `text/event-stream`
+    // is textual, so SSE is restored.
+    let body = if will_restore {
         // Transparent mode: restore secrets incrementally as the response
         // streams. SSE answers reach the client token-by-token instead of being
         // buffered whole (the M0 "hang"). The vault moves into the stream, which
@@ -252,9 +285,9 @@ async fn restore_response(
         let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id);
         Body::from_stream(restore_stream(r.bytes_stream().boxed(), sr))
     } else {
-        // Strict mode (PROMTECT_RESTORE=false) or a binary response: never
-        // re-insert secrets. Stream the body straight through; the per-request
-        // vault is dropped (and its contents zeroized) unused.
+        // Strict mode (PROMTECT_RESTORE=false), or a binary/compressed response:
+        // never re-insert secrets. Stream the body straight through; the
+        // per-request vault is dropped (and its contents zeroized) unused.
         drop(vault);
         Body::from_stream(r.bytes_stream())
     };

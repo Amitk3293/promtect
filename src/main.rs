@@ -91,11 +91,22 @@ async fn main() {
         std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
 
     // Operator-tunable body cap; defaults to 32 MiB. Bounds the memory a single
-    // request can force Promtect to buffer while scanning for secrets.
-    let max_body_bytes: usize = std::env::var("PROMTECT_MAX_BODY_BYTES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(proxy::DEFAULT_MAX_BODY_BYTES);
+    // request can force Promtect to buffer while scanning for secrets. Fail closed
+    // on a present-but-invalid value (or 0) rather than silently reverting to the
+    // default — an operator who lowered the cap shouldn't get the large default
+    // because of a typo, and 0 would reject every request.
+    let max_body_bytes: usize = match std::env::var("PROMTECT_MAX_BODY_BYTES") {
+        Err(_) => proxy::DEFAULT_MAX_BODY_BYTES,
+        Ok(s) => match s.trim().parse::<usize>() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!(
+                    "promtect: PROMTECT_MAX_BODY_BYTES must be a positive integer (got {s:?})"
+                );
+                std::process::exit(1);
+            }
+        },
+    };
 
     // Restore real secrets in the response (transparent mode) by default. Set
     // PROMTECT_RESTORE to a falsey value for strict mode, where the masked body

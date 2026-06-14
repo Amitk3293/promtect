@@ -17,7 +17,7 @@
 //! in `tests/property.rs`.
 
 use crate::audit::Audit;
-use crate::mask::{find_sentinels, sentinel_kind};
+use crate::mask::restore_scan;
 use crate::vault::Vault;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
@@ -119,20 +119,17 @@ impl StreamRestorer {
     }
 
     /// Replace every known sentinel in `s` with its secret, auditing each distinct
-    /// sentinel once per stream. Unknown sentinels are left untouched.
+    /// sentinel once per stream. Delegates to the single-pass `mask::restore_scan`
+    /// so the streaming and whole-buffer paths share identical (cascade-free)
+    /// restore semantics.
     fn restore_str(&mut self, s: &str) -> String {
-        let unique: HashSet<String> = find_sentinels(s).into_iter().collect();
-        let mut out = s.to_string();
-        for token in &unique {
-            if let Some(secret) = self.vault.secret_for(token) {
-                out = out.replace(token, &secret);
-                if self.audited.insert(token.clone()) {
-                    self.audit
-                        .record("unmask", sentinel_kind(token), token, &self.request_id);
-                }
-            }
-        }
-        out
+        restore_scan(
+            s,
+            &self.vault,
+            &self.audit,
+            &self.request_id,
+            &mut self.audited,
+        )
     }
 }
 
@@ -159,16 +156,18 @@ fn rfind_pair(buf: &[u8], a: u8, b: u8) -> Option<usize> {
         .find(|&i| buf[i] == a && buf[i + 1] == b)
 }
 
-/// State for [`restore_stream`]'s `unfold`: either still reading the upstream, or
-/// finished (the final flush has been emitted).
+/// State for [`restore_stream`]'s `unfold`: reading the upstream, about to emit a
+/// deferred error (after the carry was flushed), or finished.
 enum St<E> {
     Reading(BoxStream<'static, Result<Bytes, E>>, StreamRestorer),
+    Erroring(E),
     Done,
 }
 
 /// Adapt an upstream byte stream into a restored byte stream: every chunk runs
-/// through `sr`, and a final flush is emitted when the upstream ends. Upstream
-/// errors are forwarded unchanged and end the stream.
+/// through `sr`, and a final flush is emitted when the upstream ends. On a
+/// mid-stream upstream error the retained carry is flushed FIRST (so no held bytes
+/// are silently dropped), then the error is forwarded and the stream ends.
 pub fn restore_stream<E>(
     upstream: BoxStream<'static, Result<Bytes, E>>,
     sr: StreamRestorer,
@@ -183,14 +182,23 @@ where
                     let out = sr.push(&chunk);
                     Some((Ok(out), St::Reading(up, sr)))
                 }
-                // Forward the upstream error, then end.
-                Some(Err(e)) => Some((Err(e), St::Done)),
+                // Upstream errored mid-stream: flush whatever the restorer held
+                // back so those bytes are not lost, THEN surface the error next.
+                Some(Err(e)) => {
+                    let tail = sr.finish();
+                    if tail.is_empty() {
+                        Some((Err(e), St::Done))
+                    } else {
+                        Some((Ok(tail), St::Erroring(e)))
+                    }
+                }
                 // Upstream finished: flush the retained tail, then end.
                 None => {
                     let tail = sr.finish();
                     Some((Ok(tail), St::Done))
                 }
             },
+            St::Erroring(e) => Some((Err(e), St::Done)),
             St::Done => None,
         }
     })
@@ -249,8 +257,11 @@ mod tests {
     #[test]
     fn every_chunk_size_matches_whole_buffer() {
         let (vault, sentinel) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
-        // Multibyte content around the sentinel exercises partial-codepoint cuts.
-        let body = format!("héllo {sentinel} wörld {sentinel}!");
+        // Multibyte content around — and DIRECTLY adjacent to — the sentinel
+        // exercises partial-codepoint cuts and the guillemet-vs-codepoint boundary
+        // (`«` is 0xC2 0xAB; 0xC2 can never be a UTF-8 continuation byte, so a `«`
+        // lead always lands on a codepoint boundary — this proves it at every cut).
+        let body = format!("héllo {sentinel} wörld {sentinel}! Ã{sentinel}Ω{sentinel}");
         let expected = restore_text(&body, &vault, &Audit::null(), "req");
         for size in 1..=body.len() {
             let got = run_chunked(Arc::clone(&vault), body.as_bytes(), size);

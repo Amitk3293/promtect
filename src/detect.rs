@@ -220,8 +220,17 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             "discord_webhook",
             r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+",
         ),
-        d("twilio_key", r"\bSK[0-9a-fA-F]{32}\b"),
-        d("mailgun_key", r"\bkey-[0-9a-f]{32}\b"),
+        // Mailgun's `key-<32hex>` shape is indistinguishable from a cache key or
+        // MD5 in isolation, so require the word "mailgun" nearby (the bare KEY=value
+        // form is already covered by `env_secret`). Twilio's `SK<32hex>` is the
+        // public-ish API-key SID (not the secret) and far too false-positive-prone
+        // to detect bare; the real auth token is caught by `env_secret`.
+        dg(
+            "mailgun_key",
+            r"(?i)mailgun[^\n]{0,40}\b(key-[0-9a-f]{32})\b",
+            1,
+            false,
+        ),
         d("stripe_webhook", r"\bwhsec_[A-Za-z0-9]{32,}\b"),
         d("square_token", r"\bsq0(?:atp|csp|idp)-[A-Za-z0-9_-]{22,}\b"),
         d("razorpay_key", r"\brzp_(?:live|test)_[A-Za-z0-9]{14,}\b"),
@@ -234,13 +243,18 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // ── Monitoring / messaging / misc ───────────────────────────────────
         d("sentry_user_token", r"\bsntryu_[A-Za-z0-9]{64}\b"),
         d("sentry_org_token", r"\bsntrys_[A-Za-z0-9_=+/]{60,}\b"),
-        d("sentry_dsn", r"https://[0-9a-f]{32}@[\w.-]+/\d+\b"),
+        // Anchor the DSN host to sentry.io so we don't match any basic-auth URL of
+        // the form https://<32hex>@<anyhost>/<digits>.
+        d(
+            "sentry_dsn",
+            r"https://[0-9a-f]{32}@[a-z0-9.-]*sentry\.io/\d+",
+        ),
         d("newrelic_key", r"\bNRAK-[A-Z0-9]{27}\b"),
         d(
             "mapbox_token",
             r"\b[ps]k\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b",
         ),
-        d("telegram_bot", r"\b\d{8,10}:[A-Za-z0-9_-]{35}\b"),
+        d("telegram_bot", r"\b\d{6,16}:[A-Za-z0-9_-]{35}\b"),
         d("google_oauth", r"\bya29\.[A-Za-z0-9_-]{30,}\b"),
         d("gcp_refresh", r"\b1//[A-Za-z0-9_-]{30,}\b"),
         d("fcm_token", r"\bAPA91[A-Za-z0-9_-]{100,}\b"),
@@ -475,8 +489,7 @@ mod tests {
                 "https://discord.com/api/webhooks/123456789012345678/AbCdEf-tok".to_string(),
                 "discord_webhook",
             ),
-            (format!("SK{}", h(32)), "twilio_key"),
-            (format!("key-{}", h(32)), "mailgun_key"),
+            (format!("mailgun api key-{}", h(32)), "mailgun_key"),
             (format!("whsec_{}", a(32)), "stripe_webhook"),
             (format!("sq0atp-{}", a(22)), "square_token"),
             (format!("rzp_live_{}", a(16)), "razorpay_key"),
