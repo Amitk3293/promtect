@@ -24,22 +24,42 @@ sentinels (`«airlock:aws_key:0001»`), forwards its own HTTPS request upstream,
 then restores the real values in the response. No TLS interception, no root
 certificate.
 
-## Run
+## Quickstart — Docker (easiest)
 
 ```sh
-cargo run            # listens on http://127.0.0.1:8787
+docker compose up --build      # build + run locally
 ```
 
-In another shell:
+Or run the prebuilt image directly (available once the project is public):
+
+```sh
+docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/amitk3293/airlock-ai:latest
+```
+
+Then point Claude Code at it:
 
 ```sh
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-claude               # use Claude Code normally
+claude                         # use Claude Code normally
 ```
 
-Config via env vars: `AIRLOCK_PORT` (default 8787), `AIRLOCK_UPSTREAM`
-(default `https://api.anthropic.com`), `AIRLOCK_AUDIT` (default
-`airlock-audit.jsonl`).
+> **Security — keep the `127.0.0.1:` prefix.** Always publish to
+> `127.0.0.1:8787:8787`. Publishing as `8787:8787` binds `0.0.0.0` on your host and
+> exposes the secrets proxy to your whole network. The bundled `docker-compose.yml`
+> does the right thing by default.
+
+## Quickstart — native
+
+```sh
+cargo run                      # binds 127.0.0.1:8787
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+claude
+```
+
+Config (both paths) via env vars: `AIRLOCK_PORT` (8787), `AIRLOCK_UPSTREAM`
+(`https://api.anthropic.com`), `AIRLOCK_AUDIT` (`airlock-audit.jsonl`), and
+`AIRLOCK_BIND` (`127.0.0.1`; the container sets `0.0.0.0` — only safe when the
+port is published to loopback).
 
 ## Prove it works (no network)
 
@@ -74,6 +94,16 @@ value.**
 - Loopback-only bind (`127.0.0.1`); the upstream auth header is forwarded
   untouched (Airlock masks request **bodies**, never headers).
 - Exactly one outbound connection per request; no telemetry.
+
+## Develop
+
+```sh
+make test          # cargo test
+make lint          # fmt --check + clippy -D warnings
+make smoke         # prove the built binary masks + writes a value-free audit log
+make docker-build  # build the distroless image
+make up / make down  # docker compose up -d / down
+```
 
 ## Scope & limitations (M0)
 
