@@ -10,6 +10,8 @@ use axum::{
 };
 use std::sync::Arc;
 
+/// Shared, cheaply-clonable per-request context for the proxy pipeline:
+/// the upstream base URL, the secret vault, the audit log, and the outbound client.
 #[derive(Clone)]
 pub struct Ctx {
     pub upstream: String,
@@ -18,6 +20,8 @@ pub struct Ctx {
     pub client: reqwest::Client,
 }
 
+/// Build the Airlock Axum router: a catch-all fallback that masks the request
+/// body, forwards to `upstream`, and restores secrets in the response.
 pub fn app(ctx: Ctx) -> Router {
     Router::new().fallback(handle).with_state(ctx)
 }

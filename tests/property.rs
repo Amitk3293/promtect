@@ -135,6 +135,8 @@ fn assemble(segs: &[Segment]) -> (String, Vec<String>) {
 // ---------------------------------------------------------------------------
 
 proptest! {
+    #![proptest_config(ProptestConfig { failure_persistence: None, ..ProptestConfig::default() })]
+
     #[test]
     fn restore_undoes_mask(segs in segments()) {
         // Core invariant: the round-trip is lossless for sentinel-free inputs.
