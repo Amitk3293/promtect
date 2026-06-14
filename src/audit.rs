@@ -1,7 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Append-only JSONL audit log. Records mask/unmask events — never secret values.
@@ -21,6 +21,16 @@ impl Audit {
         Audit {
             sink: Mutex::new(None),
         }
+    }
+
+    /// Lock the sink, recovering the guard if a previous holder panicked. The
+    /// audit log is best-effort and the guarded value is a plain `Option<PathBuf>`
+    /// with no invariant a mid-write panic could corrupt, so a poisoned mutex must
+    /// never escalate into a crash that takes down the proxy.
+    fn sink_lock(&self) -> MutexGuard<'_, Option<PathBuf>> {
+        self.sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Record a value-free per-request summary: how many secrets were masked, which
@@ -53,7 +63,7 @@ impl Audit {
             "bytes_in": bytes_in,
             "bytes_out": bytes_out,
         });
-        let guard = self.sink.lock().unwrap();
+        let guard = self.sink_lock();
         if let Some(path) = guard.as_ref()
             && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
         {
@@ -74,7 +84,7 @@ impl Audit {
             "placeholder": placeholder,
             "request_id": request_id,
         });
-        let guard = self.sink.lock().unwrap();
+        let guard = self.sink_lock();
         if let Some(path) = guard.as_ref()
             && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
         {

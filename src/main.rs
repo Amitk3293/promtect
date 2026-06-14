@@ -81,10 +81,18 @@ async fn main() {
     let audit_path =
         std::env::var("AIRLOCK_AUDIT").unwrap_or_else(|_| "airlock-audit.jsonl".into());
 
+    // Operator-tunable body cap; defaults to 32 MiB. Bounds the memory a single
+    // request can force Airlock to buffer while scanning for secrets.
+    let max_body_bytes: usize = std::env::var("AIRLOCK_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(proxy::DEFAULT_MAX_BODY_BYTES);
+
     let ctx = Ctx {
         upstream,
         audit: Arc::new(audit::Audit::to_file(audit_path.into())),
         client: reqwest::Client::new(),
+        max_body_bytes,
     };
 
     let app = proxy::app(ctx);

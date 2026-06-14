@@ -26,7 +26,7 @@ the smallest units in isolation.
 | Area | What is tested |
 |---|---|
 | Detectors (`detect.rs`) | Per-provider positive and negative cases (true hit / no false-positive) |
-| Vault (`vault.rs`) | Dedup (same secret → same sentinel), distinct secrets → distinct sentinels, round-trip lookup (sentinel → secret) |
+| Vault (`vault.rs`) | Dedup (same secret → same sentinel), distinct secrets → distinct sentinels, round-trip lookup (sentinel → secret), poison-recovery (a panic held under the lock doesn't crash later requests) |
 | Masker (`mask.rs`) | Span-level splice — correct sentinel substitution and index arithmetic |
 | Audit (`audit.rs`) | Log entries are value-free (no secret value ever written) |
 | Net (`net.rs`) | `is_loopback` classification |
@@ -49,6 +49,7 @@ They verify behavior that spans the full request/response pipeline.
 | Response restore | Sentinels in the upstream response are replaced with the real values |
 | 502 on upstream error | A dead upstream produces a clean 502, not a panic |
 | Stable sentinel | The same secret in the same request always maps to the same sentinel |
+| Body-size cap | A body over `max_body_bytes` returns 413 and never reaches the upstream; a body under the cap passes through normally |
 
 **Run:** `cargo test` (all L2) or `cargo test --test integration` / `cargo test --test proxy_integration` individually
 

@@ -36,10 +36,25 @@ pub fn restore_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) 
     for token in unique {
         if let Some(secret) = vault.secret_for(&token) {
             out = out.replace(&token, &secret);
-            audit.record("unmask", "sentinel", &token, request_id);
+            // Log the detector kind carried in the sentinel (e.g. "aws_key"), not a
+            // flat "sentinel" literal, so unmask events are attributable by detector
+            // exactly like the corresponding mask events.
+            audit.record("unmask", sentinel_kind(&token), &token, request_id);
         }
     }
     out
+}
+
+/// Extract the detector kind from a sentinel token `«airlock:KIND:HEX»`.
+/// Falls back to `"sentinel"` for a malformed token — `find_sentinels` only ever
+/// yields well-formed tokens, but restore must never panic on adversarial
+/// upstream content, so this stays total.
+fn sentinel_kind(token: &str) -> &str {
+    token
+        .strip_prefix("«airlock:")
+        .and_then(|rest| rest.split(':').next())
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or("sentinel")
 }
 
 /// Extract candidate sentinel tokens `«airlock:...»` from text.
@@ -47,7 +62,10 @@ pub fn find_sentinels(text: &str) -> Vec<String> {
     use regex::Regex;
     use std::sync::LazyLock;
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"«airlock:[a-z_]+:[0-9a-f]+»").expect("airlock sentinel regex")
+        // Kind segment allows digits ([a-z0-9_]) so a future detector kind such as
+        // "s3_key" or "base64" still round-trips through restore. The counter
+        // segment is lowercase hex from `format!("{:04x}")`.
+        Regex::new(r"«airlock:[a-z0-9_]+:[0-9a-f]+»").expect("airlock sentinel regex")
     });
     RE.find_iter(text).map(|m| m.as_str().to_string()).collect()
 }
@@ -175,5 +193,46 @@ mod tests {
             !contents.contains(secret),
             "audit must not log the secret value"
         );
+    }
+
+    /// An `unmask` event must attribute the detector kind carried in the sentinel
+    /// (here `aws_key`), not a flat `"sentinel"` literal — so unmask is queryable
+    /// by detector exactly like mask.
+    #[test]
+    fn unmask_event_records_real_detector_kind() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("airlock-kind-{}.jsonl", uuid::Uuid::new_v4()));
+
+        let vault = Vault::new();
+        let audit = Audit::to_file(path.clone());
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+
+        let masked = mask_text(&format!("key={secret}"), &vault, &audit, "reqK");
+        let restored = restore_text(&masked, &vault, &audit, "reqK");
+        assert_eq!(restored, format!("key={secret}"));
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(contents.contains("\"action\":\"unmask\""));
+        // The detector is the real kind, and the old "sentinel" placeholder is gone.
+        assert!(
+            contents.contains("\"detector\":\"aws_key\""),
+            "unmask must record the detector kind from the sentinel"
+        );
+        assert!(
+            !contents.contains("\"detector\":\"sentinel\""),
+            "unmask must not log the flat \"sentinel\" literal"
+        );
+    }
+
+    /// A sentinel whose detector kind contains a digit (e.g. a future `s3_key`)
+    /// must still be recognised by `find_sentinels`, otherwise restore would
+    /// silently leave it un-expanded.
+    #[test]
+    fn find_sentinels_matches_digit_bearing_kind() {
+        let toks = find_sentinels("a «airlock:s3_key:000a» b");
+        assert_eq!(toks, vec!["«airlock:s3_key:000a»".to_string()]);
+        assert_eq!(sentinel_kind("«airlock:s3_key:000a»"), "s3_key");
     }
 }

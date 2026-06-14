@@ -40,6 +40,7 @@ fn ctx(upstream_url: &str) -> airlock::proxy::Ctx {
         upstream: upstream_url.to_string(),
         audit: Arc::new(airlock::audit::Audit::null()),
         client: reqwest::Client::new(),
+        max_body_bytes: airlock::proxy::DEFAULT_MAX_BODY_BYTES,
     }
 }
 
@@ -180,6 +181,7 @@ async fn upstream_error_returns_502() {
         upstream: format!("http://{dead_addr}"),
         audit: Arc::new(airlock::audit::Audit::null()),
         client: reqwest::Client::new(),
+        max_body_bytes: airlock::proxy::DEFAULT_MAX_BODY_BYTES,
     };
     let airlock_url = spawn(airlock::proxy::app(dead_ctx)).await;
 
@@ -364,5 +366,47 @@ async fn vault_does_not_bleed_secrets_across_requests() {
     assert!(
         !resp2.contains(aws),
         "request 1's real secret must NOT bleed into request 2's response"
+    );
+}
+
+/// A request body larger than the configured cap is refused with 413 and never
+/// reaches the upstream — Airlock must not buffer unbounded input. A tiny cap
+/// plus a small (4 KiB) fixture exercises this deterministically: the body fits
+/// the socket buffer, so the client finishes sending and reads a clean 413
+/// rather than racing a connection reset.
+#[tokio::test]
+async fn oversized_body_is_rejected_with_413() {
+    let (mock_url, seen) = spawn_mock().await;
+    let small_cap = airlock::proxy::Ctx {
+        upstream: mock_url.clone(),
+        audit: Arc::new(airlock::audit::Audit::null()),
+        client: reqwest::Client::new(),
+        max_body_bytes: 64,
+    };
+    let airlock_url = spawn(airlock::proxy::app(small_cap)).await;
+
+    let body = "x".repeat(4096); // far over the 64-byte cap, still tiny
+    let (status, _text) = post_through(&airlock_url, &body).await;
+
+    assert_eq!(status, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    // Rejected before forwarding: the upstream must never have seen the body.
+    assert!(
+        seen.body.lock().unwrap().is_empty(),
+        "upstream must not receive a body that exceeded the cap"
+    );
+}
+
+/// A body within the cap passes straight through (masked, then forwarded). The
+/// cap rejects only what exceeds it; normal traffic is unaffected.
+#[tokio::test]
+async fn body_within_cap_passes_through() {
+    let (mock_url, seen) = spawn_mock().await;
+    let airlock_url = spawn(airlock::proxy::app(ctx(&mock_url))).await; // default 32 MiB cap
+    let (status, _text) = post_through(&airlock_url, r#"{"content":"hello world"}"#).await;
+
+    assert!(status.is_success());
+    assert!(
+        seen.body.lock().unwrap().contains("hello world"),
+        "a body under the cap must reach the upstream"
     );
 }
