@@ -135,7 +135,7 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // unambiguous. (Passwords containing a literal `@` remain a known gap.)
         dg(
             "db_password",
-            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@\s]+)@",
+            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@\s\\]+)@",
             1,
             true,
         ),
@@ -143,9 +143,13 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // keyword: `\b` does not match across `_`, so the old `\b`-anchored form
         // missed `DB_PASSWORD`, `MY_TOKEN`, `APP_SECRET`. The keyword group stays
         // NON-capturing so the value remains capture group 1.
+        // The value class also excludes `\` (backslash): in a JSON-encoded body a
+        // newline is the two chars `\n`, NOT real whitespace, so without this the
+        // value would greedily run across many lines and swallow whole blocks of
+        // content (and several other secrets) into one giant sentinel.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}]{8,})"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\]{8,})"#,
             1,
             true,
         ),
@@ -329,5 +333,33 @@ mod tests {
         assert!(detect("GET /api/users?id=42").is_empty());
         assert!(detect("version 1.2.3 released").is_empty());
         assert!(detect("lorem ipsum dolor sit amet").is_empty());
+    }
+
+    #[test]
+    fn env_value_stops_at_json_escaped_newline() {
+        // In a JSON-encoded body a newline is the two chars `\n` (backslash + n),
+        // not real whitespace. The env_secret value MUST stop there — otherwise one
+        // match swallows every following line (and other secrets) into a single
+        // giant sentinel, mangling the prompt the LLM receives.
+        let json_body =
+            r#"API_KEY=firstsecretvalue123\nDB_PASSWORD=secondsecretvalue456\nNOTE=keepgoing"#;
+        let env: Vec<String> = detect(json_body)
+            .into_iter()
+            .filter(|m| m.kind == "env_secret")
+            .map(|m| m.value)
+            .collect();
+        // Each value is line-bounded; neither swallows the following line.
+        assert!(
+            env.iter().any(|v| v == "firstsecretvalue123"),
+            "first value not line-bounded: {env:?}"
+        );
+        assert!(
+            env.iter().any(|v| v == "secondsecretvalue456"),
+            "second value not line-bounded: {env:?}"
+        );
+        assert!(
+            env.iter().all(|v| !v.contains("DB_PASSWORD")),
+            "a value swallowed the next line: {env:?}"
+        );
     }
 }
