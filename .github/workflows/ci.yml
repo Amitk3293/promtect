@@ -12,7 +12,14 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Build and test on both Linux and macOS so the proxy, smoke script, and
+    # platform-specific code (e.g. the port-conflict helper) stay green on the two
+    # platforms developers actually run Promtect on.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -25,6 +32,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Smoke test
+        run: bash scripts/smoke.sh
 
   audit:
     runs-on: ubuntu-latest
