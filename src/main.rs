@@ -8,6 +8,20 @@ use airlock::{
 
 #[tokio::main]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(|s| s.as_str()) == Some("selftest") {
+        let ok = airlock::mask::selftest();
+        println!(
+            "airlock selftest: {}",
+            if ok {
+                "PASS — no leak"
+            } else {
+                "FAIL — leak detected"
+            }
+        );
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+
     let port: u16 = std::env::var("AIRLOCK_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
