@@ -41,7 +41,8 @@ async fn main() {
     let app = proxy::app(ctx);
     let bind = std::env::var("AIRLOCK_BIND").unwrap_or_else(|_| "127.0.0.1".into());
     let addr = format!("{bind}:{port}");
-    let is_loopback = bind == "127.0.0.1" || bind == "::1" || bind == "localhost";
+    // Delegate to net::is_loopback so the safety decision is unit-tested in isolation.
+    let is_loopback = airlock::net::is_loopback(&bind);
     if !is_loopback {
         eprintln!(
             "WARNING: airlock is binding a non-loopback address ({bind}). This is only safe \
