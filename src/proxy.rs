@@ -1,6 +1,7 @@
 use crate::audit::Audit;
 use crate::detect;
-use crate::mask::{mask_text, restore_text};
+use crate::mask::mask_text;
+use crate::stream::{StreamRestorer, restore_stream};
 use crate::vault::Vault;
 use axum::{
     Router,
@@ -9,6 +10,7 @@ use axum::{
     http::{HeaderMap, Method, Uri},
     response::Response,
 };
+use futures_util::StreamExt;
 use std::sync::Arc;
 
 /// Default cap on the request body Promtect will buffer in memory before masking.
@@ -49,6 +51,11 @@ pub struct Ctx {
     /// Max request-body bytes buffered before the proxy returns 413. Defaults to
     /// [`DEFAULT_MAX_BODY_BYTES`]; lower it in tests to exercise the cap cheaply.
     pub max_body_bytes: usize,
+    /// Whether to restore real secrets in the response (transparent mode, the
+    /// default). When `false` (strict mode, `PROMTECT_RESTORE=false`), the masked
+    /// upstream body is streamed through verbatim — sentinels are never expanded,
+    /// so a secret provably never re-enters the response, logs, or terminal.
+    pub restore: bool,
 }
 
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
@@ -81,10 +88,12 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     };
     let body_text = String::from_utf8_lossy(&body_bytes).to_string();
 
-    // INVARIANT: one vault per request. The same `&vault` masks the outbound body
+    // INVARIANT: one vault per request. The same vault masks the outbound body
     // and restores the inbound response, so only sentinels minted *for this
     // request* can ever be expanded back into a secret — no cross-request bleed.
-    let vault = Vault::new();
+    // Held in an `Arc` so it can move into the response stream, which the server
+    // polls after this handler returns.
+    let vault = Arc::new(Vault::new());
 
     // Mask request body content. Auth headers forwarded untouched in forward().
     let masked = mask_text(&body_text, &vault, &ctx.audit, &request_id);
@@ -105,7 +114,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     );
 
     match forward(&ctx, method, &uri, &headers, masked.into_bytes()).await {
-        Ok(r) => restore_response(r, &ctx, &vault, &request_id).await,
+        Ok(r) => restore_response(r, &ctx, vault, request_id).await,
         Err(e) => text_response(502, format!("promtect upstream error: {e}")),
     }
 }
@@ -137,20 +146,18 @@ async fn forward(
 async fn restore_response(
     r: reqwest::Response,
     ctx: &Ctx,
-    vault: &Vault,
-    request_id: &str,
+    vault: Arc<Vault>,
+    request_id: String,
 ) -> Response {
     let status = r.status();
     let resp_headers = r.headers().clone();
 
-    let bytes = r.bytes().await.unwrap_or_default();
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    // Restore against the SAME per-request vault that did the masking above.
-    let restored = restore_text(&text, vault, &ctx.audit, request_id);
-
     let mut out = Response::builder().status(status);
     for (name, value) in resp_headers.iter() {
         let n = name.as_str();
+        // Drop length/encoding framing: the body is re-chunked and its length
+        // changes when sentinels expand to real secrets, so a copied
+        // content-length or transfer-encoding would describe the wrong body.
         if n.eq_ignore_ascii_case("content-length")
             || n.eq_ignore_ascii_case("content-encoding")
             || n.eq_ignore_ascii_case("transfer-encoding")
@@ -159,9 +166,24 @@ async fn restore_response(
         }
         out = out.header(name.clone(), value.clone());
     }
-    // Headers and status are copied from an already-parsed upstream response, so
-    // this build cannot realistically fail; fall back to a clean 502 rather than
-    // panic if it ever does.
-    out.body(Body::from(restored))
+
+    let body = if ctx.restore {
+        // Transparent mode: restore secrets incrementally as the response
+        // streams. SSE answers reach the client token-by-token instead of being
+        // buffered whole (the M0 "hang"). The vault moves into the stream, which
+        // the server polls after this handler returns.
+        let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id);
+        Body::from_stream(restore_stream(r.bytes_stream().boxed(), sr))
+    } else {
+        // Strict mode (PROMTECT_RESTORE=false): never re-insert secrets. Stream
+        // the masked body straight through; the per-request vault is dropped (and
+        // its contents zeroized) unused.
+        drop(vault);
+        Body::from_stream(r.bytes_stream())
+    };
+
+    // Status and headers come from an already-parsed upstream response, so this
+    // build cannot realistically fail; fall back to a clean 502 rather than panic.
+    out.body(body)
         .unwrap_or_else(|_| text_response(502, "promtect: could not assemble upstream response"))
 }

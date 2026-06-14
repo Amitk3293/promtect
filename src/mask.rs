@@ -49,7 +49,7 @@ pub fn restore_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) 
 /// Falls back to `"sentinel"` for a malformed token — `find_sentinels` only ever
 /// yields well-formed tokens, but restore must never panic on adversarial
 /// upstream content, so this stays total.
-fn sentinel_kind(token: &str) -> &str {
+pub(crate) fn sentinel_kind(token: &str) -> &str {
     token
         .strip_prefix("«promtect:")
         .and_then(|rest| rest.split(':').next())

@@ -55,8 +55,8 @@ impl Vault {
         self.lock().by_sentinel.get(sentinel).cloned()
     }
 
-    /// Longest sentinel currently registered (for the M1 streaming look-back buffer).
-    #[allow(dead_code)] // reserved for M1 streaming restore
+    /// Longest sentinel currently registered. Bounds the streaming restorer's
+    /// look-back buffer: a `«`-led run longer than this cannot be a sentinel.
     pub fn max_sentinel_len(&self) -> usize {
         self.lock()
             .by_sentinel

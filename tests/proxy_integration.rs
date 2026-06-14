@@ -41,6 +41,7 @@ fn ctx(upstream_url: &str) -> promtect::proxy::Ctx {
         audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
         max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
+        restore: true,
     }
 }
 
@@ -182,6 +183,7 @@ async fn upstream_error_returns_502() {
         audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
         max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
+        restore: true,
     };
     let promtect_url = spawn(promtect::proxy::app(dead_ctx)).await;
 
@@ -382,6 +384,7 @@ async fn oversized_body_is_rejected_with_413() {
         audit: Arc::new(promtect::audit::Audit::null()),
         client: reqwest::Client::new(),
         max_body_bytes: 64,
+        restore: true,
     };
     let promtect_url = spawn(promtect::proxy::app(small_cap)).await;
 
@@ -408,5 +411,115 @@ async fn body_within_cap_passes_through() {
     assert!(
         seen.body.lock().unwrap().contains("hello world"),
         "a body under the cap must reach the upstream"
+    );
+}
+
+// ── Streaming (SSE) restore ─────────────────────────────────────────────────
+
+/// Mock upstream that echoes the (masked) request body back as a STREAMED
+/// response, ONE BYTE PER CHUNK. This forces every sentinel to be split across
+/// chunk boundaries — the worst case for the streaming restorer.
+async fn mock_stream(State(seen): State<Seen>, body: String) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    let chunks: Vec<Result<bytes::Bytes, std::convert::Infallible>> = body
+        .into_bytes()
+        .into_iter()
+        .map(|b| Ok(bytes::Bytes::from(vec![b])))
+        .collect();
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(axum::body::Body::from_stream(futures_util::stream::iter(
+            chunks,
+        )))
+        .unwrap()
+}
+
+/// Spawn a streaming mock upstream and return its URL plus the `Seen` handle.
+async fn spawn_stream_mock() -> (String, Seen) {
+    let seen = Seen::default();
+    let app = Router::new()
+        .route("/", post(mock_stream))
+        .with_state(seen.clone());
+    let url = spawn(app).await;
+    (url, seen)
+}
+
+/// A sentinel split across streamed chunk boundaries is fully reassembled and
+/// restored: the client sees the real secret, never a sentinel, and the SSE
+/// content-type is preserved.
+#[tokio::test]
+async fn streaming_sse_sentinel_split_is_restored() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"my key is {aws}"}}"#);
+
+    let (mock_url, seen) = spawn_stream_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let text = resp.text().await.unwrap();
+
+    // Upstream saw the masked body (a sentinel), never the real key.
+    let upstream_saw = seen.body.lock().unwrap().clone();
+    assert!(!upstream_saw.contains(aws), "real key leaked to upstream");
+    assert!(
+        upstream_saw.contains("«promtect:aws_key:"),
+        "upstream should have received a sentinel"
+    );
+
+    // Client got the real key back, reassembled from byte-split chunks, with no
+    // sentinel left over.
+    assert!(
+        text.contains(aws),
+        "restored secret missing from streamed response: {text:?}"
+    );
+    assert!(
+        !text.contains("«promtect:"),
+        "a sentinel leaked into the client response: {text:?}"
+    );
+    assert_eq!(
+        content_type.as_deref(),
+        Some("text/event-stream"),
+        "SSE content-type must be preserved"
+    );
+}
+
+/// Strict mode (`restore: false`): the masked body still streams through without
+/// hanging, but secrets are NEVER re-inserted — the response keeps the sentinel.
+#[tokio::test]
+async fn strict_mode_does_not_restore_secrets() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"my key is {aws}"}}"#);
+
+    let (mock_url, seen) = spawn_stream_mock().await;
+    let mut strict = ctx(&mock_url);
+    strict.restore = false;
+    let promtect_url = spawn(promtect::proxy::app(strict)).await;
+
+    let (status, text) = post_through(&promtect_url, &body).await;
+    assert!(status.is_success());
+
+    // Masking still happened: upstream never saw the real key.
+    let upstream_saw = seen.body.lock().unwrap().clone();
+    assert!(!upstream_saw.contains(aws), "real key leaked to upstream");
+
+    // But restore is off: the sentinel stays, the real secret never comes back.
+    assert!(
+        text.contains("«promtect:aws_key:"),
+        "strict mode should leave the sentinel in the response: {text:?}"
+    );
+    assert!(
+        !text.contains(aws),
+        "strict mode must NOT restore the real secret: {text:?}"
     );
 }
