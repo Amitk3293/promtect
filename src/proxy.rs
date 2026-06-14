@@ -95,28 +95,69 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // polls after this handler returns.
     let vault = Arc::new(Vault::new());
 
-    // Mask request body content. Auth headers forwarded untouched in forward().
-    let masked = mask_text(&body_text, &vault, &ctx.audit, &request_id);
+    // Content-type guard: scan textual bodies only. A binary/opaque body — a
+    // multipart upload, an audio/image payload to an OpenAI endpoint — is
+    // forwarded byte-for-byte, so the proxy never corrupts it by lossy UTF-8
+    // conversion or a mistaken substitution. Default is to scan (secure).
+    let forward_bytes = if is_binary_body(&headers) {
+        // Pass through unscanned, but still record it as traffic (zero secrets)
+        // so the request appears in metrics.
+        ctx.audit
+            .record_request(&request_id, 0, &[], body_bytes.len(), body_bytes.len());
+        body_bytes.to_vec()
+    } else {
+        // Mask request body content. Auth headers forwarded untouched in forward().
+        let masked = mask_text(&body_text, &vault, &ctx.audit, &request_id);
 
-    // Second detect pass for the per-request summary (cheap; same input). This
-    // avoids changing mask_text's signature while still producing an accurate
-    // "caught vs clean" event. Secret values are never included in the summary.
-    let hits = detect::detect(&body_text);
-    let mut kinds: Vec<&str> = hits.iter().map(|m| m.kind).collect();
-    kinds.sort_unstable();
-    kinds.dedup();
-    ctx.audit.record_request(
-        &request_id,
-        hits.len(),
-        &kinds,
-        body_bytes.len(),
-        masked.len(),
-    );
+        // Second detect pass for the per-request summary (cheap; same input). This
+        // avoids changing mask_text's signature while still producing an accurate
+        // "caught vs clean" event. Secret values are never included in the summary.
+        let hits = detect::detect(&body_text);
+        let mut kinds: Vec<&str> = hits.iter().map(|m| m.kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        ctx.audit.record_request(
+            &request_id,
+            hits.len(),
+            &kinds,
+            body_bytes.len(),
+            masked.len(),
+        );
 
-    match forward(&ctx, method, &uri, &headers, masked.into_bytes()).await {
+        masked.into_bytes()
+    };
+
+    match forward(&ctx, method, &uri, &headers, forward_bytes).await {
         Ok(r) => restore_response(r, &ctx, vault, request_id).await,
         Err(e) => text_response(502, format!("promtect upstream error: {e}")),
     }
+}
+
+/// Whether a body is a known binary/opaque type that must NOT be scanned or
+/// restored. Masking such a body would corrupt it (lossy UTF-8 conversion or a
+/// mistaken substitution), so binary requests are forwarded and binary responses
+/// are streamed back byte-for-byte. The default is *not* binary — an absent or
+/// unrecognised content-type is still scanned, so a secret is never skipped just
+/// because the type is missing (secure default).
+fn is_binary_body(headers: &HeaderMap) -> bool {
+    let Some(value) = headers.get(axum::http::header::CONTENT_TYPE) else {
+        return false; // absent → treat as textual and scan it
+    };
+    let Ok(s) = value.to_str() else {
+        return true; // non-ASCII content-type → opaque, do not touch
+    };
+    let s = s.to_ascii_lowercase();
+    s.starts_with("multipart/")
+        || s.starts_with("image/")
+        || s.starts_with("audio/")
+        || s.starts_with("video/")
+        || s.starts_with("font/")
+        || s.starts_with("application/octet-stream")
+        || s.starts_with("application/pdf")
+        || s.starts_with("application/zip")
+        || s.starts_with("application/gzip")
+        || s.starts_with("application/x-protobuf")
+        || s.starts_with("application/grpc")
 }
 
 async fn forward(
@@ -167,7 +208,11 @@ async fn restore_response(
         out = out.header(name.clone(), value.clone());
     }
 
-    let body = if ctx.restore {
+    // Restore only when enabled AND the response is textual. A binary response
+    // (e.g. an image endpoint) must stream back byte-for-byte — running it
+    // through the restorer would lossily corrupt it. `text/event-stream` is
+    // textual, so SSE is restored.
+    let body = if ctx.restore && !is_binary_body(&resp_headers) {
         // Transparent mode: restore secrets incrementally as the response
         // streams. SSE answers reach the client token-by-token instead of being
         // buffered whole (the M0 "hang"). The vault moves into the stream, which
@@ -175,9 +220,9 @@ async fn restore_response(
         let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id);
         Body::from_stream(restore_stream(r.bytes_stream().boxed(), sr))
     } else {
-        // Strict mode (PROMTECT_RESTORE=false): never re-insert secrets. Stream
-        // the masked body straight through; the per-request vault is dropped (and
-        // its contents zeroized) unused.
+        // Strict mode (PROMTECT_RESTORE=false) or a binary response: never
+        // re-insert secrets. Stream the body straight through; the per-request
+        // vault is dropped (and its contents zeroized) unused.
         drop(vault);
         Body::from_stream(r.bytes_stream())
     };
