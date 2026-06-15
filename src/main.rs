@@ -21,6 +21,28 @@ async fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
+    // ── guard subcommand ────────────────────────────────────────────────────
+    // One-command protected session: start an ephemeral proxy, point the tool at
+    // it, run the tool with the user's args, tear down on exit.
+    //   promtect guard claude
+    //   promtect guard codex "fix the s3 upload"
+    //   promtect guard ollama run deepseek-r1
+    //   promtect guard claude --headroom
+    if args.get(1).map(|s| s.as_str()) == Some("guard") {
+        match promtect::guard::plan_guard(&args[2..]) {
+            Ok(plan) => std::process::exit(promtect::guard::guard(plan).await),
+            Err(e) => {
+                eprintln!(
+                    "promtect guard: {e}\n\
+                     usage: promtect guard <claude|codex|ollama|--exec CMD> \
+                     [--headroom[=URL]] [--openrouter] [--upstream URL] [--strict] \
+                     [--port N] [-- TOOL_ARGS...]"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     // ── dashboard subcommand ────────────────────────────────────────────────
     // Starts a local, offline HTTP server that exposes the aggregated audit-log
     // metrics three ways: a browser UI at `/`, JSON at `/api/metrics`, and
@@ -127,6 +149,7 @@ async fn main() {
         client: reqwest::Client::new(),
         max_body_bytes,
         restore,
+        requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     let app = proxy::app(ctx);

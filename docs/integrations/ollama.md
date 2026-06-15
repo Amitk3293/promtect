@@ -5,6 +5,20 @@ Qwen, or Mistral derivatives — is exactly when a secret seatbelt matters: thes
 models often have no privacy guarantees, and you may be running an unfamiliar
 build. Promtect masks secrets before *any* model sees them, local or not.
 
+## Quickest: one command
+
+```sh
+promtect guard ollama run deepseek-r1      # proxy sits between the ollama CLI and the local server
+```
+
+`guard ollama` sets `OLLAMA_HOST` to the proxy and forwards to your local Ollama
+server (`http://127.0.0.1:11434`), masking prompts on the way. (Headroom doesn't
+compress native Ollama traffic, so `--headroom` is a no-op here.)
+
+The rest of this guide is the manual method / the OpenAI-compatible endpoint.
+
+---
+
 Ollama exposes an OpenAI-compatible endpoint at `http://localhost:11434/v1`.
 
 ## Start Promtect
