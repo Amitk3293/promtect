@@ -30,18 +30,16 @@ upload" — and the file had your access key in it. You let an agent read your
 config.
 
 That key is now in a request log on a server you don't own, in a country you
-didn't choose, under a retention policy you never read. You can rotate it. You
-can't un-send it.
+didn't choose, under a retention policy you never read.
 
 **It doesn't matter that Claude and OpenAI don't train on their API inputs — their own
-guidance is to rotate any key that reaches them.** Exposed is exposed: it's in their
-logs, in an abuse-review queue a human can read, in a [subprocessor that gets
-breached](https://openai.com/index/mixpanel-incident/) (OpenAI's analytics vendor leaked
-API users' details in November 2025), or in [a database left open with users' prompts
-and API keys in it](https://www.wiz.io/blog/wiz-research-uncovers-exposed-deepseek-database-leak)
-(DeepSeek, 2025). The security consensus is blunt: anything entering a model's context
-should be assumed compromised and rotated. You can rotate. You can't un-send. **Promtect
-keeps the secret from ever arriving.**
+guidance is to rotate any key that reaches them.** Exposed is exposed: it sits in their
+logs, in an abuse-review queue a human can read, in the next breach.
+[OpenAI's own analytics vendor leaked API users' details](https://openai.com/index/mixpanel-incident/)
+in November 2025. [DeepSeek left a database wide open](https://www.wiz.io/blog/wiz-research-uncovers-exposed-deepseek-database-leak)
+with users' prompts and API keys in it. Anything entering a model's context should be
+treated as compromised. You can rotate the key. You can't un-send it. **Promtect keeps
+it from ever arriving.**
 
 ---
 
@@ -237,8 +235,8 @@ Masking is half the story — *where* the request goes still matters. Promtect c
 the upstream and prints a one-line risk note at startup:
 
 ```
-upstream risk: Anthropic API — does not train on your input, but an exposed key is still
-               rotate-it; Promtect keeps it from arriving.
+upstream risk: Anthropic API — does not train on your input, but an exposed key still
+               means rotate it; Promtect keeps it from arriving.
 upstream risk: DeepSeek — HIGH RISK: trains on your input, China jurisdiction, no zero-retention.
 ```
 
