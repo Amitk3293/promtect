@@ -152,46 +152,46 @@ impl Metrics {
 
         push_counter(
             &mut out,
-            "airlock_requests_total",
+            "promtect_requests_total",
             "Total requests proxied.",
             self.requests_total,
             None,
         );
         push_counter(
             &mut out,
-            "airlock_requests_with_secrets_total",
+            "promtect_requests_with_secrets_total",
             "Requests in which at least one secret was masked.",
             self.requests_with_secrets,
             None,
         );
         push_counter(
             &mut out,
-            "airlock_requests_clean_total",
+            "promtect_requests_clean_total",
             "Requests that contained no detectable secrets.",
             self.requests_clean,
             None,
         );
 
         // Per-detector breakdown for secrets_masked_total.
-        out.push_str("# HELP airlock_secrets_masked_total Secrets masked, by detector.\n");
-        out.push_str("# TYPE airlock_secrets_masked_total counter\n");
+        out.push_str("# HELP promtect_secrets_masked_total Secrets masked, by detector.\n");
+        out.push_str("# TYPE promtect_secrets_masked_total counter\n");
         for (detector, count) in &self.by_detector {
             // Detector names are [a-z_]+ — safe to embed directly in labels.
             out.push_str(&format!(
-                "airlock_secrets_masked_total{{detector=\"{detector}\"}} {count}\n"
+                "promtect_secrets_masked_total{{detector=\"{detector}\"}} {count}\n"
             ));
         }
 
         push_counter(
             &mut out,
-            "airlock_bytes_in_total",
+            "promtect_bytes_in_total",
             "Total inbound body bytes (before masking).",
             self.bytes_in_total,
             None,
         );
         push_counter(
             &mut out,
-            "airlock_bytes_out_total",
+            "promtect_bytes_out_total",
             "Total outbound body bytes (after masking).",
             self.bytes_out_total,
             None,
@@ -222,7 +222,7 @@ mod tests {
     fn fixture_metrics() -> (Metrics, std::path::PathBuf) {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "airlock-metrics-test-{}.jsonl",
+            "promtect-metrics-test-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
         let mut f = std::fs::File::create(&path).unwrap();
@@ -234,12 +234,12 @@ mod tests {
         .unwrap();
         writeln!(
             f,
-            r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«airlock:aws_key:0001»","request_id":"req-1"}}"#
+            r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«promtect:aws_key:0001»","request_id":"req-1"}}"#
         )
         .unwrap();
         writeln!(
             f,
-            r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«airlock:aws_key:0002»","request_id":"req-1"}}"#
+            r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«promtect:aws_key:0002»","request_id":"req-1"}}"#
         )
         .unwrap();
         writeln!(
@@ -249,7 +249,7 @@ mod tests {
         .unwrap();
         writeln!(
             f,
-            r#"{{"ts_ms":2000,"action":"mask","detector":"anthropic_key","placeholder":"«airlock:anthropic_key:0003»","request_id":"req-2"}}"#
+            r#"{{"ts_ms":2000,"action":"mask","detector":"anthropic_key","placeholder":"«promtect:anthropic_key:0003»","request_id":"req-2"}}"#
         )
         .unwrap();
         writeln!(
@@ -259,7 +259,7 @@ mod tests {
         .unwrap();
         writeln!(
             f,
-            r#"{{"ts_ms":4000,"action":"unmask","detector":"sentinel","placeholder":"«airlock:aws_key:0001»","request_id":"req-1"}}"#
+            r#"{{"ts_ms":4000,"action":"unmask","detector":"sentinel","placeholder":"«promtect:aws_key:0001»","request_id":"req-1"}}"#
         )
         .unwrap();
         writeln!(f, "{{not valid json{{").unwrap();
@@ -344,7 +344,7 @@ mod tests {
         // Write 25 request events and verify recent is capped at RECENT_CAP (20).
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "airlock-metrics-cap-{}.jsonl",
+            "promtect-metrics-cap-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
         let mut f = std::fs::File::create(&path).unwrap();
@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn aggregate_returns_defaults_for_missing_file() {
         // Non-existent path → all zeros; must not panic.
-        let path = std::path::Path::new("/nonexistent/airlock-no-such-file.jsonl");
+        let path = std::path::Path::new("/nonexistent/promtect-no-such-file.jsonl");
         let m = aggregate(path);
         assert_eq!(m.requests_total, 0);
         assert_eq!(m.secrets_masked_total, 0);
@@ -390,8 +390,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let prom = m.to_prometheus();
         assert!(
-            prom.contains("airlock_requests_total 3"),
-            "expected 'airlock_requests_total 3' in:\n{prom}"
+            prom.contains("promtect_requests_total 3"),
+            "expected 'promtect_requests_total 3' in:\n{prom}"
         );
     }
 
@@ -402,11 +402,11 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let prom = m.to_prometheus();
         assert!(
-            prom.contains("airlock_secrets_masked_total{detector=\"aws_key\"} 2"),
+            prom.contains("promtect_secrets_masked_total{detector=\"aws_key\"} 2"),
             "expected aws_key=2 in:\n{prom}"
         );
         assert!(
-            prom.contains("airlock_secrets_masked_total{detector=\"anthropic_key\"} 1"),
+            prom.contains("promtect_secrets_masked_total{detector=\"anthropic_key\"} 1"),
             "expected anthropic_key=1 in:\n{prom}"
         );
     }
@@ -417,11 +417,11 @@ mod tests {
         std::fs::remove_file(&path).ok();
         let prom = m.to_prometheus();
         assert!(
-            prom.contains("airlock_bytes_in_total 350"),
+            prom.contains("promtect_bytes_in_total 350"),
             "expected bytes_in 350 in:\n{prom}"
         );
         assert!(
-            prom.contains("airlock_bytes_out_total 360"),
+            prom.contains("promtect_bytes_out_total 360"),
             "expected bytes_out 360 in:\n{prom}"
         );
     }
@@ -432,10 +432,10 @@ mod tests {
         let (m, path) = fixture_metrics();
         std::fs::remove_file(&path).ok();
         let prom = m.to_prometheus();
-        assert!(prom.contains("# HELP airlock_requests_total"));
-        assert!(prom.contains("# TYPE airlock_requests_total counter"));
-        assert!(prom.contains("# HELP airlock_secrets_masked_total"));
-        assert!(prom.contains("# TYPE airlock_secrets_masked_total counter"));
+        assert!(prom.contains("# HELP promtect_requests_total"));
+        assert!(prom.contains("# TYPE promtect_requests_total counter"));
+        assert!(prom.contains("# HELP promtect_secrets_masked_total"));
+        assert!(prom.contains("# TYPE promtect_secrets_masked_total counter"));
     }
 
     // ── Value-freedom / no-secret-leakage tests ──────────────────────────────
@@ -447,7 +447,7 @@ mod tests {
         // never surfaces in the Prometheus or JSON outputs.
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "airlock-metrics-nosecret-{}.jsonl",
+            "promtect-metrics-nosecret-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
         let mut f = std::fs::File::create(&path).unwrap();
@@ -462,7 +462,7 @@ mod tests {
         .unwrap();
         writeln!(
             f,
-            r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«airlock:aws_key:0001»","request_id":"req-s"}}"#
+            r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«promtect:aws_key:0001»","request_id":"req-s"}}"#
         )
         .unwrap();
 

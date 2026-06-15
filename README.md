@@ -1,123 +1,228 @@
-# Airlock AI
+# Promtect
 
-**Local-first privacy proxy for AI coding tools.** Airlock sits between your AI
-tool and the cloud, masks secrets out of the outbound request **before** they
-reach the LLM, and restores them in the response. The model gets a coherent
-prompt and answers normally — it just never sees your real secrets. Everything
-runs on your machine: no cloud, no telemetry, no root CA, and secrets are never
-written to disk.
+### Your AI coding tool just saw your AWS key. Promtect makes sure it never happens again.
 
-> **Status: M0 spike.** Works end-to-end for the Claude Code CLI on macOS.
-> Private during development; open-source at the M1 release.
+Promtect is a local proxy that sits between your AI tool and the model. It
+catches API keys, tokens, and passwords **before** they leave your laptop, swaps
+them for harmless placeholders, and (optionally) puts the real values back in the
+response — so the AI still works perfectly and your secrets never travel.
+
+**Open source. Runs entirely on your machine. No cloud, no telemetry, no root
+certificate. Secrets are never written to disk.**
+
+```text
+you ▸ fix the upload in s3.py            # s3.py contains AKIAIOSFODNN7EXAMPLE
+  promtect ▸ masked aws_key → «promtect:aws_key:0001»   (the model never sees your key)
+  claude   ▸ here's the fix, using AKIAIOSFODNN7EXAMPLE  (restored in the response — answer just works)
+```
+
+<sub>A 30-second terminal recording lives in [`docs/demo.tape`](docs/demo.tape) — render it with [`vhs`](https://github.com/charmbracelet/vhs): `vhs docs/demo.tape`.</sub>
+
+```sh
+brew install promtect/tap/promtect      # or: cargo install --path .
+promtect selftest                       # → promtect selftest: PASS — no leak
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 promtect & claude "refactor my S3 upload"
+```
+
+---
+
+## Why
+
+You pasted a `.env` into Claude to debug it. You asked Cursor to "fix the S3
+upload" — and the file had your access key in it. You let an agent read your
+config.
+
+That key is now in a request log on a server you don't own, in a country you
+didn't choose, under a retention policy you never read. You can rotate it. You
+can't un-send it.
+
+**28 million secrets leaked to public repos in 2025; AI-assisted commits leak at
+~2× the baseline rate.** The prompt box is the new leak surface — and nothing is
+watching it. Promtect watches it.
+
+---
 
 ## How it works
 
 ```
-Claude Code ──http──▶ Airlock (127.0.0.1) ──https──▶ api.anthropic.com
-                       │  detect + mask                  │
-                       └──────── restore ◀───────────────┘
+Your AI tool ──http──▶ Promtect :8787 ──https──▶ api.anthropic.com
+                        │ detect + mask               │
+                        └────────── restore ◀─────────┘
 ```
 
-You point Claude Code at a local loopback port via `ANTHROPIC_BASE_URL`. Airlock
-reads the plaintext request on loopback, swaps detected secrets for opaque
-sentinels (`«airlock:aws_key:0001»`), forwards its own HTTPS request upstream,
-then restores the real values in the response. No TLS interception, no root
-certificate.
+1. Your tool sends a plaintext HTTP request to Promtect on loopback.
+2. Promtect scans the body and replaces each detected secret with an opaque
+   sentinel (`«promtect:aws_key:0001»`).
+3. Promtect re-originates the request as HTTPS to the upstream API.
+4. As the response **streams back**, every sentinel is swapped for the real
+   value before your tool reads it — token by token, no buffering, no hang.
 
-## Quickstart — Docker (easiest)
+No TLS interception. No root certificate. The auth header (`x-api-key`,
+`Authorization`) is forwarded verbatim — only the body is ever touched.
+
+---
+
+## How Promtect compares
+
+|  | **Promtect** | Veil | LiteLLM masking |
+|---|:---:|:---:|:---:|
+| **Restore masked values in the response** | ✅ optional toggle | ❌ cannot | ❌ cannot |
+| Detect secrets in transit | ✅ 72 detectors | ⚠️ limited | ✅ |
+| Streaming (SSE) restore | ✅ per-token | ❌ | ❌ |
+| No root CA required | ✅ | ❌ installs a CA | n/a |
+| Memory-safe secrets (Rust + zeroize) | ✅ | ❌ | ❌ |
+| Value-free audit log | ✅ | ❌ logs to SQLite | ❌ |
+| Runs locally / no cloud | ✅ | ✅ | ❌ server-side |
+| Open source | ✅ Apache-2.0 | ✅ | ✅ |
+
+**The gap no one else fills:** other tools hand the model `[REDACTED]` and you
+get useless code back. Promtect is the only one that can restore — and it lets
+you choose: transparent restore for usable answers, or strict mode where the
+secret never comes back at all.
+
+---
+
+## Quickstart
+
+### Native
 
 ```sh
-docker compose up --build      # build + run locally
+cargo run            # binds 127.0.0.1:8787, upstream → api.anthropic.com
+# in another shell:
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
 
-Or run the prebuilt image directly (available once the project is public):
+### Docker
 
 ```sh
-docker run --rm -p 127.0.0.1:8787:8787 ghcr.io/amitk3293/airlock-ai:latest
+docker compose up --build
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
 ```
 
-Then point Claude Code at it:
+> **Security:** publish the port to `127.0.0.1:8787:8787`, never `8787:8787`.
+> The bundled `docker-compose.yml` does this correctly by default.
+
+### Prove it works (no network needed)
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-claude                         # use Claude Code normally
+promtect selftest    # masks a canary secret, confirms it never leaks, restores it
 ```
 
-> **Security — keep the `127.0.0.1:` prefix.** Always publish to
-> `127.0.0.1:8787:8787`. Publishing as `8787:8787` binds `0.0.0.0` on your host and
-> exposes the secrets proxy to your whole network. The bundled `docker-compose.yml`
-> does the right thing by default.
+---
 
-## Quickstart — native
+## Works with your whole stack
+
+Promtect protects more than Claude Code. Pick a provider with `PROMTECT_MODE`, or
+point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
+
+| Tool | Setup |
+|------|-------|
+| **Claude Code** | `promtect` then `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` |
+| **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8787/v1` |
+| **OpenAI Codex** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
+| **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
+| **OpenRouter** | `PROMTECT_MODE=openrouter promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/api/v1` |
+| **Headroom / LiteLLM / corp proxy** | `PROMTECT_UPSTREAM=<their-url> promtect` (Promtect goes first) |
+
+Full guides: [`docs/integrations/`](docs/integrations/README.md). It doesn't
+matter whether you're using Claude, GPT, DeepSeek, or a local model — Promtect
+masks your secrets before any of them see them.
+
+### Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `PROMTECT_PORT` | `8787` | Local port to bind (loopback) |
+| `PROMTECT_MODE` | `anthropic` | Upstream preset: `anthropic` / `openai` / `ollama` / `openrouter` |
+| `PROMTECT_UPSTREAM` | — | Explicit upstream URL; overrides mode (chaining) |
+| `PROMTECT_RESTORE` | `true` | `false` = strict mode: secrets are never re-inserted |
+| `PROMTECT_AUDIT` | `promtect-audit.jsonl` | Value-free audit log path |
+| `PROMTECT_BIND` | `127.0.0.1` | Bind address (loopback by default) |
+| `PROMTECT_MAX_BODY_BYTES` | `33554432` | Request-body cap (32 MiB) before a 413 |
+| `PROMTECT_DASHBOARD_PORT` | `8799` | Dashboard port (`promtect dashboard`) |
+
+---
+
+## Two modes, you choose
+
+- **Transparent (default):** secret masked outbound, real value seamlessly back
+  in the answer → AI output is directly usable.
+- **Strict (`PROMTECT_RESTORE=false`):** secret masked and *never* re-inserted —
+  provably never touches the response, logs, or terminal. Maximum paranoia for
+  security-strict teams.
+
+---
+
+## What it detects
+
+**72 detectors** ship in the open-source core, covering known credential formats:
+
+- **AI/LLM:** Anthropic, OpenAI, Groq, OpenRouter, Replicate, Perplexity,
+  Fireworks, NVIDIA, HuggingFace, Google AI
+- **Cloud/infra:** AWS (keys + secret), GCP, Azure Storage, DigitalOcean,
+  Doppler, HashiCorp Vault, Terraform, Databricks, PlanetScale, Tailscale
+- **Dev tools:** GitHub, GitLab, npm, PyPI, Docker Hub, Shopify, Linear,
+  Atlassian, Figma, Notion, Airtable, RubyGems, Postman, SonarQube, CircleCI
+- **SaaS/pay:** Slack, Discord, Twilio, SendGrid, Mailgun, Stripe, Square,
+  Razorpay
+- **AI infra:** Pinecone, LangSmith, MCP-style bearer tokens
+- **Structural:** JWTs, PEM / OpenSSH / PGP private keys, DB-URL passwords,
+  `.env`-style `KEY=value` pairs (with a placeholder + code-expression guard)
+
+Adding a detector is ~one line in `src/detect.rs` — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+> **Free vs Pro.** Free stops the keys you *know* about. Pro adds a different
+> capability class: entropy detection for unknown-format secrets, scanning the
+> model's *response* for leaked secrets, and PII/PHI/PCI compliance detection —
+> plus fleet enforcement and audit aggregation. *Free protects a developer; Pro
+> protects the company — and proves it.*
+
+---
+
+## Trust model
+
+- **Memory-only.** Secrets exist only in RAM and are zeroized on drop via the
+  `zeroize` crate.
+- **Per-request vault.** Each request gets a fresh vault; a sentinel minted for
+  request A cannot restore a secret from request B — cross-request bleed is
+  impossible by construction.
+- **Round-trip proven.** `restore(mask(x)) == x` is a property test, and the
+  streaming restorer is proven byte-for-byte identical to whole-buffer restore at
+  every chunk boundary.
+- **Headers untouched.** Auth headers are forwarded verbatim; Promtect scans
+  request bodies only.
+- **No telemetry.** Exactly one outbound connection per proxied request.
+
+---
+
+## Dashboard & audit
 
 ```sh
-cargo run                      # binds 127.0.0.1:8787
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
-claude
+promtect dashboard      # http://127.0.0.1:8799 — UI, /api/metrics (JSON), /metrics (Prometheus)
 ```
 
-Config (both paths) via env vars: `AIRLOCK_PORT` (8787), `AIRLOCK_UPSTREAM`
-(`https://api.anthropic.com`), `AIRLOCK_AUDIT` (`airlock-audit.jsonl`), and
-`AIRLOCK_BIND` (`127.0.0.1`; the container sets `0.0.0.0` — only safe when the
-port is published to loopback).
+Every mask/unmask event is appended to `promtect-audit.jsonl` — timestamp,
+action, detector kind, sentinel ID, request ID. **It never records the real
+secret value**, only the opaque placeholder. SOC 2 evidence, on tap.
 
-## Prove it works (no network)
-
-```sh
-cargo run -- selftest        # -> "airlock selftest: PASS — no leak"
-```
-
-The automated test suite includes a canary test that asserts a planted AWS key
-reaches a mock upstream **only** as a sentinel, and is restored on the way back:
-
-```sh
-cargo test
-```
-
-## What it detects (M0 precision pack)
-
-Prefix-anchored provider tokens (AWS `AKIA`/`ASIA`, Anthropic `sk-ant-`, OpenAI
-`sk-`, Stripe, GitHub/GitLab, Slack, Google, SendGrid, HuggingFace, npm), PEM
-private-key blocks, JWTs, AWS secret keys, database-URL passwords, and
-context-keyed `.env` values (guarded against config placeholders like
-`changeme`). Adding a detector is one line in `src/detect.rs`.
-
-## Audit log
-
-Every mask/unmask is appended to `airlock-audit.jsonl` as one JSON object per
-line — timestamp, action, detector, sentinel id, request id. **Never the secret
-value.**
-
-## Trust properties
-
-- Secrets exist only in memory and are zeroized on drop.
-- Binds loopback (`127.0.0.1`) by default. In Docker the container binds
-  `0.0.0.0`, and the loopback guarantee then comes from publishing the port to
-  `127.0.0.1:` (see the Docker security note above) — never from the bind alone.
-- The upstream auth header is forwarded untouched (Airlock masks request
-  **bodies**, never headers).
-- Exactly one outbound connection per request; no telemetry.
+---
 
 ## Develop
 
 ```sh
-make test          # cargo test
-make lint          # fmt --check + clippy --all-targets -D warnings
-make smoke         # prove the built binary masks + writes a value-free audit log
-make coverage      # text coverage summary (needs: cargo install cargo-llvm-cov)
-make docker-build  # build the distroless image
-make up            # docker compose up -d
-make down          # docker compose down
+make test     # cargo test — 81 unit + integration + property tests
+make lint     # cargo fmt --check + clippy --all-targets -D warnings
+make smoke    # build + run: prove masking + value-free audit
 ```
 
-See [TESTING.md](TESTING.md) for the layered test strategy and the contract for keeping tests aligned with every change.
+See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
+[SECURITY.md](SECURITY.md).
 
-## Scope & limitations (M0)
+---
 
-- **macOS, Claude Code CLI, explicit-config (no CA).** Other tools, a local CA
-  for zero-config transparency, and Linux are later milestones.
-- **Responses are buffered**, not token-streamed — SSE-aware streaming restore
-  is M1.
-- Entropy/unknown-secret detection and a custom always-mask vault are M1/M2.
-- Known gap: a database-URL password containing a literal `@` is truncated at
-  the first `@` (uncommon; usually `%40`-encoded).
+## License
+
+Apache-2.0. The open-source core is the whole free product — there is no crippled
+tier. Paid Promtect features (compliance, fleet, entropy, response scanning) are
+licensed separately. See [ADRs/ADR-002](ADRs/ADR-002-open-core-repo-architecture.md).

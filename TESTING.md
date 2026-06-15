@@ -1,6 +1,6 @@
 # Testing Strategy
 
-Airlock AI uses a layered test suite. Each layer has a distinct scope and cost.
+Promtect uses a layered test suite. Each layer has a distinct scope and cost.
 CI enforces all of them on every push and pull request.
 
 ---

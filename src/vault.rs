@@ -44,7 +44,7 @@ impl Vault {
             return s.clone();
         }
         g.counter += 1;
-        let sentinel = format!("«airlock:{}:{:04x}»", kind, g.counter);
+        let sentinel = format!("«promtect:{}:{:04x}»", kind, g.counter);
         g.by_secret.insert(secret.to_string(), sentinel.clone());
         g.by_sentinel.insert(sentinel.clone(), secret.to_string());
         sentinel
@@ -55,8 +55,8 @@ impl Vault {
         self.lock().by_sentinel.get(sentinel).cloned()
     }
 
-    /// Longest sentinel currently registered (for the M1 streaming look-back buffer).
-    #[allow(dead_code)] // reserved for M1 streaming restore
+    /// Longest sentinel currently registered. Bounds the streaming restorer's
+    /// look-back buffer: a `«`-led run longer than this cannot be a sentinel.
     pub fn max_sentinel_len(&self) -> usize {
         self.lock()
             .by_sentinel
