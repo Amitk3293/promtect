@@ -21,6 +21,29 @@ async fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
 
+    // ── mask subcommand ─────────────────────────────────────────────────────
+    // Pipe any text in, see exactly what Promtect would hide before it reaches
+    // the model. Reads stdin, replaces every detected secret with its sentinel,
+    // and writes the masked text to stdout. Pure local — no network, no audit
+    // file, no restore. Handy for "what would this leak?" checks:
+    //   echo 'deploy with AKIA...' | promtect mask
+    //   cat .env | promtect mask
+    if args.get(1).map(|s| s.as_str()) == Some("mask") {
+        use std::io::{Read, Write};
+        let mut input = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+            eprintln!("promtect mask: cannot read stdin ({e})");
+            std::process::exit(1);
+        }
+        // Throwaway vault/audit: masking is one-way here, so neither the sentinel
+        // map nor an audit trail needs to outlive the call.
+        let vault = promtect::vault::Vault::new();
+        let masked = promtect::mask::mask_text(&input, &vault, &promtect::audit::Audit::null(), "mask");
+        print!("{masked}");
+        std::io::stdout().flush().ok();
+        return;
+    }
+
     // ── guard subcommand ────────────────────────────────────────────────────
     // One-command protected session: start an ephemeral proxy, point the tool at
     // it, run the tool with the user's args, tear down on exit.
