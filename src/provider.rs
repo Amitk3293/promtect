@@ -135,8 +135,24 @@ pub fn classify(upstream: &str) -> Profile {
         return Profile {
             name: "DeepSeek",
             risk: Risk::High,
-            note: "DeepSeek — HIGH RISK: trains on your input, China jurisdiction, \
-                   no zero-retention.",
+            note: "DeepSeek — HIGH RISK: trains on your input, China jurisdiction \
+                   (National Intelligence Law can compel access), no zero-retention.",
+        };
+    }
+    if u.contains("moonshot") {
+        return Profile {
+            name: "Kimi (Moonshot)",
+            risk: Risk::High,
+            note: "Kimi (Moonshot AI) — HIGH RISK: data processed in China; the \
+                   National Intelligence Law can compel access regardless of server.",
+        };
+    }
+    if u.contains("bigmodel") || u.contains("zhipu") || u.contains("z.ai") {
+        return Profile {
+            name: "GLM (Zhipu)",
+            risk: Risk::High,
+            note: "GLM (Zhipu AI) — HIGH RISK: data processed in China; the National \
+                   Intelligence Law can compel access regardless of server.",
         };
     }
 
@@ -165,6 +181,20 @@ mod tests {
         let p = classify("https://api.deepseek.com");
         assert_eq!(p.risk, Risk::High);
         assert!(p.note.contains("HIGH"));
+    }
+
+    #[test]
+    fn chinese_coding_models_are_high_risk() {
+        for url in [
+            "https://api.moonshot.ai/v1",           // Kimi global
+            "https://api.moonshot.cn/v1",           // Kimi China
+            "https://open.bigmodel.cn/api/paas/v4", // GLM / Zhipu
+            "https://api.z.ai/v1",                  // GLM / Z.ai
+        ] {
+            let p = classify(url);
+            assert_eq!(p.risk, Risk::High, "{url} should be high-risk");
+            assert!(p.note.contains("China"), "{url} note should name China");
+        }
     }
 
     #[test]

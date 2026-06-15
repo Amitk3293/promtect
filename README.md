@@ -57,6 +57,14 @@ already sitting in a log you'll never reach. **What it costs with Promtect:** no
 `promtect guard claude`, and the key never leaves your laptop. Nothing to rotate, because
 nothing leaked.
 
+**Switched to a cheap Chinese model to save on tokens?** DeepSeek, Kimi (Moonshot), and
+GLM (Zhipu) [now lead coding traffic on OpenRouter](https://www.techtimes.com/articles/317352/20260529/chinese-ai-models-lead-openrouter-traffic-coding-gains-come-china-data-risk.htm) —
+and every request runs under Chinese jurisdiction, where the National Intelligence Law can
+compel access no matter where the server sits. DeepSeek already trained on user input and
+[left a database of prompts and API keys exposed](https://www.wiz.io/blog/wiz-research-uncovers-exposed-deepseek-database-leak).
+Promtect masks before any of them see it — and `PROMTECT_BLOCK_RISKY=true` refuses them
+outright.
+
 ---
 
 ## How it works
@@ -253,11 +261,14 @@ the upstream and prints a one-line risk note at startup:
 ```
 upstream risk: Anthropic API — does not train on your input, but an exposed key still
                means rotate it; Promtect keeps it from arriving.
-upstream risk: DeepSeek — HIGH RISK: trains on your input, China jurisdiction, no zero-retention.
+upstream risk: DeepSeek — HIGH RISK: trains on your input, China jurisdiction
+               (National Intelligence Law can compel access), no zero-retention.
+upstream risk: Kimi (Moonshot AI) — HIGH RISK: data processed in China; the National
+               Intelligence Law can compel access regardless of server.
 ```
 
-Set `PROMTECT_BLOCK_RISKY=true` to refuse high-risk or unverified upstreams outright
-(fail-closed).
+Set `PROMTECT_BLOCK_RISKY=true` to refuse high-risk or unverified upstreams — DeepSeek,
+Kimi, GLM, or any host Promtect can't vouch for — outright (fail-closed).
 
 ---
 
