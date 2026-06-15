@@ -33,13 +33,20 @@ That key is now in a request log on a server you don't own, in a country you
 didn't choose, under a retention policy you never read.
 
 **It doesn't matter that Claude and OpenAI don't train on their API inputs — their own
-guidance is to rotate any key that reaches them.** Exposed is exposed: it sits in their
-logs, in an abuse-review queue a human can read, in the next breach.
-[OpenAI's own analytics vendor leaked API users' details](https://openai.com/index/mixpanel-incident/)
-in November 2025. [DeepSeek left a database wide open](https://www.wiz.io/blog/wiz-research-uncovers-exposed-deepseek-database-leak)
-with users' prompts and API keys in it. Anything entering a model's context should be
-treated as compromised. You can rotate the key. You can't un-send it. **Promtect keeps
-it from ever arriving.**
+guidance is to rotate any key that reaches them.** And the tools most developers already
+use have leaked:
+
+- Shared **ChatGPT** conversations — some with proprietary code —
+  [showed up in Google Search](https://www.malwarebytes.com/blog/news/2025/08/openai-kills-short-lived-experiment-where-chatgpt-chats-could-be-found-on-google)
+  in 2025; OpenAI pulled the feature and called it a "short-lived experiment."
+- **GitHub Copilot** was shown to
+  [emit real secrets from its training data](https://blog.gitguardian.com/yes-github-copilot-can-leak-secrets/) —
+  and once a key is baked in, scrubbing it from your repo no longer removes it.
+- **Samsung** engineers pasted source code and secrets into ChatGPT; Samsung banned it
+  company-wide.
+
+Anything entering a model's context should be treated as compromised. You can rotate the
+key. You can't un-send it. **Promtect keeps it from ever arriving.**
 
 ---
 
