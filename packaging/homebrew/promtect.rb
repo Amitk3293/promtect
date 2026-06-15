@@ -7,7 +7,7 @@
 # tarball (a release workflow can template these automatically per tag).
 class Promtect < Formula
   desc "Local-first privacy proxy for AI coding tools: mask secrets before the LLM, restore them after"
-  homepage "https://promtect.dev"
+  homepage "https://promtect.org"
   license "Apache-2.0"
 
   # TODO(release): point at the tagged source tarball and its sha256.
