@@ -38,7 +38,8 @@ async fn main() {
         // Throwaway vault/audit: masking is one-way here, so neither the sentinel
         // map nor an audit trail needs to outlive the call.
         let vault = promtect::vault::Vault::new();
-        let masked = promtect::mask::mask_text(&input, &vault, &promtect::audit::Audit::null(), "mask");
+        let masked =
+            promtect::mask::mask_text(&input, &vault, &promtect::audit::Audit::null(), "mask");
         print!("{masked}");
         std::io::stdout().flush().ok();
         return;
