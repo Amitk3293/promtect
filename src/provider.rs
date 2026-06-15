@@ -73,16 +73,16 @@ pub fn classify(upstream: &str) -> Profile {
         return Profile {
             name: "Anthropic API",
             risk: Risk::Low,
-            note: "Anthropic API — does not train on your input, but an exposed key is \
-                   still rotate-it; Promtect keeps it from arriving.",
+            note: "Anthropic API — does not train on your input, but an exposed key still \
+                   means rotate it; Promtect keeps it from arriving.",
         };
     }
     if u.contains("api.openai.com") {
         return Profile {
             name: "OpenAI API",
             risk: Risk::Low,
-            note: "OpenAI API — does not train on API input, but an exposed key is still \
-                   rotate-it; Promtect keeps it from arriving.",
+            note: "OpenAI API — does not train on API input, but an exposed key still \
+                   means rotate it; Promtect keeps it from arriving.",
         };
     }
     if u.contains("openrouter.ai") {
