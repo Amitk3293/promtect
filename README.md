@@ -221,4 +221,4 @@ See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
 
 Apache-2.0. The open-source core is the whole free product — there is no crippled
 tier. Paid Promtect features (compliance, fleet, entropy, response scanning) are
-licensed separately. See [ADRs/ADR-002](ADRs/ADR-002-open-core-repo-architecture.md).
+licensed separately.

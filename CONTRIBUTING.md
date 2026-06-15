@@ -44,9 +44,8 @@ registry. Two helpers build an entry:
 
 All **known-format** credential/key/token detectors are free and OSS, forever.
 Detectors that are a *different capability class* — entropy/unknown-format
-detection, scanning the model's response, and PII/PHI/PCI compliance — are paid
-(see [ADR-002](ADRs/ADR-002-open-core-repo-architecture.md)). Please keep PRs to
-the known-format kind.
+detection, scanning the model's response, and PII/PHI/PCI compliance — are paid.
+Please keep PRs to the known-format kind.
 
 ## Code standards
 

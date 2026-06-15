@@ -16,5 +16,4 @@ labels: enhancement
 
 **Scope check**
 <!-- Is this a free/OSS feature (known-format detection, proxy behaviour, DX) or
-a paid-tier capability (compliance, fleet, entropy, response scanning)? See
-ADR-002. -->
+a paid-tier capability (compliance, fleet, entropy, response scanning)? -->
