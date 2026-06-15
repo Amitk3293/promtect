@@ -1,10 +1,19 @@
 [package]
-name = "airlock"
+name = "promtect"
 version = "0.1.0"
 edition = "2024"
+description = "Local-first privacy proxy for AI coding tools: masks secrets out of outbound LLM requests and restores them in the response. No cloud, no root CA."
+license = "Apache-2.0"
+repository = "https://github.com/amitk3293/promtect"
+homepage = "https://promtect.dev"
+readme = "README.md"
+keywords = ["security", "secrets", "proxy", "llm", "privacy"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 axum = "0.8.9"
+bytes = "1.10.1"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 regex = "1.12.4"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }

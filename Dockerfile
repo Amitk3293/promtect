@@ -6,19 +6,20 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir src \
  && echo 'fn main() {}' > src/main.rs \
  && touch src/lib.rs \
- && cargo build --release --bin airlock \
+ && cargo build --release --bin promtect \
  && rm -rf src
 COPY src ./src
+COPY assets ./assets
 # Bust the stub artifacts so our real code recompiles (deps stay cached).
-RUN touch src/main.rs src/lib.rs && cargo build --release --bin airlock
+RUN touch src/main.rs src/lib.rs && cargo build --release --bin promtect
 
 # ---- runtime (distroless, non-root, has CA roots + glibc) ----
 FROM gcr.io/distroless/cc-debian12:nonroot
-COPY --from=builder /build/target/release/airlock /usr/local/bin/airlock
-ENV AIRLOCK_BIND=0.0.0.0 \
-    AIRLOCK_PORT=8787 \
-    AIRLOCK_UPSTREAM=https://api.anthropic.com \
-    AIRLOCK_AUDIT=/home/nonroot/airlock-audit.jsonl
+COPY --from=builder /build/target/release/promtect /usr/local/bin/promtect
+ENV PROMTECT_BIND=0.0.0.0 \
+    PROMTECT_PORT=8787 \
+    PROMTECT_UPSTREAM=https://api.anthropic.com \
+    PROMTECT_AUDIT=/home/nonroot/promtect-audit.jsonl
 EXPOSE 8787
 USER nonroot
-ENTRYPOINT ["/usr/local/bin/airlock"]
+ENTRYPOINT ["/usr/local/bin/promtect"]

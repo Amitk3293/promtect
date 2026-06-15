@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Airlock — Dashboard</title>
+<title>Promtect — Dashboard</title>
 <!--
-  Airlock dashboard — a single self-contained file, ported from the Airlock
-  Design System (project "Airlock Design System"). ALL CSS and JS are inline.
+  Promtect dashboard — a single self-contained file, ported from the Promtect
+  Design System (project "Promtect Design System"). ALL CSS and JS are inline.
   ZERO external network: no CDN, no React/Babel, no Google Fonts. The brand
-  marks are inline SVG. Airlock is a privacy tool, so the dashboard that watches
+  marks are inline SVG. Promtect is a privacy tool, so the dashboard that watches
   your secrets must never phone home.
 
   The original design was React + Babel loaded from unpkg with mock data; here it
@@ -549,7 +549,7 @@
 
   <script>
   /* ============================================================================
-     Airlock dashboard — vanilla JS port of the design's parts.jsx.
+     Promtect dashboard — vanilla JS port of the design's parts.jsx.
      No framework. Builds the same DOM (same class names / structure) and wires
      it to the live GET /api/metrics endpoint.
      ============================================================================ */
@@ -684,14 +684,14 @@
     // Top bar: brand + status pills + (Overview/Endpoints) + range tab + refresh.
     function TopBar(state, actions) {
       var brand = el("div", { class: "al-topbar__brand" });
-      // Inline wordmark SVG (brand). Mark circle + three dots + "Airlock".
+      // Inline wordmark SVG (brand). Mark circle + three dots + "Promtect".
       brand.innerHTML =
-        '<svg width="150" height="30" viewBox="0 0 200 48" fill="none" role="img" aria-label="Airlock">' +
+        '<svg width="150" height="30" viewBox="0 0 200 48" fill="none" role="img" aria-label="Promtect">' +
         '<circle cx="24" cy="24" r="18.25" stroke="#25c2b1" stroke-width="3.5"></circle>' +
         '<circle cx="15.5" cy="24" r="2.7" fill="#25c2b1"></circle>' +
         '<circle cx="24" cy="24" r="2.7" fill="#25c2b1"></circle>' +
         '<circle cx="32.5" cy="24" r="2.7" fill="#25c2b1"></circle>' +
-        '<text x="56" y="32" font-family="var(--font-sans)" font-size="25" font-weight="600" letter-spacing="-0.5" fill="#eef2f5">Airlock</text>' +
+        '<text x="56" y="32" font-family="var(--font-sans)" font-size="25" font-weight="600" letter-spacing="-0.5" fill="#eef2f5">Promtect</text>' +
         '</svg>';
       brand.appendChild(el("span", { class: "al-topbar__sep" }));
       brand.appendChild(el("span", { class: "al-topbar__title" }, "Dashboard"));
@@ -826,7 +826,7 @@
       if (!d.recent.length) {
         rows = el("tr", null, el("td", { colspan: "5" }, el("div", { class: "al-empty" }, [
           el("div", { class: "al-empty__title" }, "No requests yet"),
-          el("div", { class: "al-note" }, "Point Claude Code at Airlock to see live traffic.")
+          el("div", { class: "al-note" }, "Point your AI tool at the Promtect proxy to see live traffic.")
         ])));
       } else {
         rows = d.recent.map(function (r) {
@@ -863,17 +863,17 @@
     function Endpoints(d) {
       var h = d.headline;
       var prom = [
-        "# HELP airlock_requests_total Total requests proxied.",
-        "# TYPE airlock_requests_total counter",
-        "airlock_requests_total " + h.requestsProtected,
-        "airlock_requests_with_secrets_total " + h.withSecrets,
-        "airlock_requests_clean_total " + h.requestsClean,
-        "# TYPE airlock_secrets_masked_total counter"
+        "# HELP promtect_requests_total Total requests proxied.",
+        "# TYPE promtect_requests_total counter",
+        "promtect_requests_total " + h.requestsProtected,
+        "promtect_requests_with_secrets_total " + h.withSecrets,
+        "promtect_requests_clean_total " + h.requestsClean,
+        "# TYPE promtect_secrets_masked_total counter"
       ].concat(d.byDetector.slice(0, 5).map(function (x) {
-        return 'airlock_secrets_masked_total{detector="' + x.kind + '"} ' + x.count;
+        return 'promtect_secrets_masked_total{detector="' + x.kind + '"} ' + x.count;
       })).concat([
-        "airlock_bytes_in_total " + d.bytesIn,
-        "airlock_bytes_out_total " + d.bytesOut
+        "promtect_bytes_in_total " + d.bytesIn,
+        "promtect_bytes_out_total " + d.bytesOut
       ]).join("\n");
 
       var json = JSON.stringify({
@@ -896,7 +896,7 @@
       ]);
       var noteCard = Card("al-panel", [
         panelHead("Scope", "All-time, value-free", Badge({ tone: "neutral", label: "honest" })),
-        el("p", { class: "al-note" }, "Airlock's metrics are aggregated live from the value-free audit log and are cumulative (all-time). The proxy does not yet record per-endpoint counts or a time-series history, so this dashboard shows no per-route breakdown and labels every range as all-time — never fabricated history."),
+        el("p", { class: "al-note" }, "Promtect's metrics are aggregated live from the value-free audit log and are cumulative (all-time). The proxy does not yet record per-endpoint counts or a time-series history, so this dashboard shows no per-route breakdown and labels every range as all-time — never fabricated history."),
         el("p", { class: "al-note" }, "The “Caught vs clean” chart is derived honestly by bucketing the recent requests feed by hour; when traffic is sparse it shows only the buckets that actually have data.")
       ]);
 
@@ -908,7 +908,7 @@
       return Card("al-panel", [
         el("div", { class: "al-empty" }, [
           el("div", { class: "al-empty__title" }, "No traffic yet"),
-          el("p", { class: "al-note" }, "Point Claude Code at Airlock (127.0.0.1:8799) and your secrets will be masked at the door. Counts, detector kinds and byte sizes appear here — never a secret value.")
+          el("p", { class: "al-note" }, "Point your AI tool at the Promtect proxy (default 127.0.0.1:8787) and your secrets are masked at the door. Counts, detector kinds and byte sizes appear here — never a secret value.")
         ])
       ]);
     }
@@ -1004,7 +1004,7 @@
         el("div", { class: "al-page__head" }, [
           el("h1", { class: "al-page__h1" }, "Secrets, caught at the door."),
           el("p", { class: "al-page__sub" },
-            "Local, fully-offline metrics for the Airlock proxy — counts, detector kinds and byte sizes only. Never a secret value or body content.")
+            "Local, fully-offline metrics for the Promtect proxy — counts, detector kinds and byte sizes only. Never a secret value or body content.")
         ])
       ]);
 

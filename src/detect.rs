@@ -74,6 +74,15 @@ fn looks_like_placeholder(v: &str) -> bool {
         || v.starts_with('<')
         || v.starts_with("${")
         || v.starts_with("{{")
+        // Code expression, not a literal secret: a real credential never contains
+        // parentheses. Rejects things like `os.environ.get(` / `getenv(` that a
+        // context detector would otherwise capture as the "value".
+        || v.contains('(')
+        || v.contains(')')
+        // Common config-interpolation / env-reference prefixes.
+        || lower.starts_with("process.env")
+        || lower.starts_with("os.environ")
+        || lower.starts_with("env.")
         || v.chars().all(|c| c == 'x' || c == 'X')
         || v.chars().all(|c| c == '*')
 }
@@ -152,6 +161,118 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\]{8,})"#,
             1,
             true,
+        ),
+        // ── AI / LLM provider keys (the core use case) ──────────────────────
+        // Distinct prefixes catch bare tokens that `env_secret` misses (a key
+        // pasted into prose or code without a `KEY=` context). Providers whose
+        // keys have no prefix (Mistral, Cohere, Together, DeepSeek) are still
+        // caught by `env_secret` in `KEY=value` form.
+        d("groq_key", r"\bgsk_[A-Za-z0-9]{40,}\b"),
+        d("openrouter_key", r"\bsk-or-v1-[a-f0-9]{32,}\b"),
+        d("replicate_key", r"\br8_[A-Za-z0-9]{32,}\b"),
+        d("perplexity_key", r"\bpplx-[A-Za-z0-9]{40,}\b"),
+        d("fireworks_key", r"\bfw_[A-Za-z0-9]{24,}\b"),
+        d("nvidia_key", r"\bnvapi-[A-Za-z0-9_-]{60,}\b"),
+        // ── Cloud / infrastructure ──────────────────────────────────────────
+        d("digitalocean_token", r"\bdop_v1_[a-f0-9]{64}\b"),
+        d("doppler_token", r"\bdp\.pt\.[A-Za-z0-9]{40,}\b"),
+        d("vault_token", r"\bhv[sb]\.[A-Za-z0-9]{24,}\b"),
+        d(
+            "terraform_token",
+            r"\b[A-Za-z0-9]{14}\.atlasv1\.[A-Za-z0-9_-]{60,}\b",
+        ),
+        d("databricks_token", r"\bdapi[0-9a-f]{32}\b"),
+        d(
+            "planetscale_token",
+            r"\bpscale_(?:pw|tkn)_[A-Za-z0-9_-]{32,}\b",
+        ),
+        d("tailscale_key", r"\btskey-(?:auth|api)-[A-Za-z0-9-]{40,}\b"),
+        // Azure Storage account key: 88-char base64 after `AccountKey=`.
+        dg(
+            "azure_storage_key",
+            r"(?i)AccountKey=([A-Za-z0-9+/]{86,88}={0,2})",
+            1,
+            false,
+        ),
+        // ── Developer tools / platforms ─────────────────────────────────────
+        d("pypi_token", r"\bpypi-AgEIcHlwaS[A-Za-z0-9_-]{50,}\b"),
+        d("dockerhub_token", r"\bdckr_pat_[A-Za-z0-9_-]{27,}\b"),
+        d("shopify_token", r"\bshp(?:at|ca|pa|ss)_[a-fA-F0-9]{32}\b"),
+        d("linear_key", r"\blin_api_[A-Za-z0-9]{40,}\b"),
+        d("atlassian_token", r"\bATATT3[A-Za-z0-9_.+=/-]{180,}"),
+        d("figma_token", r"\bfigd_[A-Za-z0-9_-]{40,}\b"),
+        d("notion_token", r"\bntn_[A-Za-z0-9]{40,}\b"),
+        d("airtable_pat", r"\bpat[A-Za-z0-9]{14}\.[a-f0-9]{64}\b"),
+        d("rubygems_key", r"\brubygems_[a-f0-9]{48}\b"),
+        d("postman_key", r"\bPMAK-[a-f0-9]{24}-[a-f0-9]{34}\b"),
+        d("sonar_token", r"\bsq[ap]_[a-f0-9]{40}\b"),
+        d("circleci_token", r"\bCCIPAT_[A-Za-z0-9]{22}_[a-f0-9]{40}\b"),
+        // ── SaaS / communication / payment ──────────────────────────────────
+        d(
+            "slack_webhook",
+            r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{20,}",
+        ),
+        d(
+            "discord_token",
+            r"\b[MNO][A-Za-z\d]{23}\.[\w-]{6}\.[\w-]{27,}\b",
+        ),
+        d(
+            "discord_webhook",
+            r"https://(?:ptb\.|canary\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+",
+        ),
+        // Mailgun's `key-<32hex>` shape is indistinguishable from a cache key or
+        // MD5 in isolation, so require the word "mailgun" nearby (the bare KEY=value
+        // form is already covered by `env_secret`). Twilio's `SK<32hex>` is the
+        // public-ish API-key SID (not the secret) and far too false-positive-prone
+        // to detect bare; the real auth token is caught by `env_secret`.
+        dg(
+            "mailgun_key",
+            r"(?i)mailgun[^\n]{0,40}\b(key-[0-9a-f]{32})\b",
+            1,
+            false,
+        ),
+        d("stripe_webhook", r"\bwhsec_[A-Za-z0-9]{32,}\b"),
+        d("square_token", r"\bsq0(?:atp|csp|idp)-[A-Za-z0-9_-]{22,}\b"),
+        d("razorpay_key", r"\brzp_(?:live|test)_[A-Za-z0-9]{14,}\b"),
+        // ── Vector DB / AI-agent infrastructure (AI-native differentiator) ──
+        d("pinecone_key", r"\bpcsk_[A-Za-z0-9_]{20,}\b"),
+        d(
+            "langsmith_key",
+            r"\blsv2_[a-z]{2}_[A-Za-z0-9]{16,}_[A-Za-z0-9]{8,}\b",
+        ),
+        // ── Monitoring / messaging / misc ───────────────────────────────────
+        d("sentry_user_token", r"\bsntryu_[A-Za-z0-9]{64}\b"),
+        d("sentry_org_token", r"\bsntrys_[A-Za-z0-9_=+/]{60,}\b"),
+        // Anchor the DSN host to sentry.io so we don't match any basic-auth URL of
+        // the form https://<32hex>@<anyhost>/<digits>.
+        d(
+            "sentry_dsn",
+            r"https://[0-9a-f]{32}@[a-z0-9.-]*sentry\.io/\d+",
+        ),
+        d("newrelic_key", r"\bNRAK-[A-Z0-9]{27}\b"),
+        d(
+            "mapbox_token",
+            r"\b[ps]k\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\b",
+        ),
+        d("telegram_bot", r"\b\d{6,16}:[A-Za-z0-9_-]{35}\b"),
+        d("google_oauth", r"\bya29\.[A-Za-z0-9_-]{30,}\b"),
+        d("gcp_refresh", r"\b1//[A-Za-z0-9_-]{30,}\b"),
+        d("fcm_token", r"\bAPA91[A-Za-z0-9_-]{100,}\b"),
+        d("grafana_cloud", r"\bglc_[A-Za-z0-9+/]{32,}={0,2}\b"),
+        d("grafana_sa", r"\bglsa_[A-Za-z0-9]{32}_[0-9a-f]{8}\b"),
+        d("aws_mws", r"\bamzn\.mws\.[0-9a-f-]{36}\b"),
+        d("asana_pat", r"\b[0-2]/\d{15,18}:[a-f0-9]{32}\b"),
+        d("dropbox_token", r"\bsl\.[A-Za-z0-9_-]{130,}\b"),
+        d("gitlab_trigger", r"\bglptt-[0-9a-f]{40}\b"),
+        d("age_secret_key", r"\bAGE-SECRET-KEY-1[0-9A-Z]{58}\b"),
+        // ── More certificate / key blocks (PEM forms `private_key` misses) ──
+        d(
+            "pgp_private_key",
+            r"(?s)-----BEGIN PGP PRIVATE KEY BLOCK-----.*?-----END PGP PRIVATE KEY BLOCK-----",
+        ),
+        d(
+            "teams_webhook",
+            r"https://[a-z0-9.-]+\.webhook\.office\.com/webhookb2/[\w@./-]+",
         ),
     ]
 });
@@ -324,6 +445,159 @@ mod tests {
 
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.ABCDEFGHIJ_signature_pad";
         assert!(has_kind(jwt, "jwt"), "jwt");
+    }
+
+    /// Synthetic (structural, NOT real) tokens for every extended detector, paired
+    /// with the kind each must report. Shared by the detection and no-leak tests.
+    fn extended_kind_cases() -> Vec<(String, &'static str)> {
+        let a = |n: usize| "A".repeat(n); // alphanumeric filler
+        let h = |n: usize| "a".repeat(n); // hex-safe filler
+        vec![
+            (format!("gsk_{}", a(40)), "groq_key"),
+            (format!("sk-or-v1-{}", h(40)), "openrouter_key"),
+            (format!("r8_{}", a(32)), "replicate_key"),
+            (format!("pplx-{}", a(40)), "perplexity_key"),
+            (format!("fw_{}", a(24)), "fireworks_key"),
+            (format!("nvapi-{}", a(60)), "nvidia_key"),
+            (format!("dop_v1_{}", h(64)), "digitalocean_token"),
+            (format!("dp.pt.{}", a(40)), "doppler_token"),
+            (format!("hvs.{}", a(24)), "vault_token"),
+            (format!("{}.atlasv1.{}", a(14), a(60)), "terraform_token"),
+            (format!("dapi{}", h(32)), "databricks_token"),
+            (format!("pscale_pw_{}", a(32)), "planetscale_token"),
+            (format!("tskey-auth-{}", a(40)), "tailscale_key"),
+            (format!("AccountKey={}", a(88)), "azure_storage_key"),
+            (format!("pypi-AgEIcHlwaS{}", a(50)), "pypi_token"),
+            (format!("dckr_pat_{}", a(27)), "dockerhub_token"),
+            (format!("shpat_{}", h(32)), "shopify_token"),
+            (format!("lin_api_{}", a(40)), "linear_key"),
+            (format!("ATATT3{}", a(180)), "atlassian_token"),
+            (format!("figd_{}", a(40)), "figma_token"),
+            (format!("ntn_{}", a(40)), "notion_token"),
+            (format!("pat{}.{}", a(14), h(64)), "airtable_pat"),
+            (format!("rubygems_{}", h(48)), "rubygems_key"),
+            (format!("PMAK-{}-{}", h(24), h(34)), "postman_key"),
+            (format!("sqp_{}", h(40)), "sonar_token"),
+            (format!("CCIPAT_{}_{}", a(22), h(40)), "circleci_token"),
+            (
+                format!("https://hooks.slack.com/services/T00000000/B00000000/{}", a(24)),
+                "slack_webhook",
+            ),
+            (format!("M{}.ABCDEF.{}", a(23), a(27)), "discord_token"),
+            (
+                "https://discord.com/api/webhooks/123456789012345678/AbCdEf-tok".to_string(),
+                "discord_webhook",
+            ),
+            (format!("mailgun api key-{}", h(32)), "mailgun_key"),
+            (format!("whsec_{}", a(32)), "stripe_webhook"),
+            (format!("sq0atp-{}", a(22)), "square_token"),
+            (format!("rzp_live_{}", a(16)), "razorpay_key"),
+            (format!("pcsk_{}", a(40)), "pinecone_key"),
+            (format!("lsv2_pt_{}_{}", a(32), a(12)), "langsmith_key"),
+            (format!("sntryu_{}", a(64)), "sentry_user_token"),
+            (format!("sntrys_{}", a(60)), "sentry_org_token"),
+            (
+                format!("https://{}@o0.ingest.sentry.io/12345", h(32)),
+                "sentry_dsn",
+            ),
+            (format!("NRAK-{}", a(27)), "newrelic_key"),
+            (format!("sk.eyJ{}.{}", a(20), a(20)), "mapbox_token"),
+            (format!("1234567890:{}", a(35)), "telegram_bot"),
+            (format!("ya29.{}", a(30)), "google_oauth"),
+            (format!("1//{}", a(30)), "gcp_refresh"),
+            (format!("APA91{}", a(100)), "fcm_token"),
+            (format!("glc_{}", a(40)), "grafana_cloud"),
+            (format!("glsa_{}_{}", a(32), h(8)), "grafana_sa"),
+            (
+                "amzn.mws.550e8400-e29b-41d4-a716-446655440000".to_string(),
+                "aws_mws",
+            ),
+            (format!("1/1234567890123456:{}", h(32)), "asana_pat"),
+            (format!("sl.{}", a(130)), "dropbox_token"),
+            (format!("glptt-{}", h(40)), "gitlab_trigger"),
+            (format!("AGE-SECRET-KEY-1{}", a(58)), "age_secret_key"),
+            (
+                "-----BEGIN PGP PRIVATE KEY BLOCK-----\nMIIabc\n-----END PGP PRIVATE KEY BLOCK-----"
+                    .to_string(),
+                "pgp_private_key",
+            ),
+            (
+                "https://acme.webhook.office.com/webhookb2/abc@def/IncomingWebhook/xyz/12"
+                    .to_string(),
+                "teams_webhook",
+            ),
+        ]
+    }
+
+    /// Every extended (Phase 3) detector fires on a synthetic token of its shape.
+    #[test]
+    fn detects_each_extended_kind() {
+        for (token, kind) in &extended_kind_cases() {
+            assert!(has_kind(token, kind), "{kind} did not fire on {token}");
+        }
+    }
+
+    /// NO-LEAK: every extended detector not only *fires* but actually *masks* — the
+    /// secret value is absent from the masked output and a sentinel replaces it.
+    /// Detection with a wrong span/capture-group would still leak; this proves the
+    /// no-leak invariant for every detector, not just the three the property test
+    /// exercises.
+    #[test]
+    fn masking_removes_every_extended_kind() {
+        use crate::audit::Audit;
+        use crate::mask::mask_text;
+        use crate::vault::Vault;
+        for (token, kind) in &extended_kind_cases() {
+            let vault = Vault::new();
+            let masked = mask_text(token, &vault, &Audit::null(), "r");
+            assert!(
+                !masked.contains(token.as_str()),
+                "{kind}: secret survived masking — {masked:?}"
+            );
+            assert!(
+                masked.contains("«promtect:"),
+                "{kind}: nothing was masked — {masked:?}"
+            );
+        }
+    }
+
+    /// Overlapping detectors must resolve to the RIGHT kind with the FULL span —
+    /// a wrong winner with a shorter/shifted span would leak the uncovered prefix.
+    #[test]
+    fn detector_precedence_on_overlaps() {
+        // A Mapbox secret token embeds a single `eyJ…` segment; it must report
+        // `mapbox_token` over `jwt`, covering the `sk.` prefix (not starting at eyJ).
+        let mapbox = format!("sk.eyJ{}.{}", "A".repeat(20), "B".repeat(20));
+        let hits = detect(&mapbox);
+        assert_eq!(hits.len(), 1, "mapbox overlap not deduped: {hits:?}");
+        assert_eq!(
+            hits[0].kind, "mapbox_token",
+            "mapbox lost to {}",
+            hits[0].kind
+        );
+        assert_eq!(
+            &mapbox[hits[0].start..hits[0].end],
+            mapbox,
+            "span must cover the whole token including the sk. prefix"
+        );
+
+        // An OpenRouter key shares the `sk-` lead with openai_key but the hyphens
+        // mean openai_key cannot match; it must report `openrouter_key` in full.
+        let openrouter = format!("sk-or-v1-{}", "a".repeat(40));
+        let hits = detect(&openrouter);
+        assert_eq!(hits.len(), 1, "openrouter overlap not deduped: {hits:?}");
+        assert_eq!(hits[0].kind, "openrouter_key");
+        assert_eq!(&openrouter[hits[0].start..hits[0].end], openrouter);
+    }
+
+    /// The OSS registry ships broad coverage of known credential formats.
+    #[test]
+    fn registry_has_expected_breadth() {
+        assert!(
+            DETECTORS.len() >= 70,
+            "expected >= 70 detectors, have {}",
+            DETECTORS.len()
+        );
     }
 
     #[test]

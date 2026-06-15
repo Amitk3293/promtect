@@ -10,7 +10,7 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use airlock::dashboard::{DashCtx, app};
+use promtect::dashboard::{DashCtx, app};
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -20,7 +20,7 @@ use airlock::dashboard::{DashCtx, app};
 /// never the actual secret.
 fn write_fixture_audit() -> std::path::PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "airlock-dashboard-test-{}.jsonl",
+        "promtect-dashboard-test-{}.jsonl",
         uuid::Uuid::new_v4()
     ));
     let mut f = std::fs::File::create(&path).expect("create temp audit file");
@@ -35,7 +35,7 @@ fn write_fixture_audit() -> std::path::PathBuf {
     // The corresponding mask event that drove the counter.
     writeln!(
         f,
-        r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«airlock:aws_key:0001»","request_id":"req-1"}}"#
+        r#"{{"ts_ms":1000,"action":"mask","detector":"aws_key","placeholder":"«promtect:aws_key:0001»","request_id":"req-1"}}"#
     )
     .unwrap();
 
@@ -158,13 +158,13 @@ async fn prometheus_endpoint_returns_200_with_correct_body() {
 
     // The global request counter must be present with the right value.
     assert!(
-        body.contains("airlock_requests_total 2"),
-        "expected 'airlock_requests_total 2' in Prometheus body:\n{body}"
+        body.contains("promtect_requests_total 2"),
+        "expected 'promtect_requests_total 2' in Prometheus body:\n{body}"
     );
 
     // The labelled per-detector counter line must follow Prometheus label syntax.
     assert!(
-        body.contains(r#"airlock_secrets_masked_total{detector="aws_key"} 1"#),
+        body.contains(r#"promtect_secrets_masked_total{detector="aws_key"} 1"#),
         "expected labelled aws_key counter in Prometheus body:\n{body}"
     );
 
@@ -172,7 +172,7 @@ async fn prometheus_endpoint_returns_200_with_correct_body() {
 }
 
 /// `GET /` must return HTTP 200 with an HTML body that contains the string
-/// "Airlock" — the minimal sanity check that the embedded HTML file is served.
+/// "Promtect" — the minimal sanity check that the embedded HTML file is served.
 #[tokio::test]
 async fn index_endpoint_returns_200_with_html_page() {
     let audit_path = write_fixture_audit();
@@ -185,11 +185,11 @@ async fn index_endpoint_returns_200_with_html_page() {
 
     let body = resp.text().await.expect("read / body");
 
-    // The page title and heading both include "Airlock" — presence confirms the
+    // The page title and heading both include "Promtect" — presence confirms the
     // correct file is being served rather than an error page.
     assert!(
-        body.contains("Airlock"),
-        "dashboard HTML must contain 'Airlock', got:\n{body}"
+        body.contains("Promtect"),
+        "dashboard HTML must contain 'Promtect', got:\n{body}"
     );
 
     // The page must reference the /api/metrics endpoint so the JS can fetch data.
@@ -207,7 +207,7 @@ async fn index_endpoint_returns_200_with_html_page() {
 async fn api_metrics_returns_zeros_when_audit_file_is_missing() {
     // Point to a path that definitely does not exist.
     let audit_path =
-        std::env::temp_dir().join(format!("airlock-no-such-{}.jsonl", uuid::Uuid::new_v4()));
+        std::env::temp_dir().join(format!("promtect-no-such-{}.jsonl", uuid::Uuid::new_v4()));
     let base = spawn_dashboard(audit_path).await;
 
     let resp = reqwest::get(format!("{base}/api/metrics"))

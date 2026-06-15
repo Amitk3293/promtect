@@ -46,7 +46,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
-          images: ghcr.io/amitk3293/airlock-ai
+          images: ghcr.io/amitk3293/promtect
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

@@ -32,10 +32,10 @@ coverage-html:   ## Full HTML coverage report under target/llvm-cov/html
 	cargo llvm-cov --html
 
 docker-build:
-	docker build -t airlock-ai .
+	docker build -t promtect .
 
 docker-run:
-	docker run --rm -p 127.0.0.1:$(PORT):8787 airlock-ai
+	docker run --rm -p 127.0.0.1:$(PORT):8787 promtect
 
 up:
 	docker-compose up -d || docker compose up -d
