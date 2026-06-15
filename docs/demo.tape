@@ -5,29 +5,29 @@
 
 Output docs/demo.gif
 
-Set FontSize 22
-Set Width 1100
-Set Height 520
+Set FontSize 20
+Set Width 1280
+Set Height 500
 Set Padding 24
 Set Theme "Catppuccin Mocha"
-Set TypingSpeed 42ms
+Set TypingSpeed 38ms
 
 Hide
 Type "export PATH=$PWD/target/release:/tmp/ptdemo:$PATH && clear"
 Enter
 Show
 
-Sleep 400ms
-Type "# 1 · start protecting your AI tool — one command:"
-Enter
 Sleep 700ms
+Type "# 1 · protect your AI tool — one command"
+Enter
+Sleep 1200ms
 Type "promtect guard claude"
 Enter
-Sleep 2900ms
+Sleep 3800ms
 
-Type "# 2 · what it does to your prompt before the model sees it:"
+Type "# 2 · secrets are masked before the model ever sees them"
 Enter
-Sleep 700ms
-Type "echo 'deploy with key AKIAIOSFODNN7EXAMPLE' | promtect mask"
+Sleep 1200ms
+Type "echo 'AKIAIOSFODNN7EXAMPLE  postgres://app:hunter2@prod' | promtect mask"
 Enter
-Sleep 3000ms
+Sleep 4200ms
