@@ -63,7 +63,7 @@ No TLS interception. No root certificate. The auth header (`x-api-key`,
 |  | **Promtect** | Veil | LiteLLM masking |
 |---|:---:|:---:|:---:|
 | **Restore masked values in the response** | ✅ optional toggle | ❌ cannot | ❌ cannot |
-| Detect secrets in transit | ✅ 72 detectors | ⚠️ limited | ✅ |
+| Detect secrets in transit | ✅ 71 detectors | ⚠️ limited | ✅ |
 | Streaming (SSE) restore | ✅ per-token | ❌ | ❌ |
 | No root CA required | ✅ | ❌ installs a CA | n/a |
 | Memory-safe secrets (Rust + zeroize) | ✅ | ❌ | ❌ |
@@ -137,10 +137,11 @@ point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 |------|-------|
 | **Claude Code** | `promtect` then `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` |
 | **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8787/v1` |
-| **OpenAI Codex** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
+| **OpenAI Codex CLI** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
 | **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
 | **OpenRouter** | `PROMTECT_MODE=openrouter promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/api/v1` |
 | **Headroom / LiteLLM / corp proxy** | `PROMTECT_UPSTREAM=<their-url> promtect` (Promtect goes first) |
+| **VS Code Copilot** | not yet — it needs a root CA, which Promtect deliberately avoids ([why](docs/integrations/vscode-copilot.md)) |
 
 Full guides: [`docs/integrations/`](docs/integrations/README.md). It doesn't
 matter whether you're using Claude, GPT, DeepSeek, or a local model — Promtect
@@ -173,7 +174,7 @@ masks your secrets before any of them see them.
 
 ## What it detects
 
-**72 detectors** ship in the open-source core, covering known credential formats:
+**71 detectors** ship in the open-source core, covering known credential formats:
 
 - **AI/LLM:** Anthropic, OpenAI, Groq, OpenRouter, Replicate, Perplexity,
   Fireworks, NVIDIA, HuggingFace, Google AI
