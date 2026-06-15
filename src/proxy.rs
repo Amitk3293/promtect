@@ -118,6 +118,16 @@ pub fn parse_restore(value: Option<&str>) -> bool {
     }
 }
 
+/// Parse a default-off boolean flag (e.g. `PROMTECT_BLOCK_RISKY`). Unset/empty →
+/// `false`; only an explicit truthy value (`1`/`true`/`yes`/`on`, case-insensitive)
+/// enables it. The inverse of [`parse_restore`]'s default-on behaviour.
+pub fn parse_truthy(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 /// Parse `PROMTECT_MAX_BODY_BYTES`. Unset → the default. A present-but-invalid
 /// value (non-numeric, or `0`) is an error — we fail closed rather than silently
 /// reverting to the large default, which would defeat an operator who lowered it.
