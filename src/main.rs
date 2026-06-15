@@ -170,7 +170,7 @@ async fn main() {
     let ctx = Ctx {
         upstream,
         audit: Arc::new(audit::Audit::to_file(audit_path.into())),
-        client: reqwest::Client::new(),
+        client: promtect::net::http_client(),
         max_body_bytes,
         restore,
         requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),

@@ -94,8 +94,14 @@ impl StreamRestorer {
             return Bytes::new();
         }
         let rest = std::mem::take(&mut self.carry);
-        let text = String::from_utf8_lossy(&rest);
-        Bytes::from(self.restore_str(&text))
+        match std::str::from_utf8(&rest) {
+            Ok(text) => Bytes::from(self.restore_str(text)),
+            // Stream ended mid-codepoint (truncated/corrupt upstream). Emit the raw
+            // bytes verbatim rather than lossily inserting U+FFFD — matching the
+            // whole-buffer path, which forwards non-UTF-8 bodies byte-for-byte. Any
+            // held-back sentinel is valid UTF-8, so it never lands in this branch.
+            Err(_) => Bytes::from(rest),
+        }
     }
 
     /// Largest prefix length of `carry` that is safe to restore and emit now:
@@ -280,6 +286,18 @@ mod tests {
         let body = "data: {\"hello\":\"wörld «not a sentinel»\"}\n\n";
         let got = run_chunked(vault, body.as_bytes(), 3);
         assert_eq!(String::from_utf8(got).unwrap(), body);
+    }
+
+    #[test]
+    fn truncated_trailing_codepoint_emitted_verbatim() {
+        // Upstream closes mid-codepoint: the final byte 0xC3 opens a 2-byte
+        // sequence that never completes. finish() must emit it raw, not lossily
+        // insert U+FFFD — output stays byte-identical to the (already-truncated)
+        // input, matching the proxy's verbatim pass-through for non-UTF-8 bytes.
+        let vault = Arc::new(Vault::new());
+        let body: &[u8] = b"hello w\xC3";
+        let got = run_chunked(vault, body, body.len());
+        assert_eq!(got, body);
     }
 
     #[test]

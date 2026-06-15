@@ -217,7 +217,13 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
 
     match forward(&ctx, method, &uri, &headers, forward_bytes).await {
         Ok(r) => restore_response(r, &ctx, vault, request_id).await,
-        Err(e) => text_response(502, format!("promtect upstream error: {e}")),
+        Err(e) => {
+            // Log the detail locally; keep it out of the client-visible body so we
+            // don't disclose the upstream host/path to the proxied tool (which may
+            // echo or log the response). The error never contains the secret.
+            eprintln!("promtect: upstream request failed: {e}");
+            text_response(502, "promtect: upstream request failed".to_string())
+        }
     }
 }
 
