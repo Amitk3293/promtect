@@ -1,7 +1,9 @@
 name: release
 
 # Builds release binaries for macOS (arm64 + x86_64) and Linux (x86_64 + arm64)
-# on every `v*` tag, then attaches them to the GitHub Release for that tag.
+# and attaches them to the GitHub Release for a tag. Triggered automatically on a
+# `v*` tag push, or manually (workflow_dispatch) to (re)build an existing tag
+# without re-pushing it.
 #
 # Third-party actions are pinned to immutable commit SHAs (matching ci.yml); the
 # trailing comment records the version. Uploads use the built-in `gh` CLI with the
@@ -10,9 +12,18 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.1.0)"
+        required: true
 
 permissions:
   contents: write # create the release + upload assets
+
+# Resolve the tag once: the dispatch input when run manually, else the pushed tag.
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -27,6 +38,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ env.TAG }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
@@ -49,8 +62,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME}"
-          dist="promtect-${tag}-${{ matrix.target }}"
+          dist="promtect-${TAG}-${{ matrix.target }}"
           mkdir "$dist"
           cp "target/${{ matrix.target }}/release/promtect" "$dist/"
           cp README.md LICENSE NOTICE "$dist/" 2>/dev/null || true
@@ -64,12 +76,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME}"
           # Create the release if it doesn't exist yet (first matrix job wins; the
           # rest no-op). --clobber lets every job upload its own artifact safely.
-          gh release create "$tag" --verify-tag --title "Promtect $tag" --generate-notes \
-            || echo "release $tag already exists — uploading assets"
-          gh release upload "$tag" \
-            "promtect-${tag}-${{ matrix.target }}.tar.gz" \
-            "promtect-${tag}-${{ matrix.target }}.tar.gz.sha256" \
+          gh release create "$TAG" --verify-tag --title "Promtect $TAG" --generate-notes \
+            || echo "release $TAG already exists — uploading assets"
+          gh release upload "$TAG" \
+            "promtect-${TAG}-${{ matrix.target }}.tar.gz" \
+            "promtect-${TAG}-${{ matrix.target }}.tar.gz.sha256" \
             --clobber
