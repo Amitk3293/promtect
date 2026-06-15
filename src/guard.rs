@@ -140,6 +140,25 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
         i += 1;
     }
 
+    // Reject empty override values — they would otherwise collapse to the
+    // provider default in resolve_upstream and silently NOT chain Headroom / the
+    // intended upstream.
+    if upstream_override
+        .as_deref()
+        .is_some_and(|u| u.trim().is_empty())
+    {
+        return Err("--upstream requires a non-empty URL".to_string());
+    }
+    if headroom.as_deref().is_some_and(|h| h.trim().is_empty()) {
+        return Err("--headroom= requires a URL (omit the '=' to use the default)".to_string());
+    }
+    // --exec-only flags with a named tool would be silently ignored.
+    if tool.is_some()
+        && (exec_base_var.is_some() || exec_base_path.is_some() || exec_mode.is_some())
+    {
+        return Err("--base-var/--base-path/--mode are only valid with --exec".to_string());
+    }
+
     // ── per-tool wiring (verified against each tool's docs) ──────────────────
     let (base_var, base_path, mode): (String, String, String) = match tool {
         Some("claude") => {
@@ -176,7 +195,8 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
             };
             (bv, bp, md)
         }
-        Some(other) => return Err(format!("unhandled tool '{other}'")),
+        // `tool` is validated against the known set above, so this is unreachable.
+        Some(other) => unreachable!("unvalidated tool '{other}'"),
     };
 
     // ── upstream: explicit --upstream wins, then --headroom, then the mode ───
@@ -204,6 +224,31 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
              it benefits claude/codex."
                 .to_string(),
         );
+    }
+    // Warn if a guard flag was typed AFTER the tool name — it was passed to the
+    // tool, not honored by guard (e.g. `guard claude --strict` runs in transparent
+    // mode). Guard flags must precede the tool, or come after `--` for the tool.
+    const GUARD_FLAGS: &[&str] = &[
+        "--strict",
+        "--openrouter",
+        "--headroom",
+        "--upstream",
+        "--port",
+        "--mode",
+        "--base-var",
+        "--base-path",
+    ];
+    let stray: Vec<&str> = tool_args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| GUARD_FLAGS.contains(a) || a.starts_with("--headroom="))
+        .collect();
+    if !stray.is_empty() {
+        notes.push(format!(
+            "{} look like guard flag(s) but were passed to the tool and NOT honored \
+             by guard — put guard flags before the tool name.",
+            stray.join(" ")
+        ));
     }
 
     Ok(GuardPlan {
@@ -242,12 +287,14 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // Same audit log as the standalone server, so the dashboard sees guard traffic.
     let audit_path =
         std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
+    let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = Ctx {
         upstream: plan.upstream.clone(),
         audit: Arc::new(Audit::to_file(audit_path.into())),
         client: reqwest::Client::new(),
         max_body_bytes: proxy::DEFAULT_MAX_BODY_BYTES,
         restore: plan.restore,
+        requests: requests.clone(),
     };
 
     // Banner + notes go to STDERR so they never pollute the tool's stdout (some
@@ -268,19 +315,35 @@ pub async fn guard(plan: GuardPlan) -> i32 {
 
     let app = proxy::app(ctx);
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        // A normal session serves until the process exits, so an Err here is a real
+        // fault (the masking proxy stopped) — surface it rather than swallow it.
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("promtect guard: proxy stopped serving ({e}) — tool is no longer masked");
+        }
     });
 
     // Inherit the full parent env (so the user's API keys flow through, forwarded
     // untouched), then override the tool's base-URL var to point at the proxy.
+    // kill_on_drop ensures the child can't be orphaned if this future is dropped.
     let status = tokio::process::Command::new(&plan.bin)
         .args(&plan.tool_args)
         .env(&plan.base_var, &base_url)
+        .kill_on_drop(true)
         .status()
         .await;
 
+    // Tripwire: if the proxy never saw a request, the tool bypassed it entirely
+    // (e.g. it ignored the base-URL var) — secrets may have gone out unmasked.
+    if requests.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        eprintln!(
+            "promtect guard: WARNING the proxy saw 0 requests — did '{}' use {}? \
+             secrets may have gone direct (unmasked).",
+            plan.bin, plan.base_var
+        );
+    }
+
     match status {
-        Ok(s) => s.code().unwrap_or(0),
+        Ok(s) => exit_code(&s, &plan.bin),
         Err(e) => {
             eprintln!(
                 "promtect guard: failed to run '{}' ({e}). Is it installed and on your PATH?",
@@ -289,6 +352,25 @@ pub async fn guard(plan: GuardPlan) -> i32 {
             127
         }
     }
+}
+
+/// Map a child `ExitStatus` to a process exit code. A child killed by a signal has
+/// no exit code — map it to the shell convention `128 + signal` and warn, so an
+/// OOM-killed or Ctrl-C'd run is NEVER reported as success (0).
+fn exit_code(status: &std::process::ExitStatus, bin: &str) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            eprintln!("promtect guard: '{bin}' was killed by signal {sig}");
+            return 128 + sig;
+        }
+    }
+    let _ = bin;
+    1 // no code and no signal: never report success
 }
 
 #[cfg(test)]
@@ -424,6 +506,83 @@ mod tests {
             plan(&["claude", "--port", "0"])
                 .unwrap_err()
                 .contains("--port")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_override_values() {
+        // Empty values would silently collapse to the provider default upstream.
+        assert!(
+            plan(&["claude", "--headroom="])
+                .unwrap_err()
+                .contains("--headroom")
+        );
+        assert!(
+            plan(&["claude", "--upstream", ""])
+                .unwrap_err()
+                .contains("--upstream")
+        );
+    }
+
+    #[test]
+    fn rejects_exec_only_flags_with_named_tool() {
+        for flag in [
+            ["--base-var", "X"],
+            ["--base-path", "/v1"],
+            ["--mode", "openai"],
+        ] {
+            let args = ["claude", flag[0], flag[1]];
+            assert!(
+                plan(&args).unwrap_err().contains("only valid with --exec"),
+                "{flag:?} should be rejected with a named tool"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_http_upstream() {
+        assert!(
+            plan(&["claude", "--upstream", "ftp://evil"])
+                .unwrap_err()
+                .contains("http(s)")
+        );
+    }
+
+    #[test]
+    fn value_flag_without_value_errors() {
+        assert!(
+            plan(&["claude", "--upstream"])
+                .unwrap_err()
+                .contains("requires a value")
+        );
+    }
+
+    #[test]
+    fn explicit_upstream_beats_headroom() {
+        let p = plan(&[
+            "claude",
+            "--headroom",
+            "--upstream",
+            "http://127.0.0.1:9000",
+        ])
+        .unwrap();
+        assert_eq!(p.upstream, "http://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn guard_flag_after_tool_warns() {
+        // `--strict` after the tool is passed to the tool, NOT honored — must warn,
+        // and restore stays ON (the silent-downgrade footgun).
+        let p = plan(&["claude", "task", "--strict"]).unwrap();
+        assert!(
+            p.restore,
+            "strict after tool must NOT silently disable restore"
+        );
+        assert_eq!(p.tool_args, vec!["task", "--strict"]);
+        assert!(
+            p.notes.iter().any(|n| n.contains("guard flag")),
+            "should warn about the stray guard flag: {:?}",
+            p.notes
         );
     }
 }

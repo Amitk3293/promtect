@@ -56,6 +56,10 @@ pub struct Ctx {
     /// upstream body is streamed through verbatim — sentinels are never expanded,
     /// so a secret provably never re-enters the response, logs, or terminal.
     pub restore: bool,
+    /// Count of requests the proxy has received. `guard` reads this after the
+    /// wrapped tool exits: zero means the tool never used the proxy (it bypassed
+    /// masking) — a tripwire worth warning about.
+    pub requests: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
@@ -81,6 +85,12 @@ pub fn resolve_upstream(
     if let Some(u) = upstream_override {
         let u = u.trim();
         if !u.is_empty() {
+            // Only http(s): the API key in the request's auth header is forwarded to
+            // this upstream verbatim, so a non-http scheme (or junk) must not be
+            // accepted and silently used.
+            if !(u.starts_with("http://") || u.starts_with("https://")) {
+                return Err(format!("upstream URL must be http(s) (got {u:?})"));
+            }
             return Ok(u.trim_end_matches('/').to_string());
         }
     }
@@ -139,6 +149,8 @@ pub fn parse_port(var_name: &str, value: Option<&str>, default: u16) -> Result<u
 }
 
 async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
+    ctx.requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().clone();
     let uri = req.uri().clone();

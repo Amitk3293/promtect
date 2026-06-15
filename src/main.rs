@@ -149,6 +149,7 @@ async fn main() {
         client: reqwest::Client::new(),
         max_body_bytes,
         restore,
+        requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
 
     let app = proxy::app(ctx);
