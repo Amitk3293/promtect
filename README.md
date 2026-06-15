@@ -189,7 +189,7 @@ masks your secrets before any of them see them.
 
 ## What it detects
 
-**71 detectors** ship in the open-source core — every one free — covering known credential formats across ~70 providers:
+**71 detectors** ship with Promtect, covering known credential formats across ~70 providers:
 
 - **AI/LLM:** Anthropic, OpenAI, Groq, OpenRouter, Replicate, Perplexity,
   Fireworks, NVIDIA, HuggingFace, Google AI
@@ -205,12 +205,6 @@ masks your secrets before any of them see them.
 
 Adding a detector is ~one line in `src/detect.rs` — see
 [CONTRIBUTING.md](CONTRIBUTING.md).
-
-> **Free vs Pro.** Free stops the keys you *know* about. Pro adds a different
-> capability class: entropy detection for unknown-format secrets, scanning the
-> model's *response* for leaked secrets, and PII/PHI/PCI compliance detection —
-> plus fleet enforcement and audit aggregation. *Free protects a developer; Pro
-> protects the company — and proves it.*
 
 ---
 
@@ -238,7 +232,7 @@ promtect dashboard      # http://127.0.0.1:8799 — UI, /api/metrics (JSON), /me
 
 Every mask/unmask event is appended to `promtect-audit.jsonl` — timestamp,
 action, detector kind, sentinel ID, request ID. **It never records the real
-secret value**, only the opaque placeholder. SOC 2 evidence, on tap.
+secret value**, only the opaque placeholder — a clean, value-free audit trail.
 
 ---
 
@@ -257,6 +251,4 @@ See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
 
 ## License
 
-Apache-2.0. The open-source core is the whole free product — there is no crippled
-tier. Paid Promtect features (compliance, fleet, entropy, response scanning) are
-licensed separately.
+Apache-2.0 — open source, all of it.
