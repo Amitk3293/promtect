@@ -2,6 +2,9 @@
 
 ### Your AI coding tool just saw your secrets. Promtect makes sure the model never does.
 
+**One file with a key in it, handed to an AI tool, is a key you no longer control. You
+can rotate it. You can't un-send it.**
+
 Promtect is a local proxy that catches every API key, token, and password — **71
 kinds** — before your AI tool can send them. Each secret is masked on the way out,
 then restored in the reply (or kept masked in strict mode — your call). The model
@@ -45,8 +48,14 @@ use have leaked:
 - **Samsung** engineers pasted source code and secrets into ChatGPT; Samsung banned it
   company-wide.
 
-Anything entering a model's context should be treated as compromised. You can rotate the
-key. You can't un-send it. **Promtect keeps it from ever arriving.**
+Anything entering a model's context should be treated as compromised. **Promtect keeps
+it from ever arriving.**
+
+**What one slip costs you:** rotate every key in that file, force a redeploy, and write
+the note explaining why production credentials went to a third party — and the secret is
+already sitting in a log you'll never reach. **What it costs with Promtect:** nothing.
+`promtect guard claude`, and the key never leaves your laptop. Nothing to rotate, because
+nothing leaked.
 
 ---
 
