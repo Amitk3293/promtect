@@ -1,8 +1,9 @@
 # Integrations
 
-Promtect is a local proxy. You start it, then point your AI tool's base URL at
-it. Promtect masks secrets in the outbound request and restores them in the
-response (unless you run strict mode).
+Mask every secret before it reaches the model. Promtect runs as a local proxy:
+start it, point your AI tool's base URL at it, and each API key, token, and
+password in your requests is masked before it leaves your machine — then restored
+in the reply, or kept masked in strict mode. Pick your tool below.
 
 | Tool | Guide | Mode |
 |------|-------|------|

@@ -1,16 +1,16 @@
 # Promtect
 
-### Your AI coding tool just saw your AWS key. Promtect makes sure it never happens again.
+### Your AI coding tool just saw your secrets. Promtect makes sure the model never does.
 
-Promtect is a local proxy that sits between your AI tool and the model. It
-catches API keys, tokens, and passwords **before** they leave your laptop, swaps
-them for harmless placeholders, and (optionally) puts the real values back in the
-response — so the AI still works perfectly and your secrets never travel.
+Promtect is a local proxy that catches every API key, token, and password — **71
+kinds** — before your AI tool can send them. Each secret is masked on the way out,
+then restored in the reply (or kept masked in strict mode — your call). The model
+does its job on your real code; your secrets stay on your machine.
 
 **Open source. Runs entirely on your machine. No cloud, no telemetry, no root
 certificate. Secrets are never written to disk.**
 
-![Promtect masks a secret before the LLM and restores it in the response](docs/demo.gif)
+![Promtect masks every secret — keys, tokens, DB passwords — before the model sees it, and restores them in the reply](docs/demo.gif)
 
 <sub>Recorded with [`vhs`](https://github.com/charmbracelet/vhs) from [`docs/demo.tape`](docs/demo.tape) — rebuild with `cargo build --release && vhs docs/demo.tape`.</sub>
 
@@ -32,8 +32,10 @@ That key is now in a request log on a server you don't own, in a country you
 didn't choose, under a retention policy you never read. You can rotate it. You
 can't un-send it.
 
-**28 million secrets leaked to public repos in 2025; AI-assisted commits leak at
-~2× the baseline rate.** The prompt box is the new leak surface — and nothing is
+**29 million secrets hit public GitHub in 2025, and code written with AI assistants
+leaks them at ~2× the rate. And ~70% of secrets leaked in 2022 are still live today —
+almost nobody rotates.** *(GitGuardian, State of Secrets Sprawl.)* The prompt box is
+the new leak surface — and nothing is
 watching it. Promtect watches it.
 
 ---
@@ -62,7 +64,7 @@ No TLS interception. No root certificate. The auth header (`x-api-key`,
 
 `promtect dashboard` serves an offline view of what Promtect has caught: secrets
 masked, the per-detector breakdown (every detector, counted live — nothing
-hard-coded), the clean rate, recent requests, and bytes processed. It reads only
+hard-coded), the clean rate (share of requests carrying no secret), recent requests, and bytes processed. It reads only
 the audit log, so it shows counts and detector names — never a secret value,
 never request/response bodies.
 
@@ -72,11 +74,11 @@ never request/response bodies.
 
 |  | **Promtect** | Veil | LiteLLM masking |
 |---|:---:|:---:|:---:|
-| **Restore masked values in the response** | ✅ optional toggle | ❌ cannot | ❌ cannot |
+| **Restore secrets in the response** | ✅ yes — or keep masked (`PROMTECT_RESTORE=false`) | ❌ cannot | ❌ cannot |
 | Detect secrets in transit | ✅ 71 detectors | ⚠️ limited | ✅ |
-| Streaming (SSE) restore | ✅ per-token | ❌ | ❌ |
-| No root CA required | ✅ | ❌ installs a CA | n/a |
-| Memory-safe secrets (Rust + zeroize) | ✅ | ❌ | ❌ |
+| Real-time restore as the answer streams in | ✅ per-token | ❌ | ❌ |
+| No root certificate to install | ✅ | ❌ installs a CA | n/a |
+| Secrets wiped from memory (Rust + zeroize) | ✅ | ❌ | ❌ |
 | Value-free audit log | ✅ | ❌ logs to SQLite | ❌ |
 | Runs locally / no cloud | ✅ | ✅ | ❌ server-side |
 | Open source | ✅ Apache-2.0 | ✅ | ✅ |
@@ -84,7 +86,9 @@ never request/response bodies.
 **The gap no one else fills:** other tools hand the model `[REDACTED]` and you
 get useless code back. Promtect is the only one that can restore — and it lets
 you choose: transparent restore for usable answers, or strict mode where the
-secret never comes back at all.
+secret never comes back at all. And unlike Veil, Promtect installs no root
+certificate — it never touches your system trust store, so there's no new
+interception layer to trust.
 
 ---
 
@@ -174,9 +178,9 @@ masks your secrets before any of them see them.
 
 ## Two modes, you choose
 
-- **Transparent (default):** secret masked outbound, real value seamlessly back
+- **Transparent (default):** secret masked outbound, real value restored
   in the answer → AI output is directly usable.
-- **Strict (`PROMTECT_RESTORE=false`):** secret masked and *never* re-inserted —
+- **Strict (`PROMTECT_RESTORE=false`):** secret masked and *never* restored —
   provably never touches the response, logs, or terminal. Maximum paranoia for
   security-strict teams.
 
@@ -184,7 +188,7 @@ masks your secrets before any of them see them.
 
 ## What it detects
 
-**71 detectors** ship in the open-source core, covering known credential formats:
+**71 detectors** ship in the open-source core — every one free — covering known credential formats across ~70 providers:
 
 - **AI/LLM:** Anthropic, OpenAI, Groq, OpenRouter, Replicate, Perplexity,
   Fireworks, NVIDIA, HuggingFace, Google AI
