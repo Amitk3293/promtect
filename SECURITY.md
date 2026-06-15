@@ -11,7 +11,7 @@ Report privately via either:
 
 - GitHub Security Advisories — "Report a vulnerability" on the repository's
   **Security** tab (preferred), or
-- email **security@promtect.dev**.
+- email **security@promtect.org**.
 
 Please include:
 
