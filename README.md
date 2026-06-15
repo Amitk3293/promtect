@@ -15,9 +15,10 @@ certificate. Secrets are never written to disk.**
 <sub>Recorded with [`vhs`](https://github.com/charmbracelet/vhs) from [`docs/demo.tape`](docs/demo.tape) — rebuild with `cargo build --release && vhs docs/demo.tape`.</sub>
 
 ```sh
-brew install Amitk3293/tap/promtect      # or: cargo install --path .
-promtect selftest                       # → promtect selftest: PASS — no leak
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 promtect & claude "refactor my S3 upload"
+brew install Amitk3293/tap/promtect            # or: cargo install --path .
+
+promtect guard claude                          # one command: proxy up, claude pointed at it, secrets masked
+echo "ship it with $AWS_KEY" | promtect mask   # or just see what would get masked
 ```
 
 ---
