@@ -40,6 +40,15 @@ impl RegexDetector {
     }
 }
 
+/// A function-call expression captured in `KEY=value` position, e.g.
+/// `getenv("X")` or `os.environ.get("X")` — code that reads a secret, not the
+/// secret itself. Matches an identifier (optionally dotted) immediately followed
+/// by a parenthesised argument list. Used by the placeholder guard so a real
+/// high-entropy credential that merely *contains* a parenthesis is still masked,
+/// while genuine call expressions are skipped.
+static CALL_EXPR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)").expect("call-expr guard"));
+
 /// Reject values that look like config defaults / examples, not real secrets.
 fn looks_like_placeholder(v: &str) -> bool {
     if v.len() < 6 {
@@ -74,11 +83,13 @@ fn looks_like_placeholder(v: &str) -> bool {
         || v.starts_with('<')
         || v.starts_with("${")
         || v.starts_with("{{")
-        // Code expression, not a literal secret: a real credential never contains
-        // parentheses. Rejects things like `os.environ.get(` / `getenv(` that a
-        // context detector would otherwise capture as the "value".
-        || v.contains('(')
-        || v.contains(')')
+        // Code expression, not a literal secret. Reject a genuine call shape
+        // (`getenv("X")`, `os.environ.get(`) — but NOT a high-entropy credential
+        // that merely contains a parenthesis. A captured call expression ends in
+        // `(` (the quote that opened its argument stopped the capture) or is a
+        // complete `ident(...)`; a real secret is neither.
+        || v.ends_with('(')
+        || CALL_EXPR.is_match(v)
         // Common config-interpolation / env-reference prefixes.
         || lower.starts_with("process.env")
         || lower.starts_with("os.environ")
@@ -159,6 +170,26 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         dg(
             "env_secret",
             r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\]{8,})"#,
+            1,
+            true,
+        ),
+        // Quoted-value variants. The unquoted class above stops at `,` and `}` so
+        // it does not swallow JSON structure — but that also truncates a *quoted*
+        // secret that legitimately contains those bytes (e.g. `"a,b}c..."`), which
+        // would forward the tail in cleartext. When the value is delimited by
+        // quotes, the closing quote is the unambiguous boundary, so the inner class
+        // need only exclude the quote and `\`. Same `env_secret` kind; the closing
+        // quote stays OUTSIDE group 1, so masking preserves it and the body stays
+        // valid. `dedupe_overlaps` keeps this longer match over the truncated one.
+        dg(
+            "env_secret",
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*"([^"\\]{8,})""#,
+            1,
+            true,
+        ),
+        dg(
+            "env_secret",
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*'([^'\\]{8,})'"#,
             1,
             true,
         ),
@@ -367,6 +398,55 @@ mod tests {
             detect("API_KEY=A9f83Kd0parealtoken")
                 .iter()
                 .any(|m| m.kind == "env_secret")
+        );
+    }
+
+    /// A high-entropy credential that merely *contains* a parenthesis must still
+    /// be masked — the old guard rejected any value with `(`/`)`, silently leaking
+    /// such secrets. Only genuine call expressions (below) should be skipped.
+    #[test]
+    fn env_secret_with_paren_is_masked() {
+        assert!(
+            detect("API_KEY=A9f83(Kd0parealtoken")
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value == "A9f83(Kd0parealtoken"),
+            "credential containing '(' must be detected, not treated as code"
+        );
+    }
+
+    /// Call expressions that *read* a secret are not the secret; they stay guarded.
+    #[test]
+    fn env_secret_call_expression_is_not_masked() {
+        assert!(
+            !detect("API_KEY=getenv(SECRET_TOKEN)")
+                .iter()
+                .any(|m| m.kind == "env_secret"),
+            "getenv(...) is code, not a literal secret"
+        );
+        assert!(
+            !detect(r#"API_KEY=os.environ.get("FOO_BAR")"#)
+                .iter()
+                .any(|m| m.kind == "env_secret"),
+            "os.environ.get( is code, not a literal secret"
+        );
+    }
+
+    /// A quoted value containing `,` or `}` must be captured whole — the unquoted
+    /// class stops at those bytes and would forward the tail in cleartext. The
+    /// closing quote bounds the quoted variant, so the full secret is masked.
+    #[test]
+    fn quoted_env_secret_with_delimiters_not_truncated() {
+        assert!(
+            detect(r#"{"api_key":"ab,cd}efghij"}"#)
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value == "ab,cd}efghij"),
+            "quoted secret with ','/'}}' must be captured whole, not truncated"
+        );
+        assert!(
+            detect("token = 'p4ss,w0rd,with,commas'")
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value == "p4ss,w0rd,with,commas"),
+            "single-quoted secret with commas must be captured whole"
         );
     }
 
