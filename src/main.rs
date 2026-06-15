@@ -148,6 +148,20 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Where does this upstream send data, and is it rotate-worthy? Classify it for the
+    // startup banner, and honor PROMTECT_BLOCK_RISKY (fail-closed: refuse high-risk
+    // upstreams like DeepSeek or an unverified unknown host).
+    let risk = promtect::provider::classify(&upstream);
+    let block_risky = proxy::parse_truthy(std::env::var("PROMTECT_BLOCK_RISKY").ok().as_deref());
+    if promtect::provider::is_blocked(&risk, block_risky) {
+        eprintln!(
+            "promtect: refusing to proxy to a high-risk upstream — {note}\n  \
+             ({upstream}). Unset PROMTECT_BLOCK_RISKY to allow it.",
+            note = risk.note,
+        );
+        std::process::exit(1);
+    }
+
     let audit_path =
         std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
 
@@ -210,7 +224,8 @@ async fn main() {
         "  [strict: restore off]"
     };
     println!(
-        "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}"
+        "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}\n  upstream risk: {risk_note}",
+        risk_note = risk.note,
     );
     if let Err(e) = axum::serve(listener, app).await {
         eprintln!("promtect: server error: {e}");

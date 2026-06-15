@@ -269,6 +269,19 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
 /// base-URL env var, run the tool, and return its exit code. The proxy task is
 /// dropped when the process exits.
 pub async fn guard(plan: GuardPlan) -> i32 {
+    // Classify the upstream for the banner, and fail closed on a high-risk one when
+    // PROMTECT_BLOCK_RISKY is set — before binding or spawning the tool.
+    let risk = crate::provider::classify(&plan.upstream);
+    let block_risky = proxy::parse_truthy(std::env::var("PROMTECT_BLOCK_RISKY").ok().as_deref());
+    if crate::provider::is_blocked(&risk, block_risky) {
+        eprintln!(
+            "promtect guard: refusing a high-risk upstream — {}\n  \
+             Unset PROMTECT_BLOCK_RISKY to allow it.",
+            risk.note
+        );
+        return 1;
+    }
+
     let bind_addr = format!("127.0.0.1:{}", plan.port.unwrap_or(0));
     let listener = match tokio::net::TcpListener::bind(&bind_addr).await {
         Ok(l) => l,
@@ -311,6 +324,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
             "strict: restore off"
         }
     );
+    eprintln!("  upstream risk: {}", risk.note);
     for note in &plan.notes {
         eprintln!("  note: {note}");
     }

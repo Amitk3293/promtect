@@ -33,11 +33,15 @@ That key is now in a request log on a server you don't own, in a country you
 didn't choose, under a retention policy you never read. You can rotate it. You
 can't un-send it.
 
-**29 million secrets hit public GitHub in 2025, and code written with AI assistants
-leaks them at ~2× the rate. And ~70% of secrets leaked in 2022 are still live today —
-almost nobody rotates.** *(GitGuardian, State of Secrets Sprawl.)* The prompt box is
-the new leak surface — and nothing is
-watching it. Promtect watches it.
+**It doesn't matter that Claude and OpenAI don't train on their API inputs — their own
+guidance is to rotate any key that reaches them.** Exposed is exposed: it's in their
+logs, in an abuse-review queue a human can read, in a [subprocessor that gets
+breached](https://openai.com/index/mixpanel-incident/) (OpenAI's analytics vendor leaked
+API users' details in November 2025), or in [a database left open with users' prompts
+and API keys in it](https://www.wiz.io/blog/wiz-research-uncovers-exposed-deepseek-database-leak)
+(DeepSeek, 2025). The security consensus is blunt: anything entering a model's context
+should be assumed compromised and rotated. You can rotate. You can't un-send. **Promtect
+keeps the secret from ever arriving.**
 
 ---
 
@@ -170,6 +174,7 @@ masks your secrets before any of them see them.
 | `PROMTECT_MODE` | `anthropic` | Upstream preset: `anthropic` / `openai` / `ollama` / `openrouter` |
 | `PROMTECT_UPSTREAM` | — | Explicit upstream URL; overrides mode (chaining) |
 | `PROMTECT_RESTORE` | `true` | `false` = strict mode: secrets are never re-inserted |
+| `PROMTECT_BLOCK_RISKY` | `false` | `true` = refuse to proxy to a high-risk/unverified upstream (e.g. DeepSeek) |
 | `PROMTECT_AUDIT` | `promtect-audit.jsonl` | Value-free audit log path |
 | `PROMTECT_BIND` | `127.0.0.1` | Bind address (loopback by default) |
 | `PROMTECT_MAX_BODY_BYTES` | `33554432` | Request-body cap (32 MiB) before a 413 |
@@ -205,6 +210,40 @@ masks your secrets before any of them see them.
 
 Adding a detector is ~one line in `src/detect.rs` — see
 [CONTRIBUTING.md](CONTRIBUTING.md).
+
+The test suite asserts every detector masks a synthetic secret and that prose, code
+expressions, and placeholders are **never** masked — the benchmark in
+[`tests/corpus.rs`](tests/corpus.rs) catches 20/20 representative formats with 0 false
+positives on the negative corpus.
+
+---
+
+## What it catches — and what it doesn't (yet)
+
+Promtect is a focused control, not a catch-everything. It's honest about its edges:
+
+| Catches | Doesn't catch (yet) |
+|---|---|
+| Known-format secrets in the request body (keys, tokens, DB-URL passwords, JWTs, PEM keys) | Unknown-format / high-entropy secrets with no recognizable shape |
+| UTF-8 text bodies of tools with a base-URL override (Claude Code, Cursor, Codex, Ollama, OpenRouter) | The model's **response** (restore only re-inserts what it masked) |
+| The streamed response (real-time restore, or strict mode) | Binary / multipart / base64 / compressed bodies |
+| | Tools without a base-URL override (VS Code Copilot, browser chat) |
+
+Full scope and trust assumptions: **[THREAT-MODEL.md](THREAT-MODEL.md)**.
+
+## Know where you're sending
+
+Masking is half the story — *where* the request goes still matters. Promtect classifies
+the upstream and prints a one-line risk note at startup:
+
+```
+upstream risk: Anthropic API — does not train on your input, but an exposed key is still
+               rotate-it; Promtect keeps it from arriving.
+upstream risk: DeepSeek — HIGH RISK: trains on your input, China jurisdiction, no zero-retention.
+```
+
+Set `PROMTECT_BLOCK_RISKY=true` to refuse high-risk or unverified upstreams outright
+(fail-closed).
 
 ---
 
