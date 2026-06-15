@@ -1,42 +1,42 @@
 # Promtect demo tape for charmbracelet/vhs.
-# Generate the README GIF with:  vhs docs/demo.tape   →   docs/demo.gif
-#
-# It shows: a secret in a prompt → Promtect masks it outbound → the model never
-# sees it → the real value is restored in the answer.
+# Render from the crate root (so target/release/promtect is on PATH):
+#   cargo build --release && vhs docs/demo.tape   →   docs/demo.gif
 
 Output docs/demo.gif
 
 Set FontSize 20
-Set Width 1200
-Set Height 640
-Set Padding 24
+Set Width 1180
+Set Height 680
+Set Padding 26
 Set Theme "Catppuccin Mocha"
+Set TypingSpeed 35ms
 
-Type "# Promtect: your API keys never reach the LLM"
+# Put the built binary on PATH, invisibly.
+Hide
+Type "export PATH=$PWD/target/release:$PATH && clear"
 Enter
-Sleep 1s
+Show
 
+Sleep 600ms
+Type "# Promtect — your API keys never reach the LLM"
+Enter
+Sleep 900ms
+
+# Real, offline proof that masking works.
 Type "promtect selftest"
 Enter
-Sleep 1500ms
-# → promtect selftest: PASS — no leak
+Sleep 1600ms
 
-Type "# start the proxy and point Claude Code at it"
+Type "# point your AI tool at Promtect; secrets are masked at the door:"
 Enter
-Sleep 800ms
+Sleep 900ms
 
-Type "PROMTECT_PORT=8787 promtect &"
+Type "echo 'you      > fix the upload in s3.py   (file has AKIAIOSFODNN7EXAMPLE)'"
 Enter
-Sleep 1s
-
-Type 'ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude "fix the upload in s3.py (has my AWS key)"'
+Sleep 700ms
+Type "echo '  promtect > masked aws_key -> «promtect:aws_key:0001»   (model never sees your key)'"
 Enter
-Sleep 2s
-
-Type "# outbound: the model sees  «promtect:aws_key:0001»  — never AKIA..."
+Sleep 900ms
+Type "echo '  claude   > here is the fix, using AKIAIOSFODNN7EXAMPLE   (restored in the response)'"
 Enter
-Sleep 1500ms
-
-Type "# inbound: Promtect restores your real key, so the answer just works"
-Enter
-Sleep 2s
+Sleep 2600ms
