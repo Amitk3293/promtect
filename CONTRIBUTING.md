@@ -40,12 +40,10 @@ registry. Two helpers build an entry:
    ```
 6. **Open a PR** using the "New detector" template.
 
-## What belongs in the open-source core
+## What belongs here
 
-All **known-format** credential/key/token detectors are free and OSS, forever.
-Detectors that are a *different capability class* — entropy/unknown-format
-detection, scanning the model's response, and PII/PHI/PCI compliance — are paid.
-Please keep PRs to the known-format kind.
+All the credential/key/token detectors here are open source. Adding a new
+known-format detector is the most valuable contribution you can make.
 
 ## Code standards
 
@@ -62,8 +60,7 @@ Use the issue templates. For security vulnerabilities, follow
 
 ## Contributor License Agreement
 
-So that contributions can be included in both the open-source core and paid
-Promtect builds, contributors are asked to agree to the project CLA (a bot will
-prompt you on your first PR). You retain copyright to your contribution.
+Contributors are asked to agree to the project CLA (a bot will prompt you on your
+first PR). You retain copyright to your contribution.
 
 By contributing you agree your work is licensed under Apache-2.0.
