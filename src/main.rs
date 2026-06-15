@@ -27,10 +27,17 @@ async fn main() {
     // Prometheus text exposition at `/metrics`. The server never receives proxy
     // traffic — it only reads the audit JSONL that the proxy writes.
     if args.get(1).map(|s| s.as_str()) == Some("dashboard") {
-        let port: u16 = std::env::var("PROMTECT_DASHBOARD_PORT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(8799);
+        let port = match proxy::parse_port(
+            "PROMTECT_DASHBOARD_PORT",
+            std::env::var("PROMTECT_DASHBOARD_PORT").ok().as_deref(),
+            8799,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("promtect: {e}");
+                std::process::exit(1);
+            }
+        };
         let bind = std::env::var("PROMTECT_BIND").unwrap_or_else(|_| "127.0.0.1".into());
         if !promtect::net::is_loopback(&bind) {
             // Off-loopback binds are valid in container deployments, but the
@@ -66,16 +73,24 @@ async fn main() {
                 bind.as_str()
             }
         );
-        axum::serve(listener, app)
-            .await
-            .expect("promtect dashboard: server error");
+        if let Err(e) = axum::serve(listener, app).await {
+            eprintln!("promtect dashboard: server error: {e}");
+            std::process::exit(1);
+        }
         return;
     }
 
-    let port: u16 = std::env::var("PROMTECT_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8787);
+    let port = match proxy::parse_port(
+        "PROMTECT_PORT",
+        std::env::var("PROMTECT_PORT").ok().as_deref(),
+        8787,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("promtect: {e}");
+            std::process::exit(1);
+        }
+    };
     // Upstream selection: PROMTECT_UPSTREAM (explicit override / chaining knob)
     // wins; otherwise PROMTECT_MODE picks a known provider; default Anthropic.
     let mode = std::env::var("PROMTECT_MODE").ok();
@@ -150,7 +165,8 @@ async fn main() {
     println!(
         "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}"
     );
-    axum::serve(listener, app)
-        .await
-        .expect("promtect: server error");
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("promtect: server error: {e}");
+        std::process::exit(1);
+    }
 }

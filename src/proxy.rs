@@ -123,6 +123,21 @@ pub fn parse_max_body_bytes(value: Option<&str>) -> Result<usize, String> {
     }
 }
 
+/// Parse a port env var (`PROMTECT_PORT`, `PROMTECT_DASHBOARD_PORT`). Unset → the
+/// given default. A present-but-invalid value (non-numeric, out of range, or 0)
+/// is an error — we fail closed rather than silently binding the default port,
+/// which would leave the operator pointing tools at the wrong place. `var_name` is
+/// used only for the error message.
+pub fn parse_port(var_name: &str, value: Option<&str>, default: u16) -> Result<u16, String> {
+    match value {
+        None => Ok(default),
+        Some(s) => match s.trim().parse::<u16>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!("{var_name} must be an integer 1-65535 (got {s:?})")),
+        },
+    }
+}
+
 async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     let method = req.method().clone();
@@ -414,5 +429,21 @@ mod tests {
         assert!(super::parse_max_body_bytes(Some("banana")).is_err());
         assert!(super::parse_max_body_bytes(Some("-5")).is_err());
         assert!(super::parse_max_body_bytes(Some("")).is_err());
+    }
+
+    #[test]
+    fn parse_port_defaults_and_fails_closed() {
+        assert_eq!(super::parse_port("P", None, 8787).unwrap(), 8787);
+        assert_eq!(super::parse_port("P", Some(" 9000 "), 8787).unwrap(), 9000);
+        // Present-but-invalid (non-numeric, out of range, 0) must error.
+        assert!(super::parse_port("P", Some("abc"), 8787).is_err());
+        assert!(super::parse_port("P", Some("0"), 8787).is_err());
+        assert!(super::parse_port("P", Some("70000"), 8787).is_err());
+        // The error names the offending variable.
+        assert!(
+            super::parse_port("PROMTECT_PORT", Some("x"), 8787)
+                .unwrap_err()
+                .contains("PROMTECT_PORT")
+        );
     }
 }
