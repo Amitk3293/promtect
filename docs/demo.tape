@@ -5,12 +5,12 @@
 
 Output docs/demo.gif
 
-Set FontSize 22
-Set Width 1100
-Set Height 520
-Set Padding 24
+Set FontSize 20
+Set Width 1480
+Set Height 540
+Set Padding 22
 Set Theme "Catppuccin Mocha"
-Set TypingSpeed 42ms
+Set TypingSpeed 18ms
 
 Hide
 Type "export PATH=$PWD/target/release:/tmp/ptdemo:$PATH && clear"
@@ -25,9 +25,9 @@ Type "promtect guard claude"
 Enter
 Sleep 2900ms
 
-Type "# 2 · what it does to your prompt before the model sees it:"
+Type "# 2 · every secret — keys, tokens, DB passwords — masked before the model sees it:"
 Enter
 Sleep 700ms
-Type "echo 'deploy with key AKIAIOSFODNN7EXAMPLE' | promtect mask"
+Type "echo 'aws AKIAIOSFODNN7EXAMPLE  db postgres://app:hunter2@prod  stripe sk_live_4eC39HqLyjWDarjtT1zdp7dc' | promtect mask"
 Enter
-Sleep 3000ms
+Sleep 3200ms
