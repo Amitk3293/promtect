@@ -58,6 +58,16 @@ No TLS interception. No root certificate. The auth header (`x-api-key`,
 
 ---
 
+## A local dashboard — value-free
+
+`promtect dashboard` serves an offline view of what Promtect has caught: secrets
+masked, the per-detector breakdown (every detector, counted live — nothing
+hard-coded), the clean rate, recent requests, and bytes processed. It reads only
+the audit log, so it shows counts and detector names — never a secret value,
+never request/response bodies.
+
+![Promtect's local dashboard: secrets masked, per-detector breakdown, clean rate, and recent value-free request summaries](docs/dashboard.png)
+
 ## How Promtect compares
 
 |  | **Promtect** | Veil | LiteLLM masking |
