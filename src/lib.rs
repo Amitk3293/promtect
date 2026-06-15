@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod dashboard;
 pub mod detect;
+pub mod guard;
 pub mod mask;
 pub mod metrics;
 pub mod net;
