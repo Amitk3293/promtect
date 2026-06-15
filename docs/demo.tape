@@ -1,41 +1,33 @@
-# Promtect demo tape for charmbracelet/vhs.
-# Render from the crate root (so target/release/promtect is on PATH):
+# Promtect demo for charmbracelet/vhs — two beats: how easy to start, how it works.
 #   cargo build --release && vhs docs/demo.tape   →   docs/demo.gif
+# A stub `claude` on PATH (created by the render step) lets `guard claude` run
+# cleanly in the recording without a live Anthropic session.
 
 Output docs/demo.gif
 
-Set FontSize 18
-Set Width 1000
-Set Height 500
-Set Padding 20
+Set FontSize 22
+Set Width 1100
+Set Height 520
+Set Padding 24
 Set Theme "Catppuccin Mocha"
-Set TypingSpeed 22ms
+Set TypingSpeed 42ms
 
-# Setup, invisibly: put the built binary on PATH and define the masked-exchange
-# helper so only its output shows on screen (no `echo` command clutter).
 Hide
-Type "export PATH=$PWD/target/release:$PATH"
-Enter
-Type "flow(){ printf 'you      > fix the upload in s3.py   (file has AKIAIOSFODNN7EXAMPLE)\n  promtect > masked aws_key -> «promtect:aws_key:0001»   (the model never sees it)\n  claude   > here is the fix, using AKIAIOSFODNN7EXAMPLE   (restored in the response)\n'; }"
-Enter
-Type "clear"
+Type "export PATH=$PWD/target/release:/tmp/ptdemo:$PATH && clear"
 Enter
 Show
 
-Sleep 250ms
-Type "# Promtect — your API keys never reach the LLM"
-Enter
 Sleep 400ms
-
-# Real, offline proof the masking pipeline is wired correctly.
-Type "promtect selftest"
+Type "# 1 · start protecting your AI tool — one command:"
 Enter
-Sleep 1200ms
-
-Type "# point Claude / Cursor / Codex at Promtect — secrets are masked at the door:"
+Sleep 700ms
+Type "promtect guard claude"
 Enter
-Sleep 500ms
+Sleep 2900ms
 
-Type "flow"
+Type "# 2 · what it does to your prompt before the model sees it:"
 Enter
-Sleep 2200ms
+Sleep 700ms
+Type "echo 'deploy with key AKIAIOSFODNN7EXAMPLE' | promtect mask"
+Enter
+Sleep 3000ms
