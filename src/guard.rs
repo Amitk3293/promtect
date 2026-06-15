@@ -195,8 +195,10 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
             };
             (bv, bp, md)
         }
-        // `tool` is validated against the known set above, so this is unreachable.
-        Some(other) => unreachable!("unvalidated tool '{other}'"),
+        // `tool` is validated against the known set above, so this is unreachable
+        // today. Return an error rather than panic, so a future refactor that adds
+        // a tool without updating this match fails cleanly instead of aborting.
+        Some(other) => return Err(format!("unvalidated tool '{other}'")),
     };
 
     // ── upstream: explicit --upstream wins, then --headroom, then the mode ───
@@ -291,7 +293,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     let ctx = Ctx {
         upstream: plan.upstream.clone(),
         audit: Arc::new(Audit::to_file(audit_path.into())),
-        client: reqwest::Client::new(),
+        client: crate::net::http_client(),
         max_body_bytes: proxy::DEFAULT_MAX_BODY_BYTES,
         restore: plan.restore,
         requests: requests.clone(),

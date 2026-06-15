@@ -7,6 +7,23 @@ pub fn is_loopback(bind: &str) -> bool {
     bind == "127.0.0.1" || bind == "::1" || bind == "localhost"
 }
 
+/// The upstream HTTP client Promtect forwards through.
+///
+/// Sets a connect timeout so a black-hole upstream (a host that silently drops
+/// the SYN, rather than refusing it) surfaces as a prompt 502 instead of hanging
+/// until the OS TCP stack gives up minutes later. No request/response *body*
+/// timeout is set: responses stream and may legitimately be long-lived.
+///
+/// Falls back to the default client if the builder fails (only possible on TLS
+/// backend init, at startup — never on the request path), so construction is
+/// infallible for callers.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
