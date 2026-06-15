@@ -1,0 +1,86 @@
+name: release
+
+# Builds release binaries for macOS (arm64 + x86_64) and Linux (x86_64 + arm64)
+# and attaches them to the GitHub Release for a tag. Triggered automatically on a
+# `v*` tag push, or manually (workflow_dispatch) to (re)build an existing tag
+# without re-pushing it.
+#
+# Third-party actions are pinned to immutable commit SHAs (matching ci.yml); the
+# trailing comment records the version. Uploads use the built-in `gh` CLI with the
+# automatic GITHUB_TOKEN — no third-party release action, no extra secret.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: write # create the release + upload assets
+
+# Resolve the tag once: the dispatch input when run manually, else the pushed tag.
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      # The aarch64 Linux target cross-compiles on an x86_64 runner, so it needs
+      # the matching cross-linker. Native targets (both macOS, x86_64 Linux) don't.
+      - name: Install aarch64 Linux cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          dist="promtect-${TAG}-${{ matrix.target }}"
+          mkdir "$dist"
+          cp "target/${{ matrix.target }}/release/promtect" "$dist/"
+          cp README.md LICENSE NOTICE "$dist/" 2>/dev/null || true
+          # Archive the contents (binary at the root, no wrapper dir) so the
+          # Homebrew formula's `bin.install "promtect"` works without strip logic.
+          tar -C "$dist" -czf "${dist}.tar.gz" .
+          shasum -a 256 "${dist}.tar.gz" | tee "${dist}.tar.gz.sha256"
+
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          # Create the release if it doesn't exist yet (first matrix job wins; the
+          # rest no-op). --clobber lets every job upload its own artifact safely.
+          gh release create "$TAG" --verify-tag --title "Promtect $TAG" --generate-notes \
+            || echo "release $TAG already exists — uploading assets"
+          gh release upload "$TAG" \
+            "promtect-${TAG}-${{ matrix.target }}.tar.gz" \
+            "promtect-${TAG}-${{ matrix.target }}.tar.gz.sha256" \
+            --clobber
