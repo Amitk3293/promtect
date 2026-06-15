@@ -78,7 +78,29 @@ secret never comes back at all.
 
 ---
 
-## Quickstart
+## Run it in one command
+
+`promtect guard <tool>` starts the proxy, points your tool at it, runs the tool,
+and tears it down on exit — no manual env-var wiring:
+
+```sh
+promtect guard claude                     # Claude Code, secrets masked → Anthropic
+promtect guard codex "fix the s3 upload"   # Codex → OpenAI
+promtect guard ollama run deepseek-r1      # Ollama CLI → masked → local Ollama server
+promtect guard claude --headroom           # chain Headroom: mask → compress → Anthropic
+promtect guard codex --strict              # never re-insert secrets in the response
+promtect guard --exec aider --base-var OPENAI_BASE_URL --base-path /v1   # wrap any tool
+```
+
+Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) flow through untouched —
+Promtect only masks the request body. The base URL each tool needs is set for you
+(`ANTHROPIC_BASE_URL` for Claude, `OPENAI_BASE_URL` for Codex, `OLLAMA_HOST` for
+Ollama). Combine with [Headroom](https://github.com/chopratejas/headroom) for
+secrets-safe **and** ~90% cheaper sessions.
+
+---
+
+## Quickstart (manual)
 
 ### Native
 

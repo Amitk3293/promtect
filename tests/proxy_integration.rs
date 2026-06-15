@@ -42,6 +42,7 @@ fn ctx(upstream_url: &str) -> promtect::proxy::Ctx {
         client: reqwest::Client::new(),
         max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
         restore: true,
+        requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     }
 }
 
@@ -184,6 +185,7 @@ async fn upstream_error_returns_502() {
         client: reqwest::Client::new(),
         max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
         restore: true,
+        requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let promtect_url = spawn(promtect::proxy::app(dead_ctx)).await;
 
@@ -385,6 +387,7 @@ async fn oversized_body_is_rejected_with_413() {
         client: reqwest::Client::new(),
         max_body_bytes: 64,
         restore: true,
+        requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     let promtect_url = spawn(promtect::proxy::app(small_cap)).await;
 
