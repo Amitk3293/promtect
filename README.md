@@ -15,7 +15,7 @@ certificate. Secrets are never written to disk.**
 <sub>Recorded with [`vhs`](https://github.com/charmbracelet/vhs) from [`docs/demo.tape`](docs/demo.tape) — rebuild with `cargo build --release && vhs docs/demo.tape`.</sub>
 
 ```sh
-brew install promtect/tap/promtect      # or: cargo install --path .
+brew install Amitk3293/tap/promtect      # or: cargo install --path .
 promtect selftest                       # → promtect selftest: PASS — no leak
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 promtect & claude "refactor my S3 upload"
 ```
