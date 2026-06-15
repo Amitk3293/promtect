@@ -2,7 +2,16 @@
 
 Promtect's default mode. Claude Code talks the Anthropic API.
 
-## Start Promtect
+## Quickest: one command
+
+```sh
+promtect guard claude              # starts the proxy, runs Claude Code, masks + restores
+promtect guard claude --headroom   # also chain Headroom for token compression
+```
+
+That's it. The rest of this guide is the manual method (run the proxy yourself).
+
+## Start Promtect (manual)
 
 ```sh
 promtect          # mode defaults to anthropic, listens on 127.0.0.1:8787
