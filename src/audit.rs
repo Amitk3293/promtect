@@ -33,6 +33,22 @@ impl Audit {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Open the audit log for append, creating it owner-only (`0600`) on Unix.
+    /// The log is value-free (no secret values), but on a shared machine even the
+    /// detector/count metadata is the operator's business alone — another local
+    /// user has no reason to read which detectors fired. `mode` applies only when
+    /// the file is created; pre-existing logs keep their permissions.
+    fn open_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    }
+
     /// Record a value-free per-request summary: how many secrets were masked, which
     /// detector kinds fired, and the request's byte sizes. Enables "caught vs clean"
     /// metrics (a clean request logs `masked=0`). NEVER logs secret values or body text.
@@ -65,7 +81,7 @@ impl Audit {
         });
         let guard = self.sink_lock();
         if let Some(path) = guard.as_ref()
-            && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+            && let Ok(mut f) = Self::open_append(path)
         {
             let _ = writeln!(f, "{}", line);
         }
@@ -86,7 +102,7 @@ impl Audit {
         });
         let guard = self.sink_lock();
         if let Some(path) = guard.as_ref()
-            && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+            && let Ok(mut f) = Self::open_append(path)
         {
             let _ = writeln!(f, "{}", line);
         }
