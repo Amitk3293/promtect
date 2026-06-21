@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# Auto-bump the patch version in Cargo.toml whenever a commit changes code
+# (src/, tests/, build.rs, or Cargo.toml itself). Documentation-only and
+# CI-only commits do NOT bump. This keeps the crate version moving with the
+# code so a release is never accidentally cut from a stale version (see how
+# v0.1.0 shipped without the playground subcommand). Cargo.lock is kept in
+# sync without invoking cargo, so the hook stays fast.
+#
+# Enabled per clone via: git config core.hooksPath .githooks
+#
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cargo_toml="$root/Cargo.toml"
+[ -f "$cargo_toml" ] || exit 0
+
+# Only bump when code (not just docs/CI) is part of this commit.
+if ! git diff --cached --name-only | grep -qE '^(src/|tests/|build\.rs$|Cargo\.toml$)'; then
+  exit 0
+fi
+
+# The package version is the only top-level `version = "x.y.z"` line in Cargo.toml
+# (dependency versions live inside `dep = { version = ... }`, never at column 0).
+cur="$(grep -m1 -oE '^version = "[0-9]+\.[0-9]+\.[0-9]+"' "$cargo_toml" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)"
+if [ -z "$cur" ]; then
+  echo "pre-commit: could not find [package] version in Cargo.toml; skipping bump" >&2
+  exit 0
+fi
+
+IFS=. read -r major minor patch <<EOF
+$cur
+EOF
+new="$major.$minor.$((patch + 1))"
+
+# Bump Cargo.toml (first top-level version line only).
+awk -v new="$new" '
+  !done && /^version = "[0-9]+\.[0-9]+\.[0-9]+"/ {
+    sub(/"[0-9]+\.[0-9]+\.[0-9]+"/, "\"" new "\""); done = 1
+  }
+  { print }
+' "$cargo_toml" > "$cargo_toml.tmp" && mv "$cargo_toml.tmp" "$cargo_toml"
+
+# Keep the promtect entry in Cargo.lock in sync (no cargo run needed).
+lock="$root/Cargo.lock"
+if [ -f "$lock" ]; then
+  awk -v new="$new" '
+    /^name = "promtect"$/ { hot = 1 }
+    hot && /^version = / { sub(/"[0-9]+\.[0-9]+\.[0-9]+"/, "\"" new "\""); hot = 0 }
+    { print }
+  ' "$lock" > "$lock.tmp" && mv "$lock.tmp" "$lock"
+  git add "$lock"
+fi
+
+git add "$cargo_toml"
+echo "pre-commit: bumped version $cur -> $new"

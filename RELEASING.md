@@ -4,7 +4,11 @@ Binaries and the Homebrew formula are driven by tags.
 
 ## Cut a release
 
-1. Land everything on `main` (green CI) and bump `version` in `Cargo.toml`.
+1. Land everything on `main` (green CI). The patch version in `Cargo.toml` is
+   bumped automatically on every code commit (see [Versioning](#versioning)), so
+   it already reflects the work since the last release — just confirm it's the
+   version you want to tag (bump the minor/major by hand if this release warrants
+   it).
 2. Tag and push:
    ```sh
    git tag -a vX.Y.Z -m "Promtect vX.Y.Z"
@@ -27,6 +31,21 @@ cd ../homebrew-tap && git commit -am "promtect vX.Y.Z" && git push
 ```
 
 Install: `brew install Amitk3293/tap/promtect` (tap repo `Amitk3293/homebrew-tap`).
+
+## Versioning
+
+The patch version in `Cargo.toml` auto-increments on any commit that touches code
+(`src/`, `tests/`, `build.rs`, or `Cargo.toml`) via the tracked
+`.githooks/pre-commit` hook; docs-only and CI-only commits don't bump. This keeps
+the crate version moving with the code so a release is never cut from a stale
+version. Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The hook only ever touches the patch component — bump the minor or major by hand
+in `Cargo.toml` when a release warrants it.
 
 ## Moving to a `promtect` org later
 
