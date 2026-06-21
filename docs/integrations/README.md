@@ -45,3 +45,6 @@ PROMTECT_PORT=8788 PROMTECT_MODE=openai    promtect &
 | `PROMTECT_UPSTREAM` | — | Explicit upstream URL; overrides mode (chaining). |
 | `PROMTECT_RESTORE` | `true` | `false` = strict mode (never re-insert secrets). |
 | `PROMTECT_AUDIT` | `promtect-audit.jsonl` | Value-free audit log path. |
+
+Stuck? See the [FAQ & troubleshooting](../faq.md). Want the full list of what's
+masked? See the [detector reference](../detectors.md).

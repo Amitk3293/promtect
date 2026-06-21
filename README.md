@@ -301,13 +301,26 @@ secret value**, only the opaque placeholder, a clean, value-free audit trail.
 ## Develop
 
 ```sh
-make test     # cargo test, 81 unit + integration + property tests
+make test     # cargo test, 126 unit + integration + property tests
 make lint     # cargo fmt --check + clippy --all-targets -D warnings
 make smoke    # build + run: prove masking + value-free audit
 ```
 
 See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
 [SECURITY.md](SECURITY.md).
+
+---
+
+## Documentation
+
+- **[Try it (FAQ & troubleshooting)](docs/faq.md)** — prove it's masking, multi-tool setup, strict mode, common gotchas.
+- **[Detector reference](docs/detectors.md)** — every one of the 71 detectors, by provider.
+- **[Architecture](docs/architecture.md)** — how a request flows through detect → vault → mask → streaming restore.
+- **[Integrations](docs/integrations/README.md)** — Claude Code, Cursor, Codex, Ollama, OpenRouter, chaining.
+- **[Threat model](THREAT-MODEL.md)** · **[Roadmap](ROADMAP.md)** · **[Security policy](SECURITY.md)**
+
+Or run it locally with no setup: `promtect playground` narrates a full
+mask → forward → restore round-trip against a mock upstream.
 
 ---
 

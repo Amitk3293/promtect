@@ -45,6 +45,16 @@ async fn main() {
         return;
     }
 
+    // ── playground subcommand ───────────────────────────────────────────────
+    // A narrated, offline demo of the full mask → forward → restore round-trip
+    // against an in-process mock upstream. Every secret is fake; nothing leaves
+    // the machine. The fastest way to watch Promtect actually work:
+    //   promtect playground
+    if args.get(1).map(|s| s.as_str()) == Some("playground") {
+        promtect::playground::run().await;
+        return;
+    }
+
     // ── guard subcommand ────────────────────────────────────────────────────
     // One-command protected session: start an ephemeral proxy, point the tool at
     // it, run the tool with the user's args, tear down on exit.

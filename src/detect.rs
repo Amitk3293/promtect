@@ -680,6 +680,26 @@ mod tests {
         );
     }
 
+    /// Anti-drift: `docs/detectors.md` must mention every detector `kind`, so a new
+    /// detector cannot ship undocumented. Adding a row to `DETECTORS` without a row
+    /// in the reference fails CI here.
+    #[test]
+    fn detectors_doc_covers_every_kind() {
+        let doc = include_str!("../docs/detectors.md");
+        let mut kinds: Vec<&str> = DETECTORS.iter().map(|d| d.kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        for k in &kinds {
+            // Match the backtick-delimited code span (`aws_key`), not a bare
+            // substring: otherwise a removed `private_key` row would be masked by
+            // `pgp_private_key`, which contains it, and the guard would pass blind.
+            assert!(
+                doc.contains(&format!("`{k}`")),
+                "docs/detectors.md is missing detector kind `{k}` — add a row"
+            );
+        }
+    }
+
     #[test]
     fn ignores_innocuous_text() {
         // Invariant: common log/prose strings never trigger any detector.

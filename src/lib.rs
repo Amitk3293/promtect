@@ -10,6 +10,7 @@ pub mod guard;
 pub mod mask;
 pub mod metrics;
 pub mod net;
+pub mod playground;
 pub mod provider;
 pub mod proxy;
 pub mod stream;
