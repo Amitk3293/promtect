@@ -1,0 +1,8 @@
+# Pin the Rust toolchain so CI `fmt`/`clippy`/`test` are deterministic and a
+# release never flakes on `stable` drift — a newer rustfmt reformatting unchanged
+# code is what failed the v0.1.0 docker-publish re-run. Bump `channel` deliberately
+# to adopt a newer Rust; `rustfmt`/`clippy` are pulled in automatically so CI jobs
+# don't need to install components separately.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
