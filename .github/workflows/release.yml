@@ -43,8 +43,13 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ env.TAG }}
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      # Pin the toolchain to the same channel as rust-toolchain.toml so the cross
+      # targets below are installed for the toolchain the build actually uses.
+      # Without this, the action installs targets for `stable` while the toml
+      # override builds with the pinned version → "target may not be installed".
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.96.0
         with:
+          toolchain: "1.96.0" # keep in sync with rust-toolchain.toml
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
