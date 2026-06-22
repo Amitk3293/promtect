@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// at the proxy, the proxy's upstream, and the masking mode.
 #[derive(Debug, PartialEq, Eq)]
 pub struct GuardPlan {
-    /// Tool binary to execute (`claude`, `codex`, `ollama`, or an `--exec` command).
+    /// Tool binary to execute (`claude`, `codex`, `ollama`, `aider`, or an `--exec` command).
     pub bin: String,
     /// Arguments passed through to the tool verbatim.
     pub tool_args: Vec<String>,
@@ -51,7 +51,7 @@ fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, S
 /// no I/O, so the whole wiring is unit-testable.
 pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
     if args.is_empty() {
-        return Err("expected a tool (claude|codex|ollama) or --exec CMD".to_string());
+        return Err("expected a tool (claude|codex|ollama|aider) or --exec CMD".to_string());
     }
 
     // ── tool / --exec ───────────────────────────────────────────────────────
@@ -66,9 +66,9 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
         i = 2;
     } else {
         let t = args[0].as_str();
-        if !matches!(t, "claude" | "codex" | "ollama") {
+        if !matches!(t, "claude" | "codex" | "ollama" | "aider") {
             return Err(format!(
-                "unknown tool '{t}' (expected claude|codex|ollama, or --exec CMD)"
+                "unknown tool '{t}' (expected claude|codex|ollama|aider, or --exec CMD)"
             ));
         }
         tool = Some(t);
@@ -183,6 +183,16 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
             }
             ("OLLAMA_HOST".into(), String::new(), "ollama".into())
         }
+        // Aider reads OPENAI_API_BASE for its OpenAI-compatible endpoint (LiteLLM
+        // under the hood). For OpenRouter just chain via --upstream or --exec.
+        Some("aider") if openrouter => {
+            return Err(
+                "--openrouter is not wired for aider; use --upstream https://openrouter.ai \
+                 or guard --exec aider --base-var OPENAI_API_BASE --base-path /api/v1"
+                    .to_string(),
+            );
+        }
+        Some("aider") => ("OPENAI_API_BASE".into(), "/v1".into(), "openai".into()),
         // --exec
         None => {
             let bv =
@@ -224,6 +234,18 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
         notes.push(
             "Headroom does not compress native Ollama (/api/chat) traffic — \
              it benefits claude/codex."
+                .to_string(),
+        );
+    }
+    // Aider is multi-provider but guard only sets OPENAI_API_BASE, so only its
+    // OpenAI-compatible traffic is masked. An Anthropic/Gemini/other model in
+    // aider would bypass the proxy entirely — warn so a non-openai model isn't a
+    // silent leak (this tool's worst failure mode).
+    if tool == Some("aider") {
+        notes.push(
+            "guard aider masks only OpenAI-compatible traffic (via OPENAI_API_BASE). \
+             Use an `openai/<model>` model; an Anthropic/Gemini/other model in aider \
+             bypasses the proxy and is NOT masked."
                 .to_string(),
         );
     }
@@ -329,6 +351,22 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         eprintln!("  note: {note}");
     }
 
+    // Detect a stale base-URL var left by a previous test or crashed session.
+    // Guard overrides it for the child process, but the shell still holds the old
+    // value — direct tool invocations in this terminal will fail until it's cleared.
+    // Warn only when the value looks like an ephemeral stub (loopback, non-standard
+    // port), not when it's a valid Headroom URL (8787/8788) or a remote host.
+    if let Ok(stale) = std::env::var(&plan.base_var) {
+        if is_stale_stub(&stale) {
+            eprintln!(
+                "promtect guard: WARNING — {} is set to a dead stub ({stale}).\n  \
+                 This session is fine; direct '{}' calls in this terminal will fail.\n  \
+                 Fix: unset {}",
+                plan.base_var, plan.bin, plan.base_var
+            );
+        }
+    }
+
     let app = proxy::app(ctx);
     tokio::spawn(async move {
         // A normal session serves until the process exits, so an Err here is a real
@@ -370,6 +408,25 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     }
 }
 
+/// Returns `true` if `url` looks like an ephemeral stub — a loopback address on a
+/// non-standard port. Known-good loopback ports (8787 = Promtect default, 8788 =
+/// common Headroom port) are excluded so legitimate proxy URLs don't trigger the
+/// stale-stub warning.
+fn is_stale_stub(url: &str) -> bool {
+    let host_port = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"));
+    let Some(rest) = host_port else {
+        return false; // remote host — not a stub
+    };
+    let port: u16 = rest
+        .split('/')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    !matches!(port, 8787 | 8788)
+}
+
 /// Map a child `ExitStatus` to a process exit code. A child killed by a signal has
 /// no exit code — map it to the shell convention `128 + signal` and warn, so an
 /// OOM-killed or Ctrl-C'd run is NEVER reported as success (0).
@@ -395,6 +452,19 @@ mod tests {
 
     fn plan(args: &[&str]) -> Result<GuardPlan, String> {
         plan_guard(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn stale_stub_detection() {
+        // ephemeral ports → stale
+        assert!(is_stale_stub("http://127.0.0.1:56524"));
+        assert!(is_stale_stub("http://localhost:12345"));
+        // known-good loopback ports → not stale
+        assert!(!is_stale_stub("http://127.0.0.1:8787"));
+        assert!(!is_stale_stub("http://127.0.0.1:8788"));
+        // remote host → never a stub
+        assert!(!is_stale_stub("https://api.anthropic.com"));
+        assert!(!is_stale_stub("https://openrouter.ai/api/v1"));
     }
 
     #[test]
@@ -426,6 +496,29 @@ mod tests {
         assert_eq!(p.base_path, "");
         assert_eq!(p.upstream, "http://localhost:11434");
         assert_eq!(p.tool_args, vec!["run", "deepseek-r1"]);
+    }
+
+    #[test]
+    fn aider_default_wiring() {
+        let p = plan(&["aider", "--model", "openai/gpt-5.5"]).unwrap();
+        assert_eq!(p.bin, "aider");
+        assert_eq!(p.base_var, "OPENAI_API_BASE");
+        assert_eq!(p.base_path, "/v1");
+        assert_eq!(p.upstream, "https://api.openai.com");
+        assert_eq!(p.tool_args, vec!["--model", "openai/gpt-5.5"]);
+        // Multi-provider footgun must be surfaced: only OpenAI-compatible traffic is masked.
+        assert!(
+            p.notes.iter().any(|n| n.contains("NOT masked")),
+            "expected aider bypass warning in notes, got {:?}",
+            p.notes
+        );
+    }
+
+    #[test]
+    fn aider_openrouter_is_rejected_with_hint() {
+        // Aider+OpenRouter isn't wired as a preset; the error points at the escape hatch.
+        let e = plan(&["aider", "--openrouter"]).unwrap_err();
+        assert!(e.contains("--upstream") || e.contains("--exec"), "{e}");
     }
 
     #[test]
@@ -506,7 +599,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_tool_and_bad_openrouter() {
-        assert!(plan(&["aider"]).unwrap_err().contains("unknown tool"));
+        assert!(plan(&["notatool"]).unwrap_err().contains("unknown tool"));
         assert!(
             plan(&["claude", "--openrouter"])
                 .unwrap_err()
