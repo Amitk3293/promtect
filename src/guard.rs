@@ -511,12 +511,12 @@ mod tests {
 
     #[test]
     fn aider_default_wiring() {
-        let p = plan(&["aider", "--model", "openai/gpt-4o"]).unwrap();
+        let p = plan(&["aider", "--model", "openai/gpt-5.5"]).unwrap();
         assert_eq!(p.bin, "aider");
         assert_eq!(p.base_var, "OPENAI_API_BASE");
         assert_eq!(p.base_path, "/v1");
         assert_eq!(p.upstream, "https://api.openai.com");
-        assert_eq!(p.tool_args, vec!["--model", "openai/gpt-4o"]);
+        assert_eq!(p.tool_args, vec!["--model", "openai/gpt-5.5"]);
         // Multi-provider footgun must be surfaced: only OpenAI-compatible traffic is masked.
         assert!(
             p.notes.iter().any(|n| n.contains("NOT masked")),

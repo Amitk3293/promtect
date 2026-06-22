@@ -126,7 +126,7 @@ and tears it down on exit, no manual env-var wiring:
 promtect guard claude                     # Claude Code, secrets masked → Anthropic
 promtect guard codex "fix the s3 upload"   # Codex → OpenAI
 promtect guard ollama run deepseek-r1      # Ollama CLI → masked → local Ollama server
-promtect guard aider --model openai/gpt-4o  # Aider → masked → OpenAI-compatible
+promtect guard aider --model openai/gpt-5.5 # Aider → masked → OpenAI-compatible
 promtect guard claude --headroom           # chain Headroom: mask → compress → Anthropic
 promtect guard codex --strict              # never re-insert secrets in the response
 promtect guard --exec <tool> --base-var OPENAI_API_BASE --base-path /v1   # wrap any tool
