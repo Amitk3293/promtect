@@ -355,15 +355,15 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // value — direct tool invocations in this terminal will fail until it's cleared.
     // Warn only when the value looks like an ephemeral stub (loopback, non-standard
     // port), not when it's a valid Headroom URL (8787/8788) or a remote host.
-    if let Ok(stale) = std::env::var(&plan.base_var) {
-        if is_stale_stub(&stale) {
-            eprintln!(
-                "promtect guard: WARNING — {} is set to a dead stub ({stale}).\n  \
-                 This session is fine; direct '{}' calls in this terminal will fail.\n  \
-                 Fix: if no proxy is serving this URL, run: unset {}",
-                plan.base_var, plan.bin, plan.base_var
-            );
-        }
+    if let Ok(stale) = std::env::var(&plan.base_var)
+        && is_stale_stub(&stale)
+    {
+        eprintln!(
+            "promtect guard: WARNING — {} is set to a dead stub ({stale}).\n  \
+             This session is fine; direct '{}' calls in this terminal will fail.\n  \
+             Fix: if no proxy is serving this URL, run: unset {}",
+            plan.base_var, plan.bin, plan.base_var
+        );
     }
 
     let app = proxy::app(ctx);
