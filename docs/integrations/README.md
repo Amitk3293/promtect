@@ -12,8 +12,16 @@ in the reply, or kept masked in strict mode. Pick your tool below.
 | OpenAI Codex CLI | [codex.md](codex.md) | `openai` |
 | Ollama (local models) | [ollama.md](ollama.md) | `ollama` |
 | OpenRouter | [openrouter.md](openrouter.md) | `openrouter` |
+| Agent harnesses (OpenCode, Crush, Goose, Pi) | [harnesses.md](harnesses.md) | `anthropic` / `openai` |
+| Aider (`guard aider`) | [harnesses.md](harnesses.md#aider) | `openai` |
+| OpenClaw (self-hosted gateway) | [openclaw.md](openclaw.md) | `anthropic` / `openai` |
+| NanoClaw (Agents SDK / containers) | [nanoclaw.md](nanoclaw.md) | `anthropic` |
 | Chaining (Headroom / LiteLLM / corp proxy) | [chaining.md](chaining.md) | any + `PROMTECT_UPSTREAM` |
 | VS Code Copilot | [vscode-copilot.md](vscode-copilot.md) | not yet (needs CA) |
+
+Not listed? **Any** tool that lets you override its model-provider base URL works
+the same way: point it at `http://127.0.0.1:8787` and run `promtect` in the
+matching mode. See [harnesses.md](harnesses.md) for the pattern.
 
 ## How upstream selection works
 
