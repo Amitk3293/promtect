@@ -395,10 +395,12 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // Tripwire: if the proxy never saw a request, the tool bypassed it entirely
     // (e.g. it ignored the base-URL var) — secrets may have gone out unmasked.
     // Skip for invocations that intentionally make no API calls.
-    let is_dry_run = plan
-        .tool_args
-        .iter()
-        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "version" | "help"));
+    let is_dry_run = plan.tool_args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--help" | "-h" | "--version" | "version" | "help"
+        )
+    });
     if !is_dry_run && requests.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         eprintln!(
             "promtect guard: WARNING the proxy saw 0 requests — did '{}' use {}? \
