@@ -237,15 +237,14 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
                 .to_string(),
         );
     }
-    // Aider is multi-provider but guard only sets OPENAI_API_BASE, so only its
-    // OpenAI-compatible traffic is masked. An Anthropic/Gemini/other model in
-    // aider would bypass the proxy entirely — warn so a non-openai model isn't a
-    // silent leak (this tool's worst failure mode).
+    // Aider is multi-provider: guard covers only OpenAI-compatible traffic.
+    // Anthropic/Gemini/other models bypass the proxy entirely — warn so a
+    // non-openai model isn't a silent leak (worst failure mode for a masking tool).
     if tool == Some("aider") {
         notes.push(
-            "guard aider masks only OpenAI-compatible traffic (via OPENAI_API_BASE). \
-             Use an `openai/<model>` model; an Anthropic/Gemini/other model in aider \
-             bypasses the proxy and is NOT masked."
+            "guard aider masks OpenAI-compatible traffic (via OPENAI_API_BASE + OPENAI_BASE_URL). \
+             Use an `openai/<model>` model; Anthropic/Gemini/other models in aider \
+             bypass the proxy and are NOT masked."
                 .to_string(),
         );
     }
@@ -361,7 +360,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
             eprintln!(
                 "promtect guard: WARNING — {} is set to a dead stub ({stale}).\n  \
                  This session is fine; direct '{}' calls in this terminal will fail.\n  \
-                 Fix: unset {}",
+                 Fix: if no proxy is serving this URL, run: unset {}",
                 plan.base_var, plan.bin, plan.base_var
             );
         }
@@ -379,16 +378,28 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // Inherit the full parent env (so the user's API keys flow through, forwarded
     // untouched), then override the tool's base-URL var to point at the proxy.
     // kill_on_drop ensures the child can't be orphaned if this future is dropped.
-    let status = tokio::process::Command::new(&plan.bin)
-        .args(&plan.tool_args)
+    let mut cmd = tokio::process::Command::new(&plan.bin);
+    cmd.args(&plan.tool_args)
         .env(&plan.base_var, &base_url)
-        .kill_on_drop(true)
-        .status()
-        .await;
+        .kill_on_drop(true);
+    // Belt-and-suspenders for aider: LiteLLM reads OPENAI_API_BASE, but the modern
+    // OpenAI SDK (used directly by newer aider for openai/ prefix models) reads
+    // OPENAI_BASE_URL only. Override both so the proxy intercepts regardless of
+    // which var the installed aider version prefers. A stale OPENAI_BASE_URL in the
+    // parent shell would otherwise leak straight past plan.base_var override.
+    if plan.base_var == "OPENAI_API_BASE" {
+        cmd.env("OPENAI_BASE_URL", &base_url);
+    }
+    let status = cmd.status().await;
 
     // Tripwire: if the proxy never saw a request, the tool bypassed it entirely
     // (e.g. it ignored the base-URL var) — secrets may have gone out unmasked.
-    if requests.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+    // Skip for invocations that intentionally make no API calls.
+    let is_dry_run = plan
+        .tool_args
+        .iter()
+        .any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "version" | "help"));
+    if !is_dry_run && requests.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         eprintln!(
             "promtect guard: WARNING the proxy saw 0 requests — did '{}' use {}? \
              secrets may have gone direct (unmasked).",
@@ -500,12 +511,12 @@ mod tests {
 
     #[test]
     fn aider_default_wiring() {
-        let p = plan(&["aider", "--model", "openai/gpt-5.5"]).unwrap();
+        let p = plan(&["aider", "--model", "openai/gpt-4o"]).unwrap();
         assert_eq!(p.bin, "aider");
         assert_eq!(p.base_var, "OPENAI_API_BASE");
         assert_eq!(p.base_path, "/v1");
         assert_eq!(p.upstream, "https://api.openai.com");
-        assert_eq!(p.tool_args, vec!["--model", "openai/gpt-5.5"]);
+        assert_eq!(p.tool_args, vec!["--model", "openai/gpt-4o"]);
         // Multi-provider footgun must be surfaced: only OpenAI-compatible traffic is masked.
         assert!(
             p.notes.iter().any(|n| n.contains("NOT masked")),

@@ -61,7 +61,7 @@ async fn main() {
     //   promtect guard claude
     //   promtect guard codex "fix the s3 upload"
     //   promtect guard ollama run deepseek-r1
-    //   promtect guard aider --model openai/gpt-5.5
+    //   promtect guard aider --model openai/gpt-4o
     //   promtect guard claude --headroom
     if args.get(1).map(|s| s.as_str()) == Some("guard") {
         match promtect::guard::plan_guard(&args[2..]) {

@@ -126,9 +126,10 @@ and tears it down on exit, no manual env-var wiring:
 promtect guard claude                     # Claude Code, secrets masked → Anthropic
 promtect guard codex "fix the s3 upload"   # Codex → OpenAI
 promtect guard ollama run deepseek-r1      # Ollama CLI → masked → local Ollama server
+promtect guard aider --model openai/gpt-4o  # Aider → masked → OpenAI-compatible
 promtect guard claude --headroom           # chain Headroom: mask → compress → Anthropic
 promtect guard codex --strict              # never re-insert secrets in the response
-promtect guard --exec aider --base-var OPENAI_BASE_URL --base-path /v1   # wrap any tool
+promtect guard --exec <tool> --base-var OPENAI_API_BASE --base-path /v1   # wrap any tool
 ```
 
 Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) flow through untouched,
@@ -179,6 +180,9 @@ point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 | **OpenAI Codex CLI** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
 | **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
 | **OpenRouter** | `PROMTECT_MODE=openrouter promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/api/v1` |
+| **Agent harnesses** (OpenCode, Crush, Goose, Pi) | set the harness's provider `baseUrl` to `http://127.0.0.1:8787` ([guide](docs/integrations/harnesses.md)) |
+| **Aider** | `promtect guard aider --model openai/gpt-5.5` |
+| **OpenClaw / NanoClaw** | point the gateway's provider base URL (or `ANTHROPIC_BASE_URL`) at Promtect ([OpenClaw](docs/integrations/openclaw.md), [NanoClaw](docs/integrations/nanoclaw.md)) |
 | **Headroom / LiteLLM / corp proxy** | `PROMTECT_UPSTREAM=<their-url> promtect` (Promtect goes first) |
 | **VS Code Copilot** | not yet, it needs a root CA, which Promtect deliberately avoids ([why](docs/integrations/vscode-copilot.md)) |
 
