@@ -12,7 +12,7 @@ in the reply, or kept masked in strict mode. Pick your tool below.
 | OpenAI Codex CLI | [codex.md](codex.md) | `openai` |
 | Ollama (local models) | [ollama.md](ollama.md) | `ollama` |
 | OpenRouter | [openrouter.md](openrouter.md) | `openrouter` |
-| Agent harnesses (OpenCode, Crush, Goose, Pi) | [harnesses.md](harnesses.md) | `anthropic` / `openai` |
+| Agent harnesses (OpenCode, Crush, Goose, Pi, Hermes) | [harnesses.md](harnesses.md) | `anthropic` / `openai` |
 | Aider (`guard aider`) | [harnesses.md](harnesses.md#aider) | `openai` |
 | OpenClaw (self-hosted gateway) | [openclaw.md](openclaw.md) | `anthropic` / `openai` |
 | NanoClaw (Agents SDK / containers) | [nanoclaw.md](nanoclaw.md) | `anthropic` |
