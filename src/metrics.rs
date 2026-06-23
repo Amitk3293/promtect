@@ -7,6 +7,7 @@
 
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::io::BufRead;
 
 /// Aggregated, value-free metrics over the audit log. Safe to expose publicly:
 /// it contains only counts, detector kind names, and byte totals — never secrets.
@@ -48,29 +49,66 @@ pub struct RecentRequest {
 /// How many recent-request summaries to keep in [`Metrics::recent`].
 const RECENT_CAP: usize = 20;
 
+/// True iff `name` is a safe Prometheus label value for `detector="..."`.
+///
+/// # WHY (security)
+/// Detector names in [`aggregate`] come from the audit *file*, which is parsed as
+/// UNTRUSTED input. They are later interpolated unescaped into the Prometheus
+/// exposition as `detector="{name}"`. A planted name containing a `"` or a `\n`
+/// could close the label and forge an entire metric line (label injection). The
+/// genuine detector registry only ever emits `[a-z0-9_]+` kinds, so we constrain
+/// to exactly that charset and drop anything else — this both blocks injection
+/// and rejects malformed/garbage names without needing label escaping.
+///
+/// An empty name is rejected (it could not name a real detector).
+fn is_valid_detector_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// Aggregate value-free metrics from an audit JSONL file.
 ///
 /// # Behaviour
 /// - Missing or empty file returns `Metrics::default()` (all zeros / empty).
-/// - Malformed lines are skipped (best-effort), so a partially-written log still
-///   produces useful counts for the lines that are valid.
+/// - The file is read line-by-line through a buffered reader; it is never loaded
+///   into memory in one allocation, so a pathologically large audit log cannot
+///   OOM the dashboard.
+/// - Malformed lines (bad JSON, or an I/O error mid-stream) are skipped
+///   (best-effort), so a partially-written log still produces useful counts for
+///   the lines that are valid.
+/// - Detector names that are not `[a-z0-9_]+` are dropped (see
+///   [`is_valid_detector_name`]) so an untrusted name cannot inject a label line.
 /// - Only `"request"` and `"mask"` actions contribute to counters; `"unmask"` and
 ///   any unknown actions are silently ignored.
+/// - `recent` is returned newest-first by `ts_ms` (the on-disk order is not
+///   trusted because the proxy is concurrent), capped at [`RECENT_CAP`].
 ///
 /// # Safety
 /// This function never surfaces secret values. The audit log is designed to be
 /// value-free, and this aggregator only reads the numeric/string metadata fields.
 pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
-    let text = match std::fs::read_to_string(audit_path) {
-        Ok(t) => t,
+    let file = match std::fs::File::open(audit_path) {
+        Ok(f) => f,
         // Missing or unreadable file is normal before the first request.
         Err(_) => return Metrics::default(),
     };
+    // WHY: buffered line-by-line read instead of read_to_string — the audit file
+    // is unbounded and attacker-influenceable in size; we must not allocate it
+    // whole. Each line is parsed and dropped before the next is read.
+    let reader = std::io::BufReader::new(file);
 
     let mut m = Metrics::default();
 
-    for line in text.lines() {
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+    for line in reader.lines() {
+        // A mid-stream I/O error (e.g. concurrent truncation) ends iteration; the
+        // counts gathered so far are still valid and returned.
+        let Ok(line) = line else {
+            break;
+        };
+
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
             // Skip malformed lines rather than failing the whole aggregation.
             continue;
         };
@@ -95,7 +133,7 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                 m.bytes_in_total += bytes_in;
                 m.bytes_out_total += bytes_out;
 
-                // Capture the value-free recent summary and cap the list at RECENT_CAP.
+                // Capture the value-free recent summary.
                 let ts_ms = val.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
                 let request_id = val
                     .get("request_id")
@@ -112,24 +150,30 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                     })
                     .unwrap_or_default();
 
-                // Insert newest-first: prepend then truncate.
-                m.recent.insert(
-                    0,
-                    RecentRequest {
-                        ts_ms,
-                        request_id,
-                        masked,
-                        detectors,
-                    },
-                );
+                m.recent.push(RecentRequest {
+                    ts_ms,
+                    request_id,
+                    masked,
+                    detectors,
+                });
+                // WHY: keep `recent` bounded WITHOUT assuming file order. We can't
+                // truncate by read-order (the log is interleaved), so whenever the
+                // working set grows past the cap we sort newest-first and drop the
+                // oldest. This keeps memory at ~RECENT_CAP while still selecting the
+                // globally-newest rows across an out-of-order file.
                 if m.recent.len() > RECENT_CAP {
+                    sort_recent_newest_first(&mut m.recent);
                     m.recent.truncate(RECENT_CAP);
                 }
             }
             "mask" => {
                 m.secrets_masked_total += 1;
                 // Detector name comes from the "detector" field of mask events.
-                if let Some(det) = val.get("detector").and_then(|v| v.as_str()) {
+                // It is untrusted (from the file): only count validated names so a
+                // planted name cannot forge a Prometheus label line downstream.
+                if let Some(det) = val.get("detector").and_then(|v| v.as_str())
+                    && is_valid_detector_name(det)
+                {
                     *m.by_detector.entry(det.to_string()).or_default() += 1;
                 }
             }
@@ -138,15 +182,30 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
         }
     }
 
+    // Final sort so the output is newest-first regardless of on-disk ordering.
+    // (The interim trims above only ran when over-cap; small files skip them.)
+    sort_recent_newest_first(&mut m.recent);
+    m.recent.truncate(RECENT_CAP);
+
     m
+}
+
+/// Sort recent-request summaries newest-first by `ts_ms` (descending).
+///
+/// A stable sort is used so that entries sharing a `ts_ms` keep their relative
+/// read order, giving deterministic output for same-millisecond requests.
+fn sort_recent_newest_first(recent: &mut [RecentRequest]) {
+    recent.sort_by_key(|b| std::cmp::Reverse(b.ts_ms));
 }
 
 impl Metrics {
     /// Render Prometheus text-exposition format (hand-rolled; no extra dependency).
     ///
     /// Produces HELP/TYPE comment pairs followed by metric lines. Detector names
-    /// are `[a-z_]+` (enforced by the detector registry) so no label escaping is
-    /// needed. The output ends with a trailing newline.
+    /// in `by_detector` are constrained to `[a-z0-9_]+` by [`aggregate`] (the
+    /// audit file is untrusted), so no label escaping is needed here and no
+    /// planted name can inject a metric line. The output ends with a trailing
+    /// newline.
     pub fn to_prometheus(&self) -> String {
         let mut out = String::new();
 
@@ -176,7 +235,8 @@ impl Metrics {
         out.push_str("# HELP promtect_secrets_masked_total Secrets masked, by detector.\n");
         out.push_str("# TYPE promtect_secrets_masked_total counter\n");
         for (detector, count) in &self.by_detector {
-            // Detector names are [a-z_]+ — safe to embed directly in labels.
+            // Names here are already validated to [a-z0-9_]+ by aggregate(), so
+            // direct interpolation into the label cannot break out or inject.
             out.push_str(&format!(
                 "promtect_secrets_masked_total{{detector=\"{detector}\"}} {count}\n"
             ));
@@ -487,6 +547,169 @@ mod tests {
             "Prometheus must not contain AKIA prefix"
         );
         assert!(!json.contains("AKIA"), "JSON must not contain AKIA prefix");
+    }
+
+    // ── #47 Low: hardening regressions ───────────────────────────────────────
+
+    /// Pins: a detector name from the (untrusted) audit file carrying a `"` or a
+    /// newline must not forge or inject a Prometheus metric line. Names that are
+    /// not `[a-z0-9_]+` are dropped at aggregation time, so they never reach the
+    /// label string in `to_prometheus`.
+    #[test]
+    fn prometheus_label_injection_is_rejected() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "promtect-metrics-inject-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        // A planted name that closes the label and appends a forged line. JSON
+        // string-escapes the quote and newline so the line itself stays valid
+        // JSON — the danger is only after it is parsed back to a Rust string.
+        // Written via write_all (not writeln!) so the literal braces in the JSON
+        // are not interpreted as format placeholders.
+        let lines = [
+            r#"{"action":"mask","detector":"x\" } 1\npromtect_forged_total 999","request_id":"evil"}"#,
+            // A separate planted name using a raw quote in the kind.
+            r#"{"action":"mask","detector":"a\"b","request_id":"evil"}"#,
+            // A legitimate name, to prove valid detectors still pass through.
+            r#"{"action":"mask","detector":"aws_key","request_id":"ok"}"#,
+        ];
+        for line in lines {
+            f.write_all(line.as_bytes()).unwrap();
+            f.write_all(b"\n").unwrap();
+        }
+
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        let prom = m.to_prometheus();
+
+        // The forged line must not appear anywhere in the output.
+        assert!(
+            !prom.contains("promtect_forged_total"),
+            "injected metric line leaked into Prometheus output:\n{prom}"
+        );
+        // No label line may contain the planted-name fragments. Each malformed
+        // name embeds a `"` mid-string; a clean output has exactly one quoted
+        // detector per line, so the planted fragments must be absent entirely.
+        assert!(
+            !prom.contains("x\\\"") && !prom.contains("x\" "),
+            "malformed detector name 'x...' reached the label string:\n{prom}"
+        );
+        assert!(
+            !prom.contains("a\"b") && !prom.contains("a\\\"b"),
+            "malformed detector name 'a\"b' reached the label string:\n{prom}"
+        );
+        // The invalid names must have been dropped from the breakdown entirely.
+        assert!(
+            !m.by_detector
+                .keys()
+                .any(|k| k.contains('"') || k.contains('\n')),
+            "invalid detector name retained in by_detector: {:?}",
+            m.by_detector.keys().collect::<Vec<_>>()
+        );
+        // The legitimate detector is still counted.
+        assert_eq!(m.by_detector.get("aws_key").copied(), Some(1));
+    }
+
+    /// Pins: `recent` is sorted newest-first by `ts_ms`, even when the audit log
+    /// is interleaved / out-of-order on disk (the proxy is concurrent, so lines
+    /// are not guaranteed to be in timestamp order).
+    #[test]
+    fn aggregate_recent_sorts_out_of_order_timestamps() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "promtect-metrics-order-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        // Deliberately out of timestamp order on disk: 2000, then 1000, then 3000.
+        writeln!(
+            f,
+            r#"{{"ts_ms":2000,"action":"request","request_id":"mid","masked":0,"detectors":[],"bytes_in":1,"bytes_out":1}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"ts_ms":1000,"action":"request","request_id":"old","masked":0,"detectors":[],"bytes_in":1,"bytes_out":1}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"ts_ms":3000,"action":"request","request_id":"new","masked":0,"detectors":[],"bytes_in":1,"bytes_out":1}}"#
+        )
+        .unwrap();
+
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        // Newest ts_ms first regardless of file order.
+        assert_eq!(m.recent[0].request_id, "new");
+        assert_eq!(m.recent[1].request_id, "mid");
+        assert_eq!(m.recent[2].request_id, "old");
+    }
+
+    /// Pins: the cap keeps the NEWEST entries by `ts_ms`, not the first-read ones.
+    /// With out-of-order input, sorting must precede truncation so the oldest
+    /// rows are the ones dropped.
+    #[test]
+    fn aggregate_recent_cap_keeps_newest_after_sort() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "promtect-metrics-cap-order-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Write 25 rows with DESCENDING ts_ms so the first-read rows are newest.
+        // After a correct sort-then-truncate, the kept rows are ts_ms 24..5.
+        for i in (0u64..25).rev() {
+            writeln!(
+                f,
+                r#"{{"ts_ms":{i},"action":"request","request_id":"req-{i}","masked":0,"detectors":[],"bytes_in":1,"bytes_out":1}}"#
+            )
+            .unwrap();
+        }
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(m.recent.len(), RECENT_CAP);
+        // Newest first, and the oldest 5 (ts_ms 0..4) must have been dropped.
+        assert_eq!(m.recent[0].ts_ms, 24);
+        assert_eq!(m.recent[RECENT_CAP - 1].ts_ms, 5);
+    }
+
+    /// Pins: a large audit file is processed line-by-line (streamed), proving the
+    /// aggregator does not need to materialise the whole file in one allocation.
+    /// This is a behavioural proxy for the unbounded-read fix — all lines count.
+    #[test]
+    fn aggregate_streams_many_lines_without_loading_whole_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "promtect-metrics-many-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 50_000 request rows: well past anything we'd want in one String, but
+        // small enough to stay fast in CI.
+        {
+            let mut w = std::io::BufWriter::new(&mut f);
+            for i in 0u64..50_000 {
+                writeln!(
+                    w,
+                    r#"{{"ts_ms":{i},"action":"request","request_id":"r-{i}","masked":0,"detectors":[],"bytes_in":1,"bytes_out":1}}"#
+                )
+                .unwrap();
+            }
+        }
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        // Every line was counted, and recent is still capped.
+        assert_eq!(m.requests_total, 50_000);
+        assert_eq!(m.recent.len(), RECENT_CAP);
     }
 
     #[test]
