@@ -63,7 +63,12 @@ pub(crate) fn restore_scan(
                 }
             }
             // Unknown sentinel (not minted for this request): leave it verbatim.
-            None => out.push_str(token),
+            // Emit a warn-level audit event so the miss is observable in the audit
+            // log (value-free — only the sentinel kind and the miss reason).
+            None => {
+                audit.record("unmask_miss", sentinel_kind(token), token, request_id);
+                out.push_str(token);
+            }
         }
         last = m.end();
     }
@@ -266,6 +271,45 @@ mod tests {
         assert!(
             !contents.contains("\"detector\":\"sentinel\""),
             "unmask must not log the flat \"sentinel\" literal"
+        );
+    }
+
+    /// Issue #47 — `restore_scan` emits an `unmask_miss` audit event when it
+    /// encounters a sentinel that has no entry in the vault (e.g. a sentinel from
+    /// a different request, or one that was never registered). The event is
+    /// value-free: only the sentinel kind and the literal sentinel token are logged.
+    #[test]
+    fn restore_logs_unmask_miss_for_unknown_sentinel() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("promtect-miss-{}.jsonl", uuid::Uuid::new_v4()));
+
+        let vault = Vault::new();
+        let audit = Audit::to_file(path.clone());
+        // A well-formed sentinel that was never registered in `vault`.
+        let text = "prefix «promtect:aws_key:9999» suffix";
+        let restored = restore_text(text, &vault, &audit, "reqM");
+
+        // The unknown sentinel is left verbatim in the output.
+        assert_eq!(restored, text);
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // An unmask_miss event was emitted.
+        assert!(
+            contents.contains("\"action\":\"unmask_miss\""),
+            "restore_scan must emit an unmask_miss event for an unknown sentinel"
+        );
+        // The sentinel token appears as the detector id (value-free).
+        assert!(
+            contents.contains("aws_key"),
+            "unmask_miss must record the sentinel kind"
+        );
+        // The real secret value is never logged (there is none here, but confirm
+        // the event is present and value-free in shape).
+        assert!(
+            !contents.contains("AKIAIOSFODNN7EXAMPLE"),
+            "unmask_miss must never log a secret value"
         );
     }
 

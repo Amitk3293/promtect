@@ -96,13 +96,19 @@ async fn main() {
             }
         };
         let bind = std::env::var("PROMTECT_BIND").unwrap_or_else(|_| "127.0.0.1".into());
-        if !promtect::net::is_loopback(&bind) {
-            // Off-loopback binds are valid in container deployments, but the
-            // operator must understand the exposure risk before doing it.
+        // Refuse an off-loopback bind unless the operator has explicitly opted in
+        // via PROMTECT_ALLOW_PUBLIC_BIND. A warn-then-bind default silently exposed
+        // the metrics endpoint off-host; fail-closed instead.
+        if !public_bind_allowed(
+            promtect::net::is_loopback(&bind),
+            std::env::var("PROMTECT_ALLOW_PUBLIC_BIND").ok().as_deref(),
+        ) {
             eprintln!(
-                "WARNING: promtect dashboard binding non-loopback {bind} — the metrics \
-                 endpoint will be reachable off-host. Only do this behind trusted network controls."
+                "promtect dashboard: refusing to bind non-loopback address ({bind}). The metrics \
+                 endpoint would be reachable off-host.\n  Set PROMTECT_ALLOW_PUBLIC_BIND=1 to allow \
+                 this (only behind trusted network controls), or set PROMTECT_BIND=127.0.0.1."
             );
+            std::process::exit(1);
         }
         let audit_path =
             std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
@@ -206,12 +212,20 @@ async fn main() {
     let addr = format!("{bind}:{port}");
     // Delegate to net::is_loopback so the safety decision is unit-tested in isolation.
     let is_loopback = promtect::net::is_loopback(&bind);
-    if !is_loopback {
+    // Refuse an off-loopback bind unless the operator has explicitly opted in via
+    // PROMTECT_ALLOW_PUBLIC_BIND. Binding the secrets proxy to a host network is a
+    // serious exposure, so fail-closed rather than warn-then-bind.
+    if !public_bind_allowed(
+        is_loopback,
+        std::env::var("PROMTECT_ALLOW_PUBLIC_BIND").ok().as_deref(),
+    ) {
         eprintln!(
-            "WARNING: promtect is binding a non-loopback address ({bind}). This is only safe \
-             inside a container whose port is published to 127.0.0.1. Do NOT run this directly \
-             on a host network — it would expose your secrets proxy to other machines."
+            "promtect: refusing to bind non-loopback address ({bind}). This would expose your \
+             secrets proxy to other machines.\n  Set PROMTECT_ALLOW_PUBLIC_BIND=1 to allow this \
+             (only inside a container whose port is published to 127.0.0.1, or behind trusted \
+             network controls), or set PROMTECT_BIND=127.0.0.1."
         );
+        std::process::exit(1);
     }
     // Graceful exit (not a panic/backtrace) when the port is taken.
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -238,8 +252,77 @@ async fn main() {
         "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}\n  upstream risk: {risk_note}",
         risk_note = risk.note,
     );
-    if let Err(e) = axum::serve(listener, app).await {
+    // Graceful shutdown on Ctrl-C: stop accepting new connections and let
+    // in-flight requests drain, rather than dropping mid-stream restores. A
+    // failed ctrl_c handler simply means we never trigger shutdown (the process
+    // can still be killed), so the error is intentionally ignored.
+    let shutdown = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         eprintln!("promtect: server error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Decide whether an off-loopback bind is permitted.
+///
+/// Loopback binds are always allowed. A non-loopback bind is only allowed when
+/// the operator has explicitly opted in via a truthy `PROMTECT_ALLOW_PUBLIC_BIND`
+/// (reusing [`proxy::parse_truthy`] so the truthiness grammar matches the rest of
+/// the config surface). Extracted as a pure function so the fail-closed decision
+/// is unit-tested without spawning a server.
+fn public_bind_allowed(is_loopback: bool, allow_env: Option<&str>) -> bool {
+    is_loopback || proxy::parse_truthy(allow_env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_bind_is_always_allowed() {
+        // Loopback is safe regardless of the opt-in flag.
+        assert!(public_bind_allowed(true, None));
+        assert!(public_bind_allowed(true, Some("0")));
+        assert!(public_bind_allowed(true, Some("1")));
+    }
+
+    #[test]
+    fn off_loopback_bind_refused_without_optin() {
+        // The default and any falsey/garbage flag must refuse a public bind.
+        for env in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("nope"),
+        ] {
+            assert!(
+                !public_bind_allowed(false, env),
+                "off-loopback with {env:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn off_loopback_bind_allowed_with_truthy_optin() {
+        // Explicit opt-in (matching parse_truthy's grammar) permits a public bind.
+        for env in [
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("on"),
+            Some("TRUE"),
+        ] {
+            assert!(
+                public_bind_allowed(false, env),
+                "off-loopback with {env:?} must be allowed"
+            );
+        }
     }
 }
