@@ -65,7 +65,9 @@ high-context detectors.
 `PROMTECT_UPSTREAM`(explicit URL, overrides mode) · `PROMTECT_RESTORE`(true; `false`=strict,
 secrets never reinserted) · `PROMTECT_BLOCK_RISKY`(false) · `PROMTECT_BIND`(127.0.0.1) ·
 `PROMTECT_AUDIT`(promtect-audit.jsonl) · `PROMTECT_MAX_BODY_BYTES`(33554432) ·
-`PROMTECT_DASHBOARD_PORT`(8799).
+`PROMTECT_DASHBOARD_PORT`(8799) · `PROMTECT_READ_TIMEOUT`(120s; per-chunk inter-read
+timeout, safe for long SSE streams) · `PROMTECT_ALLOW_PUBLIC_BIND`(false; set truthy to
+bind proxy/dashboard to a non-loopback address — off-loopback bind exits 1 without this).
 
 ## Workflow (non-obvious — read before committing)
 - **Enable the version-bump hook once per clone:** `git config core.hooksPath .githooks`.
