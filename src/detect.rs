@@ -60,9 +60,9 @@ impl RegexDetector {
 /// `is_match`, so any secret that happened to embed a balanced `ident(...)`
 /// substring (e.g. `A9f83(Kd0)more`) was dropped as "code" and LEAKED. Anchoring
 /// means the guard fires only when the value *is* a call expression, never when
-/// it merely contains one. The trailing `\)?` keeps a value whose capture stopped
-/// at the opening `(` (e.g. `os.environ.get(`, truncated by the following quote)
-/// recognisable as a call shape.
+/// it merely contains one. Truncated calls whose capture stopped at the opening `(`
+/// (e.g. `os.environ.get(`) are not matched here; they are handled by the separate
+/// `v.ends_with('(')` check in `looks_like_placeholder`.
 static CALL_EXPR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)$")
         .expect("BUG: call-expr guard regex failed to compile")
