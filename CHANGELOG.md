@@ -10,6 +10,21 @@ and auto-generated notes also live on the
 
 - Nothing yet.
 
+## [0.1.7]
+
+### Security
+- Updated `quinn-proto` 0.11.14 → 0.11.15 to address RUSTSEC-2026-0185.
+
+### Added
+- Integration guides for agent harnesses (OpenCode, Crush, Goose, Pi), Hermes
+  Agent, OpenClaw (self-hosted gateway), and NanoClaw (Agents SDK / containers).
+- `guard` now warns when a stale base-URL environment variable from a previous
+  run is still set, so a tool's requests cannot silently bypass the proxy (#33).
+
+### Fixed
+- Release workflow cross-compilation: pinned the dtolnay toolchain to the
+  channel declared in `rust-toolchain.toml`.
+
 ## [0.1.2]
 
 ### Security
