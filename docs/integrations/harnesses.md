@@ -1,4 +1,4 @@
-# Agent harnesses (OpenCode, Crush, Goose, Pi, Aider)
+# Agent harnesses (OpenCode, Crush, Goose, Pi, Hermes, Aider)
 
 The 2026 wave of terminal coding agents are all **model-agnostic**: you pick the
 provider and, crucially, you can point that provider's **base URL** at anything.
@@ -109,6 +109,35 @@ Pi reads `~/.pi/agent/models.json`. Point the provider's `baseUrl` at Promtect:
 ```
 
 Run `promtect` (anthropic mode is the default), then `pi`.
+
+---
+
+## Hermes
+
+Hermes (Nous Research) reads its provider config from `config.yaml`. For a custom
+OpenAI-compatible endpoint, set `provider: custom` and point `base_url` at Promtect:
+
+```yaml
+# config.yaml
+model:
+  default: <your-model-id>
+  provider: custom
+  base_url: http://127.0.0.1:8787/v1
+```
+
+```sh
+PROMTECT_MODE=openai promtect
+hermes
+```
+
+For an Anthropic-style endpoint, use `base_url: http://127.0.0.1:8787` and the
+default `anthropic` mode. Set keys with `hermes config set`, or edit `config.yaml`
+directly.
+
+> **Hermes runs side tasks too.** The `auxiliary` config section (vision,
+> embeddings, title generation) can pin its own `provider`/`base_url`. If it points
+> elsewhere, that traffic **bypasses Promtect**. Point it at the proxy as well, or
+> leave it unset so it inherits the masked `model:` endpoint.
 
 ---
 
