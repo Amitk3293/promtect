@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use promtect::{
-    audit,
+    audit, dashboard,
     proxy::{self, Ctx},
 };
 
@@ -19,15 +19,18 @@ async fn main() {
             "\n",
             "\n",
             "USAGE:\n",
-            "    promtect [SUBCOMMAND]\n",
+            "    promtect [OPTIONS] [SUBCOMMAND]\n",
+            "\n",
+            "OPTIONS:\n",
+            "    --no-dashboard   Start proxy without the metrics dashboard\n",
             "\n",
             "SUBCOMMANDS:\n",
-            "    (none)       Start the proxy (default)\n",
+            "    (none)       Start the proxy + dashboard (default)\n",
             "    selftest     Detector canary check — no network\n",
             "    mask         Mask stdin, write masked text to stdout\n",
             "    playground   Offline mask+restore demo\n",
             "    guard <cmd>  Wrap a command with an ephemeral proxy\n",
-            "    dashboard    Serve audit metrics on PROMTECT_DASHBOARD_PORT (default 8799)\n",
+            "    dashboard    Dashboard-only (no proxy) on PROMTECT_DASHBOARD_PORT\n",
             "\n",
             "ENV VARS:\n",
             "    PROMTECT_PORT              Proxy bind port (default 8787)\n",
@@ -180,6 +183,8 @@ async fn main() {
         return;
     }
 
+    let no_dashboard = args.iter().any(|a| a == "--no-dashboard");
+
     let port = match proxy::parse_port(
         "PROMTECT_PORT",
         std::env::var("PROMTECT_PORT").ok().as_deref(),
@@ -234,6 +239,7 @@ async fn main() {
     // falsey → strict mode (secrets never re-enter the response).
     let restore = proxy::parse_restore(std::env::var("PROMTECT_RESTORE").ok().as_deref());
 
+    let audit_path_for_dash = audit_path.clone();
     let upstream_for_log = upstream.clone();
     let ctx = Ctx {
         upstream,
@@ -280,13 +286,57 @@ async fn main() {
     } else {
         format!("http://127.0.0.1:{port}")
     };
+
+    // Auto-start the dashboard on a background task so users don't need a
+    // second process. Pass --no-dashboard to skip. Non-fatal if port taken.
+    let dash_hint = if no_dashboard {
+        None
+    } else {
+        match proxy::parse_port(
+            "PROMTECT_DASHBOARD_PORT",
+            std::env::var("PROMTECT_DASHBOARD_PORT").ok().as_deref(),
+            8799,
+        ) {
+            Err(e) => {
+                eprintln!("promtect: dashboard port config error — {e}; running without dashboard");
+                None
+            }
+            Ok(dash_port) => {
+                let dash_addr = format!("{bind}:{dash_port}");
+                match tokio::net::TcpListener::bind(&dash_addr).await {
+                    Err(e) => {
+                        eprintln!(
+                            "promtect: dashboard could not bind {dash_addr} ({e}); running without dashboard"
+                        );
+                        None
+                    }
+                    Ok(dash_listener) => {
+                        let dash_app = dashboard::app(dashboard::DashCtx {
+                            audit_path: Arc::new(audit_path_for_dash.as_str().into()),
+                        });
+                        tokio::task::spawn(async move {
+                            if let Err(e) = axum::serve(dash_listener, dash_app).await {
+                                eprintln!("promtect: dashboard error: {e}");
+                            }
+                        });
+                        Some(format!("http://127.0.0.1:{dash_port}"))
+                    }
+                }
+            }
+        }
+    };
+
     let restore_note = if restore {
         ""
     } else {
         "  [strict: restore off]"
     };
+    let dash_note = dash_hint
+        .as_deref()
+        .map(|u| format!("\n  dashboard: {u}"))
+        .unwrap_or_default();
     println!(
-        "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}\n  upstream risk: {risk_note}",
+        "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}{dash_note}\n  upstream risk: {risk_note}",
         risk_note = risk.note,
     );
     // Graceful shutdown on Ctrl-C: stop accepting new connections and let
