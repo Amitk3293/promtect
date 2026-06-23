@@ -14,7 +14,9 @@ async fn main() {
         || args.get(1).map(|s| s.as_str()) == Some("-h")
     {
         print!(concat!(
-            "promtect ", env!("CARGO_PKG_VERSION"), "\n",
+            "promtect ",
+            env!("CARGO_PKG_VERSION"),
+            "\n",
             "\n",
             "USAGE:\n",
             "    promtect [SUBCOMMAND]\n",
