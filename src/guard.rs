@@ -437,7 +437,7 @@ fn is_stale_stub(url: &str) -> bool {
         .next()
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
-    !matches!(port, 8787 | 8790)
+    !matches!(port, 8787 | 8788 | 8790)
 }
 
 /// Map a child `ExitStatus` to a process exit code. A child killed by a signal has

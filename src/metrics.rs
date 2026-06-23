@@ -156,15 +156,8 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                     masked,
                     detectors,
                 });
-                // WHY: keep `recent` bounded WITHOUT assuming file order. We can't
-                // truncate by read-order (the log is interleaved), so whenever the
-                // working set grows past the cap we sort newest-first and drop the
-                // oldest. This keeps memory at ~RECENT_CAP while still selecting the
-                // globally-newest rows across an out-of-order file.
-                if m.recent.len() > RECENT_CAP {
-                    sort_recent_newest_first(&mut m.recent);
-                    m.recent.truncate(RECENT_CAP);
-                }
+                // No interim cap: the final sort+truncate at the end of this
+                // function handles ordering correctly without O(N²) interim sorts.
             }
             "mask" => {
                 m.secrets_masked_total += 1;

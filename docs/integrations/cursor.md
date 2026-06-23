@@ -6,7 +6,7 @@ Cursor's OpenAI base URL to Promtect.
 ## Start Promtect
 
 ```sh
-PROMTECT_MODE=openai promtect        # listens on 127.0.0.1:8787
+PROMTECT_MODE=openai promtect        # listens on 127.0.0.1:8790
 ```
 
 ## Point Cursor at it
@@ -15,7 +15,7 @@ In Cursor: **Settings → Models → OpenAI API Key → Override Base URL** (the
 label varies by version), set the base URL to:
 
 ```
-http://127.0.0.1:8787/v1
+http://127.0.0.1:8790/v1
 ```
 
 Enter your real OpenAI API key in Cursor as usual — Promtect forwards it

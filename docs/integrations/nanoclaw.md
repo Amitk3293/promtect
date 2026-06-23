@@ -8,12 +8,12 @@ Start Promtect (anthropic mode is the default) where the container can reach it,
 and set the base URL in NanoClaw's container/service env:
 
 ```sh
-promtect        # listens on 127.0.0.1:8787
+promtect        # listens on 127.0.0.1:8790
 ```
 
 ```sh
 # in NanoClaw's environment (e.g. its container env / .env)
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+ANTHROPIC_BASE_URL=http://127.0.0.1:8790
 ```
 
 ## Notes

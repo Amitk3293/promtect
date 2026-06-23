@@ -22,8 +22,8 @@ Run from the crate root (this dir). Toolchain pinned via `rust-toolchain.toml`.
 - Selftest (detector canary, no network): `cargo run -- selftest` / `make selftest`
 - Smoke (end-to-end proxy + audit): `bash scripts/smoke.sh` / `make smoke`
 - Coverage: `make coverage` (needs `cargo install cargo-llvm-cov`)
-- Run proxy: `cargo run` → binds `127.0.0.1:8787`, then point a tool at it, e.g.
-  `ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude`
+- Run proxy: `cargo run` → binds `127.0.0.1:8790`, then point a tool at it, e.g.
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude`
 
 ## Architecture (src/)
 Per-request pipeline; all secret state is request-scoped to prevent cross-request bleed.
@@ -61,7 +61,7 @@ one negative test. A false negative in a masking proxy is a leak — prefer over
 high-context detectors.
 
 ## Config (env vars)
-`PROMTECT_PORT`(8787) · `PROMTECT_MODE`(anthropic|openai|ollama|openrouter) ·
+`PROMTECT_PORT`(8790) · `PROMTECT_MODE`(anthropic|openai|ollama|openrouter) ·
 `PROMTECT_UPSTREAM`(explicit URL, overrides mode) · `PROMTECT_RESTORE`(true; `false`=strict,
 secrets never reinserted) · `PROMTECT_BLOCK_RISKY`(false) · `PROMTECT_BIND`(127.0.0.1) ·
 `PROMTECT_AUDIT`(promtect-audit.jsonl) · `PROMTECT_MAX_BODY_BYTES`(33554432) ·

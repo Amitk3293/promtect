@@ -160,7 +160,7 @@ docker compose up --build
 ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 ```
 
-> **Security:** publish the port to `127.0.0.1:8790:8787`, never `8787:8787`.
+> **Security:** publish the port to `127.0.0.1:8790:8790`, never `8787:8787`.
 > The bundled `docker-compose.yml` does this correctly by default.
 
 ### Prove it works (no network needed)

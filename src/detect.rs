@@ -279,10 +279,11 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // JSON-escaped-quote variant. In a JSON request body, `password = "val"`
         // arrives as `password = \"val\"` (backslash-escaped). The backslash is in
         // the exclusion class of the variants above, so they miss it. This variant
-        // uses `\"…\"` as delimiters to catch the JSON-encoded form.
+        // uses `\"…\"` as delimiters. The capture allows `\X` escape sequences so
+        // a password containing a literal backslash (encoded as `\\`) isn't truncated.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*\\"([^"\\«»]{8,})\\""#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*\\"((?:[^"\\«»]|\\.){8,})\\""#,
             1,
             Some(looks_like_placeholder),
         ),

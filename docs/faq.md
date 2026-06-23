@@ -28,7 +28,7 @@ Nothing leaves your machine.
 Check, in order:
 
 1. **Is the tool pointed at Promtect?** The base URL must be
-   `http://127.0.0.1:8787` (Claude) or `http://127.0.0.1:8787/v1` (OpenAI-style
+   `http://127.0.0.1:8790` (Claude) or `http://127.0.0.1:8790/v1` (OpenAI-style
    tools). Promtect logs `promtect listening on …` and the upstream at startup.
 2. **Is the mode right for the tool?** Claude → default; Cursor/Codex →
    `PROMTECT_MODE=openai`; Ollama → `PROMTECT_MODE=ollama`. A mismatch forwards to
@@ -65,7 +65,7 @@ than a hard guarantee the secret never comes back.
 Yes — one upstream per process, so run two instances on different ports:
 
 ```sh
-PROMTECT_PORT=8787 PROMTECT_MODE=anthropic promtect &   # Claude → :8787
+PROMTECT_PORT=8790 PROMTECT_MODE=anthropic promtect &   # Claude → :8790
 PROMTECT_PORT=8788 PROMTECT_MODE=openai    promtect &   # Cursor → :8788/v1
 ```
 

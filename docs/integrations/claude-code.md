@@ -14,19 +14,19 @@ That's it. The rest of this guide is the manual method (run the proxy yourself).
 ## Start Promtect (manual)
 
 ```sh
-promtect          # mode defaults to anthropic, listens on 127.0.0.1:8787
+promtect          # mode defaults to anthropic, listens on 127.0.0.1:8790
 ```
 
 ## Point Claude Code at it
 
 ```sh
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude "refactor my S3 upload function"
+ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude "refactor my S3 upload function"
 ```
 
 Or export it for the session:
 
 ```sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8790
 claude
 ```
 
