@@ -241,16 +241,17 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // captured span, smuggling a partial sentinel into the masked body and
         // corrupting the round-trip. They are never part of a real secret.
         //
-        // KNOWN GAP (unquoted, conservative): this class stops at the first
-        // whitespace (`\s`), so a *space-bearing* unquoted secret loses its tail
-        // — e.g. `secret = hunter two` captures only `hunter`. An unquoted value
-        // has no closing delimiter, so a space is the only safe boundary; greedily
-        // crossing it would swallow following prose/JSON (and other secrets) into
-        // one giant sentinel, which is worse. Quote the value (the variants below
-        // capture spaces verbatim) to mask a secret that contains spaces.
+        // Fix #45: the unquoted value capture now allows internal spaces/tabs
+        // while still anchoring both edges to non-whitespace chars:
+        //   first char : [^\s"',}\\\n\r«»]  — no whitespace, no terminator
+        //   middle 6+  : [^"',}\\\n\r«»]+   — terminators excluded, spaces OK
+        //   last char  : [^\s"',}\\\n\r«»]  — greedy backtrack strips trailing space
+        // Minimum length is 1 + 6 + 1 = 8, matching the previous `{8,}` floor.
+        // Real newlines (\n/\r) are hard-excluded from the middle so one match
+        // cannot span multiple lines and absorb adjacent secrets into one sentinel.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\«»]{8,})"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\\n\r«»][^"',}\\\n\r«»]{6,}[^\s"',}\\\n\r«»])"#,
             1,
             Some(looks_like_placeholder),
         ),
@@ -985,6 +986,38 @@ mod tests {
             detect(json_fragment).iter().any(|m| m.kind == "env_secret"),
             "password with JSON-escaped quotes must be detected; got: {:?}",
             detect(json_fragment)
+        );
+    }
+
+    /// Issue #45 — the unquoted env_secret variant previously stopped at the
+    /// first space, leaking the tail of a space-bearing secret in cleartext.
+    /// The full value (including internal spaces) must now be captured.
+    #[test]
+    fn env_secret_unquoted_captures_space_bearing_value() {
+        // `abc123 def456` is a 13-char secret with an internal space.
+        // Before the fix only `abc123` was captured; `def456` leaked.
+        let hits = detect("API_KEY = abc123 def456");
+        assert!(
+            hits.iter()
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "abc123 def456"),
+            "space-bearing secret tail must not leak; got: {:?}",
+            hits
+        );
+    }
+
+    /// Issue #45 — trailing whitespace must NOT be included in the masked value.
+    /// The last-char class in the new unquoted capture forces greedy backtrack,
+    /// stripping any trailing space before it reaches a hard terminator.
+    #[test]
+    fn env_secret_unquoted_excludes_trailing_whitespace() {
+        // Value is `hunter2season` followed by trailing spaces; only the
+        // non-space suffix should be in the captured group, not the spaces.
+        let hits = detect("API_SECRET = hunter2season   ");
+        assert!(
+            hits.iter().any(|m| m.kind == "env_secret"
+                && m.value.as_str() == "hunter2season"),
+            "trailing spaces must be stripped from captured value; got: {:?}",
+            hits
         );
     }
 }
