@@ -17,6 +17,7 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --bin promtect
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=builder /build/target/release/promtect /usr/local/bin/promtect
 ENV PROMTECT_BIND=0.0.0.0 \
+    PROMTECT_ALLOW_PUBLIC_BIND=1 \
     PROMTECT_PORT=8790 \
     PROMTECT_UPSTREAM=https://api.anthropic.com \
     PROMTECT_AUDIT=/home/nonroot/promtect-audit.jsonl

@@ -5,7 +5,8 @@ services:
     ports:
       - "127.0.0.1:${PROMTECT_HOST_PORT:-8790}:8790"   # loopback only — do NOT change to "8787:8787" (LAN exposure)
     environment:
-      PROMTECT_BIND: "0.0.0.0"        # safe: only reachable via the 127.0.0.1-published port above
+      PROMTECT_BIND: "0.0.0.0"
+      PROMTECT_ALLOW_PUBLIC_BIND: "1"  # safe: only reachable via the 127.0.0.1-published port above
       PROMTECT_UPSTREAM: "https://api.anthropic.com"
       PROMTECT_AUDIT: "/home/nonroot/promtect-audit.jsonl"
     volumes:
