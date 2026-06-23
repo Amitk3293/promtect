@@ -323,6 +323,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // Same audit log as the standalone server, so the dashboard sees guard traffic.
     let audit_path =
         std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
+    let audit_path_for_dash = audit_path.clone();
     let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = Ctx {
         upstream: plan.upstream.clone(),
@@ -374,6 +375,28 @@ pub async fn guard(plan: GuardPlan) -> i32 {
             eprintln!("promtect guard: proxy stopped serving ({e}) — tool is no longer masked");
         }
     });
+
+    // Auto-start the dashboard so guard sessions get the same metrics UI as the
+    // standalone proxy. Uses the same audit log, so guard traffic appears there.
+    // Non-fatal: if the port is taken (e.g. another guard session), skip silently.
+    if let Ok(dash_port) = proxy::parse_port(
+        "PROMTECT_DASHBOARD_PORT",
+        std::env::var("PROMTECT_DASHBOARD_PORT").ok().as_deref(),
+        8799,
+    ) {
+        let dash_addr = format!("127.0.0.1:{dash_port}");
+        if let Ok(dash_listener) = tokio::net::TcpListener::bind(&dash_addr).await {
+            let dash_app = crate::dashboard::app(crate::dashboard::DashCtx {
+                audit_path: Arc::new(audit_path_for_dash.as_str().into()),
+            });
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(dash_listener, dash_app).await {
+                    eprintln!("promtect guard: dashboard error: {e}");
+                }
+            });
+            eprintln!("  dashboard: http://127.0.0.1:{dash_port}");
+        }
+    }
 
     // Inherit the full parent env (so the user's API keys flow through, forwarded
     // untouched), then override the tool's base-URL var to point at the proxy.
