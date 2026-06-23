@@ -87,11 +87,14 @@ No TLS interception. No root certificate. The auth header (`x-api-key`,
 
 ## A local dashboard, value-free
 
-`promtect dashboard` serves an offline view of what Promtect has caught: secrets
-masked, the per-detector breakdown (every detector, counted live, nothing
-hard-coded), the clean rate (share of requests carrying no secret), recent requests, and bytes processed. It reads only
-the audit log, so it shows counts and detector names, never a secret value,
-never request/response bodies.
+The dashboard starts automatically on `http://127.0.0.1:8799` whenever the proxy
+starts. It serves an offline view of what Promtect has caught: secrets masked,
+the per-detector breakdown (every detector, counted live, nothing hard-coded),
+the clean rate, recent requests, and bytes processed. It reads only the audit log,
+so it shows counts and detector names, never a secret value, never request/response bodies.
+
+Pass `--no-dashboard` to start the proxy without it, or run `promtect dashboard`
+standalone to tail an existing audit log without starting a proxy.
 
 ![Promtect's local dashboard: secrets masked, per-detector breakdown, clean rate, and recent value-free request summaries](docs/dashboard.png)
 
@@ -293,7 +296,8 @@ Kimi, GLM, or any host Promtect can't vouch for) outright. Fail-closed.
 ## Dashboard & audit
 
 ```sh
-promtect dashboard      # http://127.0.0.1:8799, UI, /api/metrics (JSON), /metrics (Prometheus)
+promtect --no-dashboard # start proxy only, skip the metrics dashboard
+promtect dashboard      # standalone dashboard (no proxy) — UI, /api/metrics, /metrics (Prometheus)
 ```
 
 Every mask/unmask event is appended to `promtect-audit.jsonl`, timestamp,
