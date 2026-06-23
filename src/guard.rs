@@ -369,9 +369,14 @@ pub async fn guard(plan: GuardPlan) -> i32 {
 
     let app = proxy::app(ctx);
     tokio::spawn(async move {
-        // A normal session serves until the process exits, so an Err here is a real
-        // fault (the masking proxy stopped) — surface it rather than swallow it.
-        if let Err(e) = axum::serve(listener, app).await {
+        // Drain in-flight proxy requests on SIGINT / SIGTERM so secrets masked
+        // in a partially-buffered response are fully restored before the socket
+        // closes.  An error from with_graceful_shutdown still surfaces so a
+        // premature stop is never silently swallowed.
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(crate::proxy::shutdown_signal())
+            .await
+        {
             eprintln!("promtect guard: proxy stopped serving ({e}) — tool is no longer masked");
         }
     });
@@ -390,7 +395,12 @@ pub async fn guard(plan: GuardPlan) -> i32 {
                 audit_path: Arc::new(audit_path_for_dash.as_str().into()),
             });
             tokio::spawn(async move {
-                if let Err(e) = axum::serve(dash_listener, dash_app).await {
+                // Drain in-flight dashboard requests on signal so metrics
+                // pages aren't truncated when guard exits.
+                if let Err(e) = axum::serve(dash_listener, dash_app)
+                    .with_graceful_shutdown(crate::proxy::shutdown_signal())
+                    .await
+                {
                     eprintln!("promtect guard: dashboard error: {e}");
                 }
             });
