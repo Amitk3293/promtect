@@ -1,24 +1,33 @@
 use regex::Regex;
 use std::sync::LazyLock;
+use zeroize::Zeroizing;
 
 /// A detected secret span. `start..end` are byte offsets into the scanned text;
 /// `value` is the exact substring that will be masked.
+///
+/// `value` is wrapped in [`zeroize::Zeroizing`] so the heap copy of the secret —
+/// which outlives the splice in `mask_text` and lingers in the `Vec<Match>` until
+/// the vector is dropped — is wiped from memory on drop rather than left for a
+/// later allocation to reuse. It derefs to `String`, so reads that need `&str`
+/// use `.as_str()` or `&*m.value`; direct `==` comparisons use `.as_str()`.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Match {
     pub kind: &'static str,
-    pub value: String,
+    pub value: Zeroizing<String>,
     pub start: usize,
     pub end: usize,
 }
 
 /// One regex detector. `group` picks which capture is the secret: 0 = the whole
 /// match (token-shaped secrets), N = a sub-group (the value in `KEY=value`, the
-/// password in a DB URL). `guard` drops obvious config placeholders.
+/// password in a DB URL). `guard_fn` is an optional predicate: when `Some(f)`,
+/// matched values where `f(value)` returns `true` are silently dropped as
+/// placeholders or code expressions.
 struct RegexDetector {
     kind: &'static str,
     re: Regex,
     group: usize,
-    guard: bool,
+    guard_fn: Option<fn(&str) -> bool>,
 }
 
 impl RegexDetector {
@@ -26,12 +35,12 @@ impl RegexDetector {
         for caps in self.re.captures_iter(text) {
             if let Some(m) = caps.get(self.group) {
                 let value = m.as_str();
-                if self.guard && looks_like_placeholder(value) {
+                if self.guard_fn.is_some_and(|f| f(value)) {
                     continue;
                 }
                 out.push(Match {
                     kind: self.kind,
-                    value: value.to_string(),
+                    value: Zeroizing::new(value.to_string()),
                     start: m.start(),
                     end: m.end(),
                 });
@@ -46,8 +55,18 @@ impl RegexDetector {
 /// by a parenthesised argument list. Used by the placeholder guard so a real
 /// high-entropy credential that merely *contains* a parenthesis is still masked,
 /// while genuine call expressions are skipped.
-static CALL_EXPR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)").expect("call-expr guard"));
+///
+/// Anchored to the WHOLE value (`^…$`): the previous unanchored form used
+/// `is_match`, so any secret that happened to embed a balanced `ident(...)`
+/// substring (e.g. `A9f83(Kd0)more`) was dropped as "code" and LEAKED. Anchoring
+/// means the guard fires only when the value *is* a call expression, never when
+/// it merely contains one. Truncated calls whose capture stopped at the opening `(`
+/// (e.g. `os.environ.get(`) are not matched here; they are handled by the separate
+/// `v.ends_with('(')` check in `looks_like_placeholder`.
+static CALL_EXPR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[A-Za-z_][A-Za-z0-9_.]*\([^)]*\)$")
+        .expect("BUG: call-expr guard regex failed to compile")
+});
 
 /// Reject values that look like config defaults / examples, not real secrets.
 fn looks_like_placeholder(v: &str) -> bool {
@@ -55,6 +74,10 @@ fn looks_like_placeholder(v: &str) -> bool {
         return true;
     }
     let lower = v.to_ascii_lowercase();
+    // Exact-match deny list. Values that are clearly example / template text and
+    // should never be forwarded masked (as that would waste a round-trip and add
+    // noise to the audit log). Keep this list narrow: anything ambiguous belongs
+    // in a per-detector guard, not here.
     const DENY: &[&str] = &[
         "changeme",
         "change_me",
@@ -66,6 +89,9 @@ fn looks_like_placeholder(v: &str) -> bool {
         "examplekey",
         "your_key",
         "yourkey",
+        "your_password",
+        "placeholder",
+        "sample",
         "test",
         "none",
         "null",
@@ -90,7 +116,9 @@ fn looks_like_placeholder(v: &str) -> bool {
         // complete `ident(...)`; a real secret is neither.
         || v.ends_with('(')
         || CALL_EXPR.is_match(v)
-        // Common config-interpolation / env-reference prefixes.
+        // Common config-interpolation / env-reference prefixes, including both
+        // dot-access (`process.env.SECRET_NAME`) and bracket-access
+        // (`process.env['SECRET']`) JavaScript forms.
         || lower.starts_with("process.env")
         || lower.starts_with("os.environ")
         || lower.starts_with("env.")
@@ -98,21 +126,53 @@ fn looks_like_placeholder(v: &str) -> bool {
         || v.chars().all(|c| c == '*')
 }
 
+/// Reject DB-connection-string password fields that are obviously placeholder
+/// defaults. This guard is intentionally narrower than `looks_like_placeholder`:
+/// the surrounding `scheme://user:pass@host` URL shape is strong evidence of a
+/// real credential, so we skip the length floor and most DENY words. Only the
+/// explicit placeholder strings that no production password would ever use are
+/// rejected — favouring over-masking for all other values.
+fn looks_like_db_placeholder(v: &str) -> bool {
+    const DB_DENY: &[&str] = &[
+        "changeme",
+        "change_me",
+        "placeholder",
+        "secret",
+        "password",
+        "example",
+        "test",
+        "sample",
+        "your_password",
+    ];
+    let lower = v.to_ascii_lowercase();
+    DB_DENY.contains(&lower.as_str())
+}
+
 static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
+    // Patterns are compile-time constants, so a failure here is a developer bug,
+    // not a runtime condition. The panic message names the offending detector,
+    // its pattern, and the parse error so the fix is obvious from CI output alone.
     fn d(kind: &'static str, pat: &str) -> RegexDetector {
         RegexDetector {
             kind,
-            re: Regex::new(pat).expect(kind),
+            re: Regex::new(pat)
+                .unwrap_or_else(|e| panic!("BUG: detector {kind} invalid regex {pat:?}: {e}")),
             group: 0,
-            guard: false,
+            guard_fn: None,
         }
     }
-    fn dg(kind: &'static str, pat: &str, group: usize, guard: bool) -> RegexDetector {
+    fn dg(
+        kind: &'static str,
+        pat: &str,
+        group: usize,
+        guard_fn: Option<fn(&str) -> bool>,
+    ) -> RegexDetector {
         RegexDetector {
             kind,
-            re: Regex::new(pat).expect(kind),
+            re: Regex::new(pat)
+                .unwrap_or_else(|e| panic!("BUG: detector {kind} invalid regex {pat:?}: {e}")),
             group,
-            guard,
+            guard_fn,
         }
     }
     vec![
@@ -147,17 +207,24 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             "aws_secret",
             r#"(?i)aws_secret_access_key["']?\s*[:=]\s*["']?([A-Za-z0-9/+]{40})"#,
             1,
-            false,
+            None,
         ),
         // PASSWORD capture excludes only `@` (the userinfo/host separator) and
         // whitespace. A `/` is legal inside a password and must NOT abort the
         // match; the username class keeps `/` excluded so the `user:pass` split is
         // unambiguous. (Passwords containing a literal `@` remain a known gap.)
+        //
+        // A narrow DB-placeholder guard is applied: obvious template values like
+        // `changeme`, `password`, or `placeholder` are dropped. The full
+        // `looks_like_placeholder` guard (which includes a length floor and many
+        // DENY words that could reject a short real password) stays OFF — only
+        // the explicit placeholder words known to appear in DB URLs are filtered.
+        // A false negative is a leak, so this guard stays minimal.
         dg(
             "db_password",
             r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@\s\\]+)@",
             1,
-            true,
+            Some(looks_like_db_placeholder),
         ),
         // `[a-z0-9_]*` allows a compound prefix (e.g. `DB_`, `MY_`) before the
         // keyword: `\b` does not match across `_`, so the old `\b`-anchored form
@@ -167,11 +234,23 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // newline is the two chars `\n`, NOT real whitespace, so without this the
         // value would greedily run across many lines and swallow whole blocks of
         // content (and several other secrets) into one giant sentinel.
+        // It further excludes the sentinel guillemets `«`/`»` (U+00AB / U+00BB):
+        // model- or user-supplied content could otherwise place one inside a
+        // captured span, smuggling a partial sentinel into the masked body and
+        // corrupting the round-trip. They are never part of a real secret.
+        //
+        // KNOWN GAP (unquoted, conservative): this class stops at the first
+        // whitespace (`\s`), so a *space-bearing* unquoted secret loses its tail
+        // — e.g. `secret = hunter two` captures only `hunter`. An unquoted value
+        // has no closing delimiter, so a space is the only safe boundary; greedily
+        // crossing it would swallow following prose/JSON (and other secrets) into
+        // one giant sentinel, which is worse. Quote the value (the variants below
+        // capture spaces verbatim) to mask a secret that contains spaces.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\]{8,})"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\«»]{8,})"#,
             1,
-            true,
+            Some(looks_like_placeholder),
         ),
         // Quoted-value variants. The unquoted class above stops at `,` and `}` so
         // it does not swallow JSON structure — but that also truncates a *quoted*
@@ -181,17 +260,19 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // need only exclude the quote and `\`. Same `env_secret` kind; the closing
         // quote stays OUTSIDE group 1, so masking preserves it and the body stays
         // valid. `dedupe_overlaps` keeps this longer match over the truncated one.
+        // Guillemets `«`/`»` are excluded from the quoted classes too, for the same
+        // anti-smuggling reason as the unquoted variant above.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*"([^"\\]{8,})""#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*"([^"\\«»]{8,})""#,
             1,
-            true,
+            Some(looks_like_placeholder),
         ),
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*'([^'\\]{8,})'"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*'([^'\\«»]{8,})'"#,
             1,
-            true,
+            Some(looks_like_placeholder),
         ),
         // ── AI / LLM provider keys (the core use case) ──────────────────────
         // Distinct prefixes catch bare tokens that `env_secret` misses (a key
@@ -223,7 +304,7 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             "azure_storage_key",
             r"(?i)AccountKey=([A-Za-z0-9+/]{86,88}={0,2})",
             1,
-            false,
+            None,
         ),
         // ── Developer tools / platforms ─────────────────────────────────────
         d("pypi_token", r"\bpypi-AgEIcHlwaS[A-Za-z0-9_-]{50,}\b"),
@@ -260,7 +341,7 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             "mailgun_key",
             r"(?i)mailgun[^\n]{0,40}\b(key-[0-9a-f]{32})\b",
             1,
-            false,
+            None,
         ),
         d("stripe_webhook", r"\bwhsec_[A-Za-z0-9]{32,}\b"),
         d("square_token", r"\bsq0(?:atp|csp|idp)-[A-Za-z0-9_-]{22,}\b"),
@@ -374,7 +455,7 @@ mod tests {
         let hits = detect("DATABASE_URL=postgres://app:s3cr3tPass1@db.internal:5432/prod");
         assert!(
             hits.iter()
-                .any(|m| m.kind == "db_password" && m.value == "s3cr3tPass1")
+                .any(|m| m.kind == "db_password" && m.value.as_str() == "s3cr3tPass1")
         );
     }
 
@@ -385,8 +466,46 @@ mod tests {
         let hits = detect("DATABASE_URL=postgres://app:p4ss/word@db:5432/x");
         assert!(
             hits.iter()
-                .any(|m| m.kind == "db_password" && m.value == "p4ss/word"),
+                .any(|m| m.kind == "db_password" && m.value.as_str() == "p4ss/word"),
             "password containing '/' must still be detected"
+        );
+    }
+
+    /// Issue #44 — DB URL placeholder guard.
+    /// Common placeholder values inside a DB connection string must be dropped,
+    /// but a real non-placeholder password must still be detected.
+    #[test]
+    fn db_password_drops_placeholder_values() {
+        // Each of these is a well-known placeholder that nobody ships in production.
+        for placeholder in &[
+            "changeme",
+            "CHANGEME",
+            "placeholder",
+            "PLACEHOLDER",
+            "secret",
+            "SECRET",
+            "password",
+            "PASSWORD",
+            "example",
+            "test",
+            "sample",
+            "your_password",
+        ] {
+            let url = format!("postgres://user:{placeholder}@db:5432/mydb");
+            assert!(
+                detect(&url)
+                    .iter()
+                    .filter(|m| m.kind == "db_password")
+                    .count()
+                    == 0,
+                "db_password must NOT fire on placeholder value {placeholder:?}"
+            );
+        }
+        // A non-placeholder value must still be detected (guard should not over-block).
+        let url = "postgres://user:xKj8mQp2rN@db:5432/mydb";
+        assert!(
+            detect(url).iter().any(|m| m.kind == "db_password"),
+            "db_password must fire on a real non-placeholder password"
         );
     }
 
@@ -401,6 +520,24 @@ mod tests {
         );
     }
 
+    /// Issue #44 — extended placeholder guard for env_secret.
+    /// The DENY list now includes `"your_password"`, `"placeholder"`, and `"sample"`.
+    #[test]
+    fn env_secret_drops_new_placeholder_words() {
+        assert!(
+            detect("PASSWORD=placeholder").is_empty(),
+            "PASSWORD=placeholder should be dropped"
+        );
+        assert!(
+            detect("PASSWORD=your_password").is_empty(),
+            "PASSWORD=your_password should be dropped"
+        );
+        assert!(
+            detect("PASSWORD=sample").is_empty(),
+            "PASSWORD=sample should be dropped"
+        );
+    }
+
     /// A high-entropy credential that merely *contains* a parenthesis must still
     /// be masked — the old guard rejected any value with `(`/`)`, silently leaking
     /// such secrets. Only genuine call expressions (below) should be skipped.
@@ -409,7 +546,7 @@ mod tests {
         assert!(
             detect("API_KEY=A9f83(Kd0parealtoken")
                 .iter()
-                .any(|m| m.kind == "env_secret" && m.value == "A9f83(Kd0parealtoken"),
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "A9f83(Kd0parealtoken"),
             "credential containing '(' must be detected, not treated as code"
         );
     }
@@ -431,6 +568,79 @@ mod tests {
         );
     }
 
+    /// Issue #43 — `process.env` dot-access and bracket-access forms must not be
+    /// treated as literal secrets. Both JS env-access syntaxes produce a code
+    /// expression, not a real credential value.
+    #[test]
+    fn process_env_access_forms_are_not_masked() {
+        // Dot-access: `SECRET_KEY=process.env.MY_SECRET`
+        assert!(
+            !detect("SECRET_KEY=process.env.MY_SECRET")
+                .iter()
+                .any(|m| m.kind == "env_secret"),
+            "process.env.MY_SECRET dot-access must not be masked"
+        );
+        // Bracket-access: `SECRET_KEY=process.env['MY_SECRET']`
+        assert!(
+            !detect("SECRET_KEY=process.env['MY_SECRET']")
+                .iter()
+                .any(|m| m.kind == "env_secret"),
+            "process.env['MY_SECRET'] bracket-access must not be masked"
+        );
+        // Double-quote variant: `SECRET_KEY=process.env["MY_SECRET"]`
+        assert!(
+            !detect(r#"SECRET_KEY=process.env["MY_SECRET"]"#)
+                .iter()
+                .any(|m| m.kind == "env_secret"),
+            r#"process.env["MY_SECRET"] bracket-access must not be masked"#
+        );
+    }
+
+    /// Issue #45 — `env_secret` must fire on the unquoted bare form (`KEY=value`)
+    /// and space-separated forms (`KEY =value`, `KEY= value`) that the regex
+    /// handles via `\s*[:=]\s*`. This test pins the behaviour so a future regex
+    /// change cannot silently regress it.
+    #[test]
+    fn env_secret_unquoted_and_space_forms() {
+        // Bare unquoted (already worked; now pinned).
+        assert!(
+            detect("API_KEY=A9f83Kd0parealtoken")
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "A9f83Kd0parealtoken"),
+            "bare KEY=value form must be detected"
+        );
+        // Space before `=`
+        assert!(
+            detect("API_KEY =A9f83Kd0parealtoken")
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "A9f83Kd0parealtoken"),
+            "KEY =value (space before =) form must be detected"
+        );
+        // Space after `=`
+        assert!(
+            detect("API_KEY= A9f83Kd0parealtoken")
+                .iter()
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "A9f83Kd0parealtoken"),
+            "KEY= value (space after =) form must be detected"
+        );
+    }
+
+    /// Issue #45 — values that start with guillemet sentinels (`«`) must
+    /// NOT be captured, so an already-masked sentinel is never re-masked into a
+    /// nested sentinel that would corrupt round-trip restore.
+    #[test]
+    fn env_secret_excludes_guillemet_values() {
+        // A sentinel that sits in the value position of a KEY= expression must not
+        // trigger another env_secret match.
+        let sentinel_value = "API_KEY=«promtect:aws_key:0001»";
+        assert!(
+            !detect(sentinel_value)
+                .iter()
+                .any(|m| m.kind == "env_secret"),
+            "a sentinel in value position must not trigger env_secret"
+        );
+    }
+
     /// A quoted value containing `,` or `}` must be captured whole — the unquoted
     /// class stops at those bytes and would forward the tail in cleartext. The
     /// closing quote bounds the quoted variant, so the full secret is masked.
@@ -439,13 +649,13 @@ mod tests {
         assert!(
             detect(r#"{"api_key":"ab,cd}efghij"}"#)
                 .iter()
-                .any(|m| m.kind == "env_secret" && m.value == "ab,cd}efghij"),
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "ab,cd}efghij"),
             "quoted secret with ','/'}}' must be captured whole, not truncated"
         );
         assert!(
             detect("token = 'p4ss,w0rd,with,commas'")
                 .iter()
-                .any(|m| m.kind == "env_secret" && m.value == "p4ss,w0rd,with,commas"),
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "p4ss,w0rd,with,commas"),
             "single-quoted secret with commas must be captured whole"
         );
     }
@@ -458,13 +668,13 @@ mod tests {
         assert!(
             detect("DB_PASSWORD=S3cretValue123")
                 .iter()
-                .any(|m| m.kind == "env_secret" && m.value == "S3cretValue123"),
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "S3cretValue123"),
             "DB_PASSWORD compound key must be detected"
         );
         assert!(
             detect("MY_TOKEN=realtoken456789")
                 .iter()
-                .any(|m| m.kind == "env_secret" && m.value == "realtoken456789"),
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "realtoken456789"),
             "MY_TOKEN compound key must be detected"
         );
     }
@@ -720,7 +930,7 @@ mod tests {
         let env: Vec<String> = detect(json_body)
             .into_iter()
             .filter(|m| m.kind == "env_secret")
-            .map(|m| m.value)
+            .map(|m| m.value.to_string())
             .collect();
         // Each value is line-bounded; neither swallows the following line.
         assert!(
