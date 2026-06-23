@@ -12,7 +12,7 @@ an `api` type (no base-URL env var). For Claude models:
   models: {
     providers: {
       promtect: {
-        baseUrl: "http://127.0.0.1:8787",
+        baseUrl: "http://127.0.0.1:8790",
         apiKey: "${ANTHROPIC_API_KEY}",
         api: "anthropic-messages",
         models: [{ id: "claude-opus-4-8", name: "Opus 4.8 (via Promtect)" }],
@@ -23,7 +23,7 @@ an `api` type (no base-URL env var). For Claude models:
 ```
 
 For an OpenAI-compatible provider use `api: "openai-completions"` and
-`baseUrl: "http://127.0.0.1:8787/v1"`.
+`baseUrl: "http://127.0.0.1:8790/v1"`.
 
 Start Promtect in the matching mode and keep it running:
 

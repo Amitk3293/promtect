@@ -19,13 +19,13 @@ The rest of this guide is the manual method.
 ## Start Promtect
 
 ```sh
-PROMTECT_MODE=openai promtect        # listens on 127.0.0.1:8787
+PROMTECT_MODE=openai promtect        # listens on 127.0.0.1:8790
 ```
 
 ## Point Codex at it
 
 ```sh
-OPENAI_BASE_URL=http://127.0.0.1:8787/v1 codex "add tests for the parser"
+OPENAI_BASE_URL=http://127.0.0.1:8790/v1 codex "add tests for the parser"
 ```
 
 Your real `OPENAI_API_KEY` is forwarded untouched; only the request body is

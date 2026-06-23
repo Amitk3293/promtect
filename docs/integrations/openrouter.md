@@ -18,13 +18,13 @@ Set your OpenAI-compatible client's base URL to Promtect, preserving the
 `/api/v1` path OpenRouter uses:
 
 ```sh
-OPENAI_BASE_URL=http://127.0.0.1:8787/api/v1 your-tool ...
+OPENAI_BASE_URL=http://127.0.0.1:8790/api/v1 your-tool ...
 ```
 
 Or curl:
 
 ```sh
-curl http://127.0.0.1:8787/api/v1/chat/completions \
+curl http://127.0.0.1:8790/api/v1/chat/completions \
   -H "authorization: Bearer $OPENROUTER_API_KEY" \
   -H 'content-type: application/json' \
   -d '{"model":"deepseek/deepseek-r1","messages":[{"role":"user","content":"review my config"}]}'

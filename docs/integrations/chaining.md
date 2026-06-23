@@ -28,7 +28,7 @@ context; Promtect restores the real values in the final response.
 
 ```sh
 PROMTECT_UPSTREAM=http://localhost:4000 promtect
-# point your OpenAI-compatible client at http://127.0.0.1:8787
+# point your OpenAI-compatible client at http://127.0.0.1:8790
 ```
 
 ## Promtect → corporate HTTP proxy → Anthropic

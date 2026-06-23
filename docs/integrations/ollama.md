@@ -32,13 +32,13 @@ PROMTECT_MODE=ollama promtect        # upstream = http://localhost:11434
 Any OpenAI-compatible client or SDK:
 
 ```sh
-OPENAI_BASE_URL=http://127.0.0.1:8787/v1 your-tool ...
+OPENAI_BASE_URL=http://127.0.0.1:8790/v1 your-tool ...
 ```
 
 Or curl directly:
 
 ```sh
-curl http://127.0.0.1:8787/v1/chat/completions \
+curl http://127.0.0.1:8790/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"deepseek-r1","messages":[{"role":"user","content":"explain my .env"}]}'
 ```

@@ -20,7 +20,7 @@ in the reply, or kept masked in strict mode. Pick your tool below.
 | VS Code Copilot | [vscode-copilot.md](vscode-copilot.md) | not yet (needs CA) |
 
 Not listed? **Any** tool that lets you override its model-provider base URL works
-the same way: point it at `http://127.0.0.1:8787` and run `promtect` in the
+the same way: point it at `http://127.0.0.1:8790` and run `promtect` in the
 matching mode. See [harnesses.md](harnesses.md) for the pattern.
 
 ## How upstream selection works
@@ -40,7 +40,7 @@ Each Promtect instance talks to one upstream. To protect two tools that use
 different providers, run two instances on different ports:
 
 ```sh
-PROMTECT_PORT=8787 PROMTECT_MODE=anthropic promtect &
+PROMTECT_PORT=8790 PROMTECT_MODE=anthropic promtect &
 PROMTECT_PORT=8788 PROMTECT_MODE=openai    promtect &
 ```
 
@@ -48,7 +48,7 @@ PROMTECT_PORT=8788 PROMTECT_MODE=openai    promtect &
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `PROMTECT_PORT` | `8787` | Port Promtect listens on (loopback). |
+| `PROMTECT_PORT` | `8790` | Port Promtect listens on (loopback). |
 | `PROMTECT_MODE` | `anthropic` | Upstream provider preset. |
 | `PROMTECT_UPSTREAM` | — | Explicit upstream URL; overrides mode (chaining). |
 | `PROMTECT_RESTORE` | `true` | `false` = strict mode (never re-insert secrets). |
