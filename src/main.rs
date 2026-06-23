@@ -8,6 +8,41 @@ use promtect::{
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+
+    // Help must print before any port binding attempt.
+    if args.get(1).map(|s| s.as_str()) == Some("--help")
+        || args.get(1).map(|s| s.as_str()) == Some("-h")
+    {
+        print!(concat!(
+            "promtect ", env!("CARGO_PKG_VERSION"), "\n",
+            "\n",
+            "USAGE:\n",
+            "    promtect [SUBCOMMAND]\n",
+            "\n",
+            "SUBCOMMANDS:\n",
+            "    (none)       Start the proxy (default)\n",
+            "    selftest     Detector canary check — no network\n",
+            "    mask         Mask stdin, write masked text to stdout\n",
+            "    playground   Offline mask+restore demo\n",
+            "    guard <cmd>  Wrap a command with an ephemeral proxy\n",
+            "    dashboard    Serve audit metrics on PROMTECT_DASHBOARD_PORT (default 8799)\n",
+            "\n",
+            "ENV VARS:\n",
+            "    PROMTECT_PORT              Proxy bind port (default 8787)\n",
+            "    PROMTECT_BIND              Proxy bind address (default 127.0.0.1)\n",
+            "    PROMTECT_ALLOW_PUBLIC_BIND Allow non-loopback bind (default false)\n",
+            "    PROMTECT_MODE              anthropic|openai|ollama|openrouter (default anthropic)\n",
+            "    PROMTECT_UPSTREAM          Explicit upstream URL (overrides mode)\n",
+            "    PROMTECT_RESTORE           Restore sentinels in response (default true)\n",
+            "    PROMTECT_BLOCK_RISKY       Block high-risk upstreams (default false)\n",
+            "    PROMTECT_AUDIT             Audit log path (default promtect-audit.jsonl)\n",
+            "    PROMTECT_MAX_BODY_BYTES    Request body size cap (default 33554432)\n",
+            "    PROMTECT_READ_TIMEOUT      Per-chunk read timeout seconds (default 120)\n",
+            "    PROMTECT_DASHBOARD_PORT    Dashboard port (default 8799)\n",
+        ));
+        return;
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("selftest") {
         let ok = promtect::mask::selftest();
         println!(
