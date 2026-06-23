@@ -3,7 +3,7 @@ services:
     image: ghcr.io/amitk3293/promtect:latest   # prebuilt (public at M1); until then use: docker compose up --build
     build: .
     ports:
-      - "127.0.0.1:${PROMTECT_HOST_PORT:-8787}:8787"   # loopback only — do NOT change to "8787:8787" (LAN exposure)
+      - "127.0.0.1:${PROMTECT_HOST_PORT:-8790}:8790"   # loopback only — do NOT change to "8787:8787" (LAN exposure)
     environment:
       PROMTECT_BIND: "0.0.0.0"        # safe: only reachable via the 127.0.0.1-published port above
       PROMTECT_UPSTREAM: "https://api.anthropic.com"

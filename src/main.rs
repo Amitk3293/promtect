@@ -33,7 +33,7 @@ async fn main() {
             "    dashboard    Dashboard-only (no proxy) on PROMTECT_DASHBOARD_PORT\n",
             "\n",
             "ENV VARS:\n",
-            "    PROMTECT_PORT              Proxy bind port (default 8787)\n",
+            "    PROMTECT_PORT              Proxy bind port (default 8790)\n",
             "    PROMTECT_BIND              Proxy bind address (default 127.0.0.1)\n",
             "    PROMTECT_ALLOW_PUBLIC_BIND Allow non-loopback bind (default false)\n",
             "    PROMTECT_MODE              anthropic|openai|ollama|openrouter (default anthropic)\n",
@@ -188,7 +188,7 @@ async fn main() {
     let port = match proxy::parse_port(
         "PROMTECT_PORT",
         std::env::var("PROMTECT_PORT").ok().as_deref(),
-        8787,
+        8790,
     ) {
         Ok(p) => p,
         Err(e) => {

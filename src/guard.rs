@@ -37,8 +37,8 @@ pub struct GuardPlan {
     pub notes: Vec<String>,
 }
 
-/// Default Headroom port (Headroom's own default; the owner runs it on 8788, which
-/// can be selected with `--headroom=http://127.0.0.1:8788`).
+/// Default Headroom URL — Headroom binds `127.0.0.1:8787` by default.
+/// Use `--headroom=<url>` to override (e.g. `--headroom=http://127.0.0.1:9000`).
 const HEADROOM_DEFAULT: &str = "http://127.0.0.1:8787";
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
@@ -354,7 +354,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // Guard overrides it for the child process, but the shell still holds the old
     // value — direct tool invocations in this terminal will fail until it's cleared.
     // Warn only when the value looks like an ephemeral stub (loopback, non-standard
-    // port), not when it's a valid Headroom URL (8787/8788) or a remote host.
+    // port), not when it's a valid Headroom (8787) or Promtect (8790) URL or a remote host.
     if let Ok(stale) = std::env::var(&plan.base_var)
         && is_stale_stub(&stale)
     {
@@ -422,8 +422,8 @@ pub async fn guard(plan: GuardPlan) -> i32 {
 }
 
 /// Returns `true` if `url` looks like an ephemeral stub — a loopback address on a
-/// non-standard port. Known-good loopback ports (8787 = Promtect default, 8788 =
-/// common Headroom port) are excluded so legitimate proxy URLs don't trigger the
+/// non-standard port. Known-good loopback ports (8787 = Headroom default, 8790 =
+/// Promtect default) are excluded so legitimate proxy URLs don't trigger the
 /// stale-stub warning.
 fn is_stale_stub(url: &str) -> bool {
     let host_port = url
@@ -437,7 +437,7 @@ fn is_stale_stub(url: &str) -> bool {
         .next()
         .and_then(|p| p.parse().ok())
         .unwrap_or(0);
-    !matches!(port, 8787 | 8788)
+    !matches!(port, 8787 | 8790)
 }
 
 /// Map a child `ExitStatus` to a process exit code. A child killed by a signal has
@@ -474,7 +474,7 @@ mod tests {
         assert!(is_stale_stub("http://localhost:12345"));
         // known-good loopback ports → not stale
         assert!(!is_stale_stub("http://127.0.0.1:8787"));
-        assert!(!is_stale_stub("http://127.0.0.1:8788"));
+        assert!(!is_stale_stub("http://127.0.0.1:8790"));
         // remote host → never a stub
         assert!(!is_stale_stub("https://api.anthropic.com"));
         assert!(!is_stale_stub("https://openrouter.ai/api/v1"));
@@ -549,10 +549,10 @@ mod tests {
             "http://127.0.0.1:8787"
         );
         assert_eq!(
-            plan(&["claude", "--headroom=http://127.0.0.1:8788"])
+            plan(&["claude", "--headroom=http://127.0.0.1:8790"])
                 .unwrap()
                 .upstream,
-            "http://127.0.0.1:8788"
+            "http://127.0.0.1:8790"
         );
     }
 
@@ -577,8 +577,8 @@ mod tests {
 
     #[test]
     fn explicit_upstream_wins() {
-        let p = plan(&["claude", "--upstream", "http://127.0.0.1:8788/"]).unwrap();
-        assert_eq!(p.upstream, "http://127.0.0.1:8788");
+        let p = plan(&["claude", "--upstream", "http://127.0.0.1:8790/"]).unwrap();
+        assert_eq!(p.upstream, "http://127.0.0.1:8790");
     }
 
     #[test]

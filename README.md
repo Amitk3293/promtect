@@ -68,7 +68,7 @@ outright.
 ## How it works
 
 ```
-Your AI tool ──http──▶ Promtect :8787 ──https──▶ api.anthropic.com
+Your AI tool ──http──▶ Promtect :8790 ──https──▶ api.anthropic.com
                         │ detect + mask               │
                         └────────── restore ◀─────────┘
 ```
@@ -148,19 +148,19 @@ secrets-safe **and** ~90% cheaper sessions.
 ### Native
 
 ```sh
-cargo run            # binds 127.0.0.1:8787, upstream → api.anthropic.com
+cargo run            # binds 127.0.0.1:8790, upstream → api.anthropic.com
 # in another shell:
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 ```
 
 ### Docker
 
 ```sh
 docker compose up --build
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 ```
 
-> **Security:** publish the port to `127.0.0.1:8787:8787`, never `8787:8787`.
+> **Security:** publish the port to `127.0.0.1:8790:8787`, never `8787:8787`.
 > The bundled `docker-compose.yml` does this correctly by default.
 
 ### Prove it works (no network needed)
@@ -178,12 +178,12 @@ point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 
 | Tool | Setup |
 |------|-------|
-| **Claude Code** | `promtect` then `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` |
-| **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8787/v1` |
-| **OpenAI Codex CLI** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
-| **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` |
-| **OpenRouter** | `PROMTECT_MODE=openrouter promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8787/api/v1` |
-| **Agent harnesses** (OpenCode, Crush, Goose, Pi) | set the harness's provider `baseUrl` to `http://127.0.0.1:8787` ([guide](docs/integrations/harnesses.md)) |
+| **Claude Code** | `promtect` then `ANTHROPIC_BASE_URL=http://127.0.0.1:8790` |
+| **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8790/v1` |
+| **OpenAI Codex CLI** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |
+| **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |
+| **OpenRouter** | `PROMTECT_MODE=openrouter promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/api/v1` |
+| **Agent harnesses** (OpenCode, Crush, Goose, Pi) | set the harness's provider `baseUrl` to `http://127.0.0.1:8790` ([guide](docs/integrations/harnesses.md)) |
 | **Aider** | `promtect guard aider --model openai/gpt-5.5` |
 | **OpenClaw / NanoClaw** | point the gateway's provider base URL (or `ANTHROPIC_BASE_URL`) at Promtect ([OpenClaw](docs/integrations/openclaw.md), [NanoClaw](docs/integrations/nanoclaw.md)) |
 | **Headroom / LiteLLM / corp proxy** | `PROMTECT_UPSTREAM=<their-url> promtect` (Promtect goes first) |
@@ -197,7 +197,7 @@ masks your secrets before any of them see them.
 
 | Variable | Default | Description |
 |---|---|---|
-| `PROMTECT_PORT` | `8787` | Local port to bind (loopback) |
+| `PROMTECT_PORT` | `8790` | Local port to bind (loopback) |
 | `PROMTECT_MODE` | `anthropic` | Upstream preset: `anthropic` / `openai` / `ollama` / `openrouter` |
 | `PROMTECT_UPSTREAM` |, | Explicit upstream URL; overrides mode (chaining) |
 | `PROMTECT_RESTORE` | `true` | `false` = strict mode: secrets are never re-inserted |
