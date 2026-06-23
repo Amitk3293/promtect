@@ -327,7 +327,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = Ctx {
         upstream: plan.upstream.clone(),
-        audit: Arc::new(Audit::to_file(audit_path.into())),
+        audit: Arc::new(Audit::to_file(audit_path)),
         client: crate::net::http_client(),
         max_body_bytes: proxy::DEFAULT_MAX_BODY_BYTES,
         restore: plan.restore,
