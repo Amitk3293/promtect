@@ -92,3 +92,25 @@ jobs:
             "promtect-${TAG}-${{ matrix.target }}.tar.gz" \
             "promtect-${TAG}-${{ matrix.target }}.tar.gz.sha256" \
             --clobber
+
+  tap-update:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Update Homebrew tap
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/Amitk3293/homebrew-tap.git" tap
+          scripts/update-formula.sh "$TAG" > tap/Formula/promtect.rb
+          git -C tap config user.email "github-actions[bot]@users.noreply.github.com"
+          git -C tap config user.name "github-actions[bot]"
+          git -C tap add Formula/promtect.rb
+          # no-op if the formula is already up-to-date (e.g. workflow_dispatch re-run)
+          git -C tap diff --staged --quiet \
+            || git -C tap commit -m "promtect ${TAG}: formula auto-update"
+          git -C tap push
