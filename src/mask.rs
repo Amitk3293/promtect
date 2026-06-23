@@ -102,6 +102,17 @@ pub fn find_sentinels(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Re-scan a masked body for any secrets that survived masking.
+///
+/// Replaces every sentinel with a fixed neutral string before running detectors,
+/// so the sentinel's own `kind:HEX` content cannot trigger a false positive.
+pub fn scan_for_leaks(masked: &str) -> Vec<crate::detect::Match> {
+    // Replace sentinels with «MASKED» — guillemets are in every detector's
+    // exclusion class, so no pattern can capture across this boundary.
+    let stripped = SENTINEL_RE.replace_all(masked, "«MASKED»");
+    crate::detect::detect(&stripped)
+}
+
 /// Local proof: mask a canary secret, confirm it is gone from the masked text,
 /// then confirm restore returns the original. Pure in-memory, no network.
 pub fn selftest() -> bool {

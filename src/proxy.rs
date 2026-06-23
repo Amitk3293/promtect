@@ -206,6 +206,51 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             let mut kinds: Vec<&str> = hits.iter().map(|m| m.kind).collect();
             kinds.sort_unstable();
             kinds.dedup();
+
+            // Emit a Promtect-attributed stderr line so the user can see masking
+            // in their terminal without opening the dashboard.
+            if !hits.is_empty() {
+                eprintln!(
+                    "[promtect] req {}: masked {} secret{} ({})",
+                    &request_id[..8],
+                    hits.len(),
+                    if hits.len() == 1 { "" } else { "s" },
+                    kinds.join(", ")
+                );
+            }
+
+            // Post-mask leak check: re-run detectors on the masked body (sentinels
+            // stripped first so their kind:HEX content can't false-positive).
+            // Any match that survives means masking missed that pattern — warn
+            // loudly and block before the request leaves the machine.
+            let leaks = crate::mask::scan_for_leaks(&masked);
+            if !leaks.is_empty() {
+                let leak_kinds: Vec<&str> = {
+                    let mut v: Vec<&str> = leaks.iter().map(|m| m.kind).collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    v
+                };
+                eprintln!(
+                    "[promtect] ⚠️  LEAK req {}: {} pattern{} may not be masked ({}) \
+                     — request blocked",
+                    &request_id[..8],
+                    leaks.len(),
+                    if leaks.len() == 1 { "" } else { "s" },
+                    leak_kinds.join(", ")
+                );
+                // Fail-closed: block the request rather than forward plaintext secrets.
+                return text_response(
+                    400,
+                    format!(
+                        "promtect: {} secret pattern{} not masked before forwarding ({})",
+                        leaks.len(),
+                        if leaks.len() == 1 { "" } else { "s" },
+                        leak_kinds.join(", ")
+                    ),
+                );
+            }
+
             ctx.audit.record_request(
                 &request_id,
                 hits.len(),

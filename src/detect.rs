@@ -222,7 +222,9 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // A false negative is a leak, so this guard stays minimal.
         dg(
             "db_password",
-            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@\s\\]+)@",
+            // Guillemets «» excluded for the same sentinel-anti-smuggling reason
+            // as env_secret: a partial sentinel must not be absorbed into the match.
+            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@\s\\«»]+)@",
             1,
             Some(looks_like_db_placeholder),
         ),
@@ -248,7 +250,7 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // capture spaces verbatim) to mask a secret that contains spaces.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\«»]{8,})"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\«»]{8,})"#,
             1,
             Some(looks_like_placeholder),
         ),
@@ -264,13 +266,23 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         // anti-smuggling reason as the unquoted variant above.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*"([^"\\«»]{8,})""#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*"([^"\\«»]{8,})""#,
             1,
             Some(looks_like_placeholder),
         ),
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*'([^'\\«»]{8,})'"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*'([^'\\«»]{8,})'"#,
+            1,
+            Some(looks_like_placeholder),
+        ),
+        // JSON-escaped-quote variant. In a JSON request body, `password = "val"`
+        // arrives as `password = \"val\"` (backslash-escaped). The backslash is in
+        // the exclusion class of the variants above, so they miss it. This variant
+        // uses `\"…\"` as delimiters to catch the JSON-encoded form.
+        dg(
+            "env_secret",
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*\\"([^"\\«»]{8,})\\""#,
             1,
             Some(looks_like_placeholder),
         ),
@@ -944,6 +956,34 @@ mod tests {
         assert!(
             env.iter().all(|v| !v.contains("DB_PASSWORD")),
             "a value swallowed the next line: {env:?}"
+        );
+    }
+
+    /// Issue: `secret_key` (Terraform AWS provider) leaked because the `secret`
+    /// keyword matched but `_key` before `=` prevented the `[:=]` anchor from
+    /// firing. `secret[_-]?key` must be listed before bare `secret`.
+    #[test]
+    fn secret_key_hcl_is_detected() {
+        let hcl = r#"secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYSECRETKEY""#;
+        assert!(
+            detect(hcl).iter().any(|m| m.kind == "env_secret"),
+            "secret_key = \"...\" must be detected as env_secret; got: {:?}",
+            detect(hcl)
+        );
+    }
+
+    /// Issue: in a JSON request body the HCL value `password = "val"` is encoded
+    /// as `password = \"val\"` (backslash-escaped quotes). The backslash is in the
+    /// exclusion class of the unquoted/quoted variants, so capture failed. A
+    /// JSON-escaped-quote variant (`\"…\"`) must catch this.
+    #[test]
+    fn password_json_encoded_quotes_is_detected() {
+        // Simulate how the proxy sees it: double-quotes JSON-escaped to \"
+        let json_fragment = r#"password = \"super-secret-db-pass-123!\""#;
+        assert!(
+            detect(json_fragment).iter().any(|m| m.kind == "env_secret"),
+            "password with JSON-escaped quotes must be detected; got: {:?}",
+            detect(json_fragment)
         );
     }
 }
