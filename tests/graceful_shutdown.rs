@@ -73,16 +73,18 @@ async fn shutdown_signal_does_not_fire_spuriously() {
 /// On Unix: verify that `shutdown_signal()` compiles and both signal handlers register.
 #[cfg(unix)]
 #[tokio::test]
-async fn shutdown_signal_compiles_and_registers_unix_handlers() {
+async fn shutdown_signal_is_callable_and_sigterm_registers() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    // Both handlers must register without error.
-    let _ctrl_c_handle = tokio::signal::ctrl_c();
+    // SIGTERM handler registration is eager (constructor, not first poll).
     let _sigterm_handle = signal(SignalKind::terminate())
         .expect("SIGTERM handler must register successfully");
 
-    // The public shutdown_signal() function must be callable from library
-    // code (guard.rs uses crate::proxy::shutdown_signal()).
+    // shutdown_signal() must be callable from library code without error
+    // (guard.rs uses crate::proxy::shutdown_signal()).
+    // NOTE: ctrl_c() registers its handler on first poll, not construction,
+    // so we only verify the function is callable here, not that the OS-level
+    // handler is installed.
     let _future = promtect::proxy::shutdown_signal();
-    // Drop the future — we do not await it to avoid actually blocking.
+    // Drop the future — we do not await it to avoid blocking the test.
 }
