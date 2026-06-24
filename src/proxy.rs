@@ -3,7 +3,7 @@
 
 use crate::audit::Audit;
 use crate::detect;
-use crate::mask::mask_text;
+use crate::mask::mask_with_matches;
 use crate::stream::{StreamRestorer, restore_stream};
 use crate::vault::Vault;
 use axum::{
@@ -41,6 +41,14 @@ fn text_response(status: u16, msg: impl Into<String>) -> Response {
 /// upstream base URL, the (append-only, process-wide) audit log, and the outbound
 /// client.
 ///
+/// An extra detection pass composed on top of the core detectors at mask time.
+///
+/// The public core always leaves this `None` and never depends on anything that
+/// sets it. A downstream build (`promtect-pro`) sets it to merge its own
+/// detectors (entropy, PII/PCI) into the SAME mask / restore / value-free-audit
+/// path. It is a leak-only seam: it can ADD matches, never remove the core's.
+pub type ExtraDetector = Arc<dyn Fn(&str) -> Vec<crate::detect::Match> + Send + Sync>;
+
 /// NOTE: there is deliberately NO vault here. The vault is created fresh per
 /// request inside [`handle`] — a single shared vault would let a sentinel minted
 /// in one request restore a secret belonging to a *different* request
@@ -63,6 +71,21 @@ pub struct Ctx {
     /// wrapped tool exits: zero means the tool never used the proxy (it bypassed
     /// masking) — a tripwire worth warning about.
     pub requests: Arc<std::sync::atomic::AtomicU64>,
+    /// Optional extra detection pass (see [`ExtraDetector`]). `None` in the public
+    /// core; set by `promtect-pro` to compose its detectors into masking.
+    pub extra_detect: Option<ExtraDetector>,
+}
+
+/// Core detectors plus any extra (Pro) detection pass, merged into one match list.
+/// `None` yields exactly the core's `detect()` output, so the public proxy's
+/// behavior is unchanged; a downstream build adds its matches here. The merged
+/// list may overlap — [`mask_with_matches`] coalesces overlaps before masking.
+fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Match> {
+    let mut matches = detect::detect(text);
+    if let Some(extra) = extra {
+        matches.extend(extra(text));
+    }
+    matches
 }
 
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
@@ -237,24 +260,29 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // corrupts it by lossy conversion or a mistaken substitution.
     let forward_bytes = match std::str::from_utf8(&body_bytes) {
         Ok(text) => {
-            // Mask request body content. Auth headers forwarded untouched in forward().
-            let masked = mask_text(text, &vault, &ctx.audit, &request_id);
+            // Compose the core detectors with any extra (Pro) pass, then mask AND
+            // summarize from the same match set so the summary reflects everything
+            // masked. extra_detect is None in the public core (behavior unchanged).
+            let matches = compose_matches(text, &ctx.extra_detect);
+            let hit_count = matches.len();
 
-            // Second detect pass for the per-request summary (cheap; same input).
-            // Secret values are never included in the summary.
-            let hits = detect::detect(text);
-            let mut kinds: Vec<&str> = hits.iter().map(|m| m.kind).collect();
+            // Per-request summary kinds (value-free), taken before the match list is
+            // consumed by masking.
+            let mut kinds: Vec<&str> = matches.iter().map(|m| m.kind).collect();
             kinds.sort_unstable();
             kinds.dedup();
 
+            // Mask request body content. Auth headers forwarded untouched in forward().
+            let masked = mask_with_matches(text, matches, &vault, &ctx.audit, &request_id);
+
             // Emit a Promtect-attributed stderr line so the user can see masking
             // in their terminal without opening the dashboard.
-            if !hits.is_empty() {
+            if hit_count > 0 {
                 eprintln!(
                     "[promtect] req {}: masked {} secret{} ({})",
                     &request_id[..8],
-                    hits.len(),
-                    if hits.len() == 1 { "" } else { "s" },
+                    hit_count,
+                    if hit_count == 1 { "" } else { "s" },
                     kinds.join(", ")
                 );
             }
@@ -262,7 +290,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             // Post-mask leak check: only needed when masking ran — if no secrets
             // were detected, the masked body is identical to the input and a second
             // scan would find the same nothing (wasted work on every clean request).
-            if !hits.is_empty() {
+            if hit_count > 0 {
                 // Re-run detectors with sentinels stripped so their kind:HEX content
                 // can't false-positive. A surviving match means masking missed it —
                 // block rather than forward plaintext secrets.
@@ -285,7 +313,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
                     // Record before blocking so the dashboard counts this request.
                     ctx.audit.record_request(
                         &request_id,
-                        hits.len(),
+                        hit_count,
                         &kinds,
                         body_bytes.len(),
                         masked.len(),
@@ -304,7 +332,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
 
             ctx.audit.record_request(
                 &request_id,
-                hits.len(),
+                hit_count,
                 &kinds,
                 body_bytes.len(),
                 masked.len(),
@@ -573,5 +601,34 @@ mod tests {
                 .unwrap_err()
                 .contains("PROMTECT_PORT")
         );
+    }
+
+    /// The composition seam: `compose_matches` returns exactly the core's detect()
+    /// output when there is no extra pass, and merges an extra (Pro) pass on top
+    /// when one is set. This is how the proxy injects promtect-pro's detectors.
+    #[test]
+    fn compose_matches_merges_extra_pass() {
+        let text = "key AKIAIOSFODNN7EXAMPLE and CUSTOMSECRET here";
+        let base = super::detect::detect(text).len();
+
+        // None -> exactly the core detectors (public-proxy behavior is unchanged).
+        assert_eq!(super::compose_matches(text, &None).len(), base);
+
+        // An extra pass adds its own matches on top of the core's.
+        let extra: super::ExtraDetector = std::sync::Arc::new(|t: &str| {
+            t.find("CUSTOMSECRET")
+                .map(|i| {
+                    vec![super::detect::Match::new(
+                        "custom",
+                        "CUSTOMSECRET".to_string(),
+                        i,
+                        i + "CUSTOMSECRET".len(),
+                    )]
+                })
+                .unwrap_or_default()
+        });
+        let composed = super::compose_matches(text, &Some(extra));
+        assert_eq!(composed.len(), base + 1);
+        assert!(composed.iter().any(|m| m.kind == "custom"));
     }
 }

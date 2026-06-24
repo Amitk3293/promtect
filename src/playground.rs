@@ -94,6 +94,7 @@ pub async fn run() {
         max_body_bytes: proxy::DEFAULT_MAX_BODY_BYTES,
         restore: true,
         requests: Arc::new(AtomicU64::new(0)),
+        extra_detect: None,
     };
     let promtect_url = match spawn(proxy::app(ctx)).await {
         Ok(u) => u,

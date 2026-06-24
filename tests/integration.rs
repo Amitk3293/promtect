@@ -45,6 +45,7 @@ async fn canary_secret_never_reaches_upstream() {
         max_body_bytes: promtect::proxy::DEFAULT_MAX_BODY_BYTES,
         restore: true,
         requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        extra_detect: None,
     };
     let promtect_url = spawn(app(ctx)).await;
 
