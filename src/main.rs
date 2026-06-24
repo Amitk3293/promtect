@@ -243,7 +243,7 @@ async fn main() {
     let upstream_for_log = upstream.clone();
     let ctx = Ctx {
         upstream,
-        audit: Arc::new(audit::Audit::to_file(audit_path.into())),
+        audit: Arc::new(audit::Audit::to_file(audit_path)),
         client: promtect::net::http_client(),
         max_body_bytes,
         restore,

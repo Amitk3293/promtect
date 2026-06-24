@@ -15,7 +15,7 @@ use promtect::audit::Audit;
 /// and `record` must swallow the error (fail-open).
 #[test]
 fn record_into_unwritable_path_does_not_panic() {
-    let audit = Audit::to_file("/proc/promtect-nonexistent/audit.jsonl".into());
+    let audit = Audit::to_file("/proc/promtect-nonexistent/audit.jsonl");
     // Multiple calls also exercise the one-shot warning path without panicking.
     audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "req-1");
     audit.record("unmask", "aws_key", "«promtect:aws_key:0001»", "req-1");
@@ -24,7 +24,7 @@ fn record_into_unwritable_path_does_not_panic() {
 /// `record_request` against a guaranteed-unwritable absolute path must not panic.
 #[test]
 fn record_request_into_unwritable_path_does_not_panic() {
-    let audit = Audit::to_file("/proc/promtect-nonexistent/audit.jsonl".into());
+    let audit = Audit::to_file("/proc/promtect-nonexistent/audit.jsonl");
     audit.record_request("req-1", 3, &["aws_key", "jwt"], 1024, 1000);
     audit.record_request("req-2", 0, &[], 10, 10);
 }
