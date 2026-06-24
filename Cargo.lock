@@ -870,7 +870,11 @@ dependencies = [
 
 [[package]]
 name = "promtect"
+<<<<<<< HEAD
+version = "0.1.21"
+=======
 version = "0.1.18"
+>>>>>>> origin/staging
 dependencies = [
  "axum",
  "bytes",
