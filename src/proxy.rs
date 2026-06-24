@@ -491,6 +491,10 @@ mod tests {
             "http://localhost:11434"
         );
         assert_eq!(
+            resolve_upstream(Some("ollama-cloud"), None).unwrap(),
+            "https://ollama.com"
+        );
+        assert_eq!(
             resolve_upstream(Some("openrouter"), None).unwrap(),
             "https://openrouter.ai"
         );
