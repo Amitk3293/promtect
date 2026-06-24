@@ -158,6 +158,38 @@ pub fn parse_port(var_name: &str, value: Option<&str>, default: u16) -> Result<u
     }
 }
 
+/// Resolves when SIGINT (Ctrl-C) or, on Unix, SIGTERM is received.
+///
+/// Pass this as the `with_graceful_shutdown` future on every `axum::serve`
+/// call so both signal types trigger a clean connection drain. A failure to
+/// register a signal handler is intentionally ignored: the process can still
+/// be killed externally, and a missing handler must never block the masking
+/// path (fail-open on auxiliary infrastructure).
+pub async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                ctrl_c.await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    ctrl_c.await;
+}
+
 async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     ctx.requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

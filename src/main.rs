@@ -5,6 +5,11 @@ use promtect::{
     proxy::{self, Ctx},
 };
 
+// Re-export shutdown_signal from the library so the binary uses a single
+// implementation.  The function is defined in promtect::proxy where it is
+// also callable from guard.rs and test code.
+use promtect::proxy::shutdown_signal;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -176,7 +181,12 @@ async fn main() {
                 bind.as_str()
             }
         );
-        if let Err(e) = axum::serve(listener, app).await {
+        // Drain in-flight dashboard requests on Ctrl-C / SIGTERM before
+        // exiting, so partial metric responses aren't silently cut off.
+        if let Err(e) = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+        {
             eprintln!("promtect dashboard: server error: {e}");
             std::process::exit(1);
         }
@@ -243,7 +253,7 @@ async fn main() {
     let upstream_for_log = upstream.clone();
     let ctx = Ctx {
         upstream,
-        audit: Arc::new(audit::Audit::to_file(audit_path.into())),
+        audit: Arc::new(audit::Audit::to_file(audit_path)),
         client: promtect::net::http_client(),
         max_body_bytes,
         restore,
@@ -315,7 +325,13 @@ async fn main() {
                             audit_path: Arc::new(audit_path_for_dash.as_str().into()),
                         });
                         tokio::task::spawn(async move {
-                            if let Err(e) = axum::serve(dash_listener, dash_app).await {
+                            // Graceful drain: stop accepting new dashboard
+                            // connections on signal before the main proxy
+                            // shuts down, so metrics pages aren't cut mid-stream.
+                            if let Err(e) = axum::serve(dash_listener, dash_app)
+                                .with_graceful_shutdown(shutdown_signal())
+                                .await
+                            {
                                 eprintln!("promtect: dashboard error: {e}");
                             }
                         });
@@ -339,15 +355,10 @@ async fn main() {
         "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}{dash_note}\n  upstream risk: {risk_note}",
         risk_note = risk.note,
     );
-    // Graceful shutdown on Ctrl-C: stop accepting new connections and let
-    // in-flight requests drain, rather than dropping mid-stream restores. A
-    // failed ctrl_c handler simply means we never trigger shutdown (the process
-    // can still be killed), so the error is intentionally ignored.
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
+    // Graceful shutdown on SIGINT / SIGTERM: stop accepting new connections
+    // and let in-flight requests drain rather than dropping mid-stream restores.
     if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(shutdown_signal())
         .await
     {
         eprintln!("promtect: server error: {e}");

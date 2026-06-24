@@ -31,9 +31,12 @@ pub struct Audit {
 }
 
 impl Audit {
-    pub fn to_file(path: PathBuf) -> Self {
+    pub fn to_file(path: impl Into<PathBuf>) -> Self {
         Audit {
-            sink: Mutex::new(Some(FileSink { path, handle: None })),
+            sink: Mutex::new(Some(FileSink {
+                path: path.into(),
+                handle: None,
+            })),
             warned: AtomicBool::new(false),
         }
     }
@@ -305,7 +308,7 @@ mod tests {
     /// writes occur. Pointed at an unwritable path so every write fails.
     #[test]
     fn write_failure_warns_once_and_stays_fail_open() {
-        let audit = Audit::to_file("/proc/promtect-nonexistent/audit.jsonl".into());
+        let audit = Audit::to_file("/proc/promtect-nonexistent/audit.jsonl");
         assert!(!audit.warned.load(Ordering::Relaxed));
         audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "req-1");
         assert!(
