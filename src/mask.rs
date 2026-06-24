@@ -8,20 +8,67 @@ use crate::vault::Vault;
 /// Replace every detected secret in `text` with its vault sentinel.
 /// Records one audit event per unique sentinel (not per occurrence). Returns the masked text.
 pub fn mask_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) -> String {
-    // detect() returns non-overlapping spans sorted by start. Splice from the END
-    // so earlier byte offsets stay valid as we mutate the string.
-    let mut matches = detect::detect(text);
-    matches.sort_by_key(|m| std::cmp::Reverse(m.start));
+    mask_with_matches(text, detect::detect(text), vault, audit, request_id)
+}
+
+/// Mask `text` using an externally supplied match list — the core detectors plus
+/// any extra detection passes a downstream binary (`promtect-pro`) adds. This is
+/// the composition seam: a Pro build runs `detect()`, appends its own
+/// `Match::new(..)` values, and masks the merged list here.
+///
+/// Unlike [`detect`], a merged list may be unsorted and may contain OVERLAPPING
+/// spans (an entropy pass flagging part of a known key, say). Overlapping spans
+/// are coalesced into their union before splicing, so no secret tail is ever left
+/// unmasked and `replace_range` never sees an invalid range. A non-overlapping
+/// input (the core's own `detect()` output) passes through unchanged.
+///
+/// Records one audit event per unique sentinel (not per occurrence): conversation
+/// history repeats the same value, producing one sentinel but many occurrences.
+pub fn mask_with_matches(
+    text: &str,
+    mut matches: Vec<detect::Match>,
+    vault: &Vault,
+    audit: &Audit,
+    request_id: &str,
+) -> String {
+    if matches.is_empty() {
+        return text.to_string();
+    }
+    matches.sort_by_key(|m| m.start);
+    // Coalesce overlapping spans into union spans; the union takes the kind of the
+    // first contributing match. Adjacent non-overlapping spans stay separate.
+    let mut merged: Vec<(usize, usize, &'static str)> = Vec::with_capacity(matches.len());
+    for m in &matches {
+        // A downstream pass could hand us an out-of-range or non-char-boundary
+        // span. Masking a request body must NEVER panic (CLAUDE.md invariant), and
+        // `&text[start..end]` below would panic on a bad span, so skip it and record
+        // a value-free audit event instead. The core's own detect() always yields
+        // valid spans, so this only guards externally-composed matches.
+        if m.start >= m.end
+            || m.end > text.len()
+            || !text.is_char_boundary(m.start)
+            || !text.is_char_boundary(m.end)
+        {
+            audit.record("mask_skip", m.kind, "«invalid-span»", request_id);
+            continue;
+        }
+        match merged.last_mut() {
+            Some(last) if m.start < last.1 => {
+                if m.end > last.1 {
+                    last.1 = m.end;
+                }
+            }
+            _ => merged.push((m.start, m.end, m.kind)),
+        }
+    }
+    // Splice from the END so earlier byte offsets stay valid as we mutate.
     let mut out = text.to_string();
-    // Track sentinels already audited this call: conversation history causes the same
-    // value to appear many times in one request body, producing one sentinel but many
-    // occurrences. Audit once per unique sentinel, not once per occurrence.
     let mut audited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for m in matches {
-        let sentinel = vault.sentinel_for(m.kind, &m.value);
-        out.replace_range(m.start..m.end, &sentinel);
+    for (start, end, kind) in merged.into_iter().rev() {
+        let sentinel = vault.sentinel_for(kind, &text[start..end]);
+        out.replace_range(start..end, &sentinel);
         if audited.insert(sentinel.clone()) {
-            audit.record("mask", m.kind, &sentinel, request_id);
+            audit.record("mask", kind, &sentinel, request_id);
         }
     }
     out
@@ -145,6 +192,77 @@ mod tests {
         assert!(masked.contains("«promtect:aws_key:"));
         let restored = restore_text(&masked, &vault, &audit, "req1");
         assert_eq!(restored, original);
+    }
+
+    /// Composition seam: a downstream binary (promtect-pro) runs the core
+    /// detectors AND its own extra passes, building matches via `Match::new`,
+    /// then masks the merged list through `mask_with_matches`. Masking the
+    /// merged list must round-trip byte-for-byte.
+    #[test]
+    fn mask_with_external_matches_round_trips() {
+        let vault = Vault::new();
+        let audit = Audit::null();
+        let text = "core AKIAIOSFODNN7EXAMPLE and custom CUSTOMTOKEN123 here";
+        let mut matches = detect::detect(text); // core finds the AWS key
+        let s = text.find("CUSTOMTOKEN123").unwrap();
+        matches.push(detect::Match::new(
+            "custom",
+            "CUSTOMTOKEN123".to_string(),
+            s,
+            s + "CUSTOMTOKEN123".len(),
+        ));
+        let masked = mask_with_matches(text, matches, &vault, &audit, "req");
+        assert!(
+            !masked.contains("AKIAIOSFODNN7EXAMPLE"),
+            "core secret leaked"
+        );
+        assert!(!masked.contains("CUSTOMTOKEN123"), "external secret leaked");
+        assert_eq!(restore_text(&masked, &vault, &audit, "req"), text);
+    }
+
+    /// An extra pass (e.g. entropy) may flag a span that OVERLAPS a core match.
+    /// `mask_with_matches` must coalesce overlaps rather than splice invalid
+    /// ranges — no panic, no leak, exact round-trip.
+    #[test]
+    fn mask_with_overlapping_matches_round_trips() {
+        let vault = Vault::new();
+        let audit = Audit::null();
+        let text = "tok AKIAIOSFODNN7EXAMPLE end";
+        let k = text.find("AKIAIOSFODNN7EXAMPLE").unwrap();
+        let mut matches = detect::detect(text); // full AWS key span
+        // overlapping shorter span inside the key
+        matches.push(detect::Match::new(
+            "entropy",
+            "IOSFODNN7".to_string(),
+            k + 4,
+            k + 13,
+        ));
+        let masked = mask_with_matches(text, matches, &vault, &audit, "req");
+        assert!(
+            !masked.contains("AKIAIOSFODNN7EXAMPLE"),
+            "secret leaked through overlap"
+        );
+        assert_eq!(restore_text(&masked, &vault, &audit, "req"), text);
+    }
+
+    /// A downstream pass could hand `mask_with_matches` an out-of-range or
+    /// non-char-boundary span. Masking must NOT panic (CLAUDE.md): the bad span is
+    /// skipped, valid matches still mask, and the body round-trips.
+    #[test]
+    fn mask_with_matches_skips_invalid_spans_without_panicking() {
+        let vault = Vault::new();
+        let audit = Audit::null();
+        let text = "emoji 😀 then AKIAIOSFODNN7EXAMPLE"; // 😀 is 4 UTF-8 bytes
+        let e = text.find('😀').unwrap();
+        let mut matches = detect::detect(text); // valid AWS key span
+        // span landing INSIDE the emoji's bytes — not a char boundary
+        matches.push(detect::Match::new("bogus", "x".to_string(), e + 1, e + 2));
+        let masked = mask_with_matches(text, matches, &vault, &audit, "req");
+        assert!(
+            !masked.contains("AKIAIOSFODNN7EXAMPLE"),
+            "valid match must still mask"
+        );
+        assert_eq!(restore_text(&masked, &vault, &audit, "req"), text);
     }
 
     /// Restore is single-pass: if one secret's VALUE equals another secret's
