@@ -1016,8 +1016,8 @@ mod tests {
         // non-space suffix should be in the captured group, not the spaces.
         let hits = detect("API_SECRET = hunter2season   ");
         assert!(
-            hits.iter().any(|m| m.kind == "env_secret"
-                && m.value.as_str() == "hunter2season"),
+            hits.iter()
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "hunter2season"),
             "trailing spaces must be stripped from captured value; got: {:?}",
             hits
         );
@@ -1032,15 +1032,13 @@ mod tests {
         // captured value, not `mysecretpass123&other=val`.
         let hits = detect("password=mysecretpass123&other=val");
         assert!(
-            hits.iter().any(|m| m.kind == "env_secret"
-                && m.value.as_str() == "mysecretpass123"),
+            hits.iter()
+                .any(|m| m.kind == "env_secret" && m.value.as_str() == "mysecretpass123"),
             "& must terminate unquoted capture; got: {:?}",
             hits
         );
         assert!(
-            !hits
-                .iter()
-                .any(|m| m.value.as_str().contains('&')),
+            !hits.iter().any(|m| m.value.as_str().contains('&')),
             "captured value must not span & separator; got: {:?}",
             hits
         );
@@ -1048,9 +1046,7 @@ mod tests {
         // Same check for `;` separator (used in some form-urlencoded dialects).
         let hits2 = detect("password=mysecretpass123;other=val");
         assert!(
-            !hits2
-                .iter()
-                .any(|m| m.value.as_str().contains(';')),
+            !hits2.iter().any(|m| m.value.as_str().contains(';')),
             "captured value must not span ; separator; got: {:?}",
             hits2
         );
