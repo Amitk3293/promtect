@@ -262,6 +262,7 @@ async fn main() {
         max_body_bytes,
         restore,
         requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        extra_detect: None,
     };
 
     let app = proxy::app(ctx);
