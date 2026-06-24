@@ -39,6 +39,19 @@ pub fn mask_with_matches(
     // first contributing match. Adjacent non-overlapping spans stay separate.
     let mut merged: Vec<(usize, usize, &'static str)> = Vec::with_capacity(matches.len());
     for m in &matches {
+        // A downstream pass could hand us an out-of-range or non-char-boundary
+        // span. Masking a request body must NEVER panic (CLAUDE.md invariant), and
+        // `&text[start..end]` below would panic on a bad span, so skip it and record
+        // a value-free audit event instead. The core's own detect() always yields
+        // valid spans, so this only guards externally-composed matches.
+        if m.start >= m.end
+            || m.end > text.len()
+            || !text.is_char_boundary(m.start)
+            || !text.is_char_boundary(m.end)
+        {
+            audit.record("mask_skip", m.kind, "«invalid-span»", request_id);
+            continue;
+        }
         match merged.last_mut() {
             Some(last) if m.start < last.1 => {
                 if m.end > last.1 {
@@ -228,6 +241,26 @@ mod tests {
         assert!(
             !masked.contains("AKIAIOSFODNN7EXAMPLE"),
             "secret leaked through overlap"
+        );
+        assert_eq!(restore_text(&masked, &vault, &audit, "req"), text);
+    }
+
+    /// A downstream pass could hand `mask_with_matches` an out-of-range or
+    /// non-char-boundary span. Masking must NOT panic (CLAUDE.md): the bad span is
+    /// skipped, valid matches still mask, and the body round-trips.
+    #[test]
+    fn mask_with_matches_skips_invalid_spans_without_panicking() {
+        let vault = Vault::new();
+        let audit = Audit::null();
+        let text = "emoji 😀 then AKIAIOSFODNN7EXAMPLE"; // 😀 is 4 UTF-8 bytes
+        let e = text.find('😀').unwrap();
+        let mut matches = detect::detect(text); // valid AWS key span
+        // span landing INSIDE the emoji's bytes — not a char boundary
+        matches.push(detect::Match::new("bogus", "x".to_string(), e + 1, e + 2));
+        let masked = mask_with_matches(text, matches, &vault, &audit, "req");
+        assert!(
+            !masked.contains("AKIAIOSFODNN7EXAMPLE"),
+            "valid match must still mask"
         );
         assert_eq!(restore_text(&masked, &vault, &audit, "req"), text);
     }
