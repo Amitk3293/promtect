@@ -243,15 +243,17 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         //
         // Fix #45: the unquoted value capture now allows internal spaces/tabs
         // while still anchoring both edges to non-whitespace chars:
-        //   first char : [^\s"',}\\\n\r«»]  — no whitespace, no terminator
-        //   middle 6+  : [^"',}\\\n\r«»]+   — terminators excluded, spaces OK
-        //   last char  : [^\s"',}\\\n\r«»]  — greedy backtrack strips trailing space
+        //   first char : [^\s"',}\\\n\r«»]    — no whitespace, no terminator
+        //   middle 6+  : [^"',}\\\n\r«»&;]+   — terminators + URL param separators
+        //                                        excluded, internal spaces OK
+        //   last char  : [^\s"',}\\\n\r«»]    — greedy backtrack strips trailing space
         // Minimum length is 1 + 6 + 1 = 8, matching the previous `{8,}` floor.
         // Real newlines (\n/\r) are hard-excluded from the middle so one match
-        // cannot span multiple lines and absorb adjacent secrets into one sentinel.
+        // cannot span multiple lines. `&` and `;` are excluded so URL-encoded bodies
+        // (`password=secret&other=val`) do not merge adjacent params into one sentinel.
         dg(
             "env_secret",
-            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\\n\r«»][^"',}\\\n\r«»]{6,}[^\s"',}\\\n\r«»])"#,
+            r#"(?i)[a-z0-9_]*(?:password|passwd|pwd|secret[_-]?key|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|credentials?)["']?\s*[:=]\s*["']?([^\s"',}\\\n\r«»&;][^"',}\\\n\r«»&;]{6,}[^\s"',}\\\n\r«»&;])"#,
             1,
             Some(looks_like_placeholder),
         ),
@@ -1018,6 +1020,39 @@ mod tests {
                 && m.value.as_str() == "hunter2season"),
             "trailing spaces must be stripped from captured value; got: {:?}",
             hits
+        );
+    }
+
+    /// Regression: `&` and `;` are URL-encoded param separators; they must
+    /// terminate the unquoted capture so adjacent fields are not merged into
+    /// one sentinel, which would corrupt the body on restore.
+    #[test]
+    fn env_secret_unquoted_stops_at_url_encoded_separators() {
+        // `password=mysecretpass123&other=val` — `mysecretpass123` must be the
+        // captured value, not `mysecretpass123&other=val`.
+        let hits = detect("password=mysecretpass123&other=val");
+        assert!(
+            hits.iter().any(|m| m.kind == "env_secret"
+                && m.value.as_str() == "mysecretpass123"),
+            "& must terminate unquoted capture; got: {:?}",
+            hits
+        );
+        assert!(
+            !hits
+                .iter()
+                .any(|m| m.value.as_str().contains('&')),
+            "captured value must not span & separator; got: {:?}",
+            hits
+        );
+
+        // Same check for `;` separator (used in some form-urlencoded dialects).
+        let hits2 = detect("password=mysecretpass123;other=val");
+        assert!(
+            !hits2
+                .iter()
+                .any(|m| m.value.as_str().contains(';')),
+            "captured value must not span ; separator; got: {:?}",
+            hits2
         );
     }
 }
