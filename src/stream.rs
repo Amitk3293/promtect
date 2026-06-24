@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! Streaming secret restoration.
 //!
 //! The proxy must not buffer the whole upstream response before restoring

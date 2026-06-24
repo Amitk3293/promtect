@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 use rand::RngCore;
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};

@@ -8,7 +8,12 @@ and auto-generated notes also live on the
 
 ## [Unreleased]
 
-- Nothing yet.
+### Changed
+- **Relicensed the core from Apache-2.0 to the Sustainable Use License (SUL v1.0)**,
+  a fair-code, source-available license. Free for internal business, personal, and
+  non-commercial use; no reselling or paid redistribution. Past Apache-2.0 releases
+  (≤ v0.1.23) remain Apache-2.0. Licensor is AK DevOps Solutions SL. See `LICENSE`,
+  `NOTICE`, `COMMERCIAL.md`, and `TRADEMARK.md`.
 
 ## [0.1.7]
 

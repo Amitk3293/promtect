@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! Local, offline observability server: the dashboard UI, a JSON metrics API,
 //! and a Prometheus `/metrics` endpoint — all derived from the value-free audit log.
 //!

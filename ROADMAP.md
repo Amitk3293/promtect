@@ -7,7 +7,9 @@ direction, not a delivery contract. Have a need that's not here? Open an issue.
 
 **The free core stays free.** Everything that ships in this repo — the proxy, the
 71 known-format detectors, mask + restore, strict mode, the value-free audit log
-and dashboard — is Apache-2.0 and always will be. Paid work is a *different class*
+and dashboard — is licensed under the Sustainable Use License (fair-code,
+source-available), free to use, modify, and self-host, and always will be. Paid
+work is a *different class*
 of detection and team tooling built on top, never a paywall around what's here.
 
 ## Shipped (v0.1)

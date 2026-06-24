@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! Promtect library crate — the masking pipeline (detect → vault → mask), the
 //! loopback proxy, the value-free audit log, small net helpers, and the local
 //! observability dashboard. Both the binary (`main.rs`) and the integration

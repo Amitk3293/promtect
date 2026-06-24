@@ -109,7 +109,7 @@ standalone to tail an existing audit log without starting a proxy.
 | Secrets wiped from memory (Rust + zeroize) | ✅ | ❌ | ❌ |
 | Value-free audit log | ✅ | ❌ logs to SQLite | ❌ |
 | Runs locally / no cloud | ✅ | ✅ | ❌ server-side |
-| Open source | ✅ Apache-2.0 | ✅ | ✅ |
+| Source available | ✅ SUL (fair-code) | ✅ | ✅ |
 
 **The gap no one else fills:** other tools hand the model `[REDACTED]` and you
 get useless code back. Promtect is the only one that can restore, and it lets
@@ -334,4 +334,18 @@ mask → forward → restore round-trip against a mock upstream.
 
 ## License
 
-Apache-2.0, open source, all of it.
+Promtect is **open-core**.
+
+The core in this repo (the proxy and all 71 known-secret detectors) is licensed under
+the **Sustainable Use License**, a fair-code, source-available license. It is free for
+internal business, personal, and non-commercial use. You can read, run, modify, and
+self-host it. You cannot resell it or run it as a paid service for others. Full terms
+in [LICENSE](LICENSE).
+
+Paid detector classes (entropy, PII/PHI/PCI, output scanning) and enterprise features
+are a separate product under a commercial license. See [COMMERCIAL.md](COMMERCIAL.md).
+
+"Promtect" is a trademark of AK DevOps Solutions SL. See [TRADEMARK.md](TRADEMARK.md).
+
+Source-available and fair-code, not OSI "open source". Copyright 2026 AK DevOps
+Solutions SL.

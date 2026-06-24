@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! `promtect guard <tool>` — run an AI coding tool inside a one-command protected
 //! session.
 //!
@@ -85,6 +88,8 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
     let mut exec_base_var: Option<String> = None;
     let mut exec_base_path: Option<String> = None;
     let mut exec_mode: Option<String> = None;
+    // `--cloud` targets Ollama Cloud (ollama.com) instead of the local daemon.
+    let mut cloud = false;
     let mut tool_args: Vec<String> = Vec::new();
 
     while i < args.len() {
@@ -96,6 +101,7 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
             }
             "--strict" => strict = true,
             "--openrouter" => openrouter = true,
+            "--cloud" => cloud = true,
             "--headroom" => headroom = Some(HEADROOM_DEFAULT.to_string()),
             "--upstream" => {
                 upstream_override = Some(next_value(args, i, "--upstream")?.to_string());
@@ -158,6 +164,10 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
     {
         return Err("--base-var/--base-path/--mode are only valid with --exec".to_string());
     }
+    // --cloud only changes the Ollama upstream; on any other tool it would do nothing.
+    if cloud && tool != Some("ollama") {
+        return Err("--cloud is only valid with ollama".to_string());
+    }
 
     // ── per-tool wiring (verified against each tool's docs) ──────────────────
     let (base_var, base_path, mode): (String, String, String) = match tool {
@@ -181,7 +191,10 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
             if openrouter {
                 return Err("--openrouter is not valid with ollama".to_string());
             }
-            ("OLLAMA_HOST".into(), String::new(), "ollama".into())
+            // `--cloud` swaps the upstream to ollama.com; explicit --upstream/--headroom
+            // still win below, since mode is the lowest-priority upstream source.
+            let m = if cloud { "ollama-cloud" } else { "ollama" };
+            ("OLLAMA_HOST".into(), String::new(), m.into())
         }
         // Aider reads OPENAI_API_BASE for its OpenAI-compatible endpoint (LiteLLM
         // under the hood). For OpenRouter just chain via --upstream or --exec.
@@ -260,6 +273,7 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
         "--mode",
         "--base-var",
         "--base-path",
+        "--cloud",
     ];
     let stray: Vec<&str> = tool_args
         .iter()
@@ -542,6 +556,26 @@ mod tests {
         assert_eq!(p.base_path, "");
         assert_eq!(p.upstream, "http://localhost:11434");
         assert_eq!(p.tool_args, vec!["run", "deepseek-r1"]);
+    }
+
+    #[test]
+    fn ollama_cloud_points_at_ollama_dot_com() {
+        let p = plan(&["ollama", "--cloud", "run", "gpt-oss:120b-cloud"]).unwrap();
+        assert_eq!(p.bin, "ollama");
+        assert_eq!(p.base_var, "OLLAMA_HOST");
+        assert_eq!(p.base_path, "");
+        assert_eq!(p.upstream, "https://ollama.com");
+        // --cloud must not be swallowed into the tool's args.
+        assert_eq!(p.tool_args, vec!["run", "gpt-oss:120b-cloud"]);
+    }
+
+    #[test]
+    fn cloud_flag_rejected_on_non_ollama_tool() {
+        let err = plan(&["codex", "--cloud"]).unwrap_err();
+        assert!(
+            err.contains("only valid with ollama"),
+            "expected ollama-only error, got {err:?}"
+        );
     }
 
     #[test]

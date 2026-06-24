@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! `promtect playground` — a self-contained, offline demo of the full
 //! mask → forward → restore round-trip.
 //!
