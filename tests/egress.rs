@@ -2,8 +2,8 @@
 //!
 //! These cover the public surface of the hardened upstream client and the
 //! off-loopback bind policy. The `public_bind_allowed` decision itself lives in
-//! the binary crate (`src/main.rs`) and is unit-tested there; here we assert the
-//! building blocks it composes from (`net::is_loopback` + `proxy::parse_truthy`)
+//! `src/run.rs` (private to that module) and is unit-tested there; here we assert
+//! the building blocks it composes from (`net::is_loopback` + `proxy::parse_truthy`)
 //! agree with that policy, plus the client construction and read-timeout parsing.
 
 use promtect::net::{http_client, is_loopback, parse_read_timeout_secs};
@@ -40,7 +40,7 @@ fn read_timeout_parsing_is_fail_safe() {
 
 /// #38: the off-loopback bind policy is `is_loopback OR truthy(opt-in)`.
 /// Mirror that composition here so the public building blocks stay in agreement
-/// with the private `public_bind_allowed` helper in `main.rs`.
+/// with the private `public_bind_allowed` helper in `run.rs`.
 #[test]
 fn off_loopback_bind_requires_explicit_optin() {
     let allowed = |bind: &str, env: Option<&str>| is_loopback(bind) || parse_truthy(env);

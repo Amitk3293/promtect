@@ -16,5 +16,6 @@ pub mod net;
 pub mod playground;
 pub mod provider;
 pub mod proxy;
+pub mod run;
 pub mod stream;
 pub mod vault;

@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-SUL-1.0
 // Copyright (c) 2026 AK DevOps Solutions SL
 
-use std::sync::Arc;
-
-use promtect::{
-    audit, dashboard,
-    proxy::{self, Ctx},
-};
+use promtect::proxy;
 
 // Re-export shutdown_signal from the library so the binary uses a single
 // implementation.  The function is defined in promtect::proxy where it is
@@ -147,11 +142,11 @@ async fn main() {
         let bind = std::env::var("PROMTECT_BIND").unwrap_or_else(|_| "127.0.0.1".into());
         // Refuse an off-loopback bind unless the operator has explicitly opted in
         // via PROMTECT_ALLOW_PUBLIC_BIND. A warn-then-bind default silently exposed
-        // the metrics endpoint off-host; fail-closed instead.
-        if !public_bind_allowed(
-            promtect::net::is_loopback(&bind),
-            std::env::var("PROMTECT_ALLOW_PUBLIC_BIND").ok().as_deref(),
-        ) {
+        // the metrics endpoint off-host; fail-closed instead. The bind decision is
+        // `loopback OR truthy(opt-in)` — the same policy run::run_proxy uses.
+        if !(promtect::net::is_loopback(&bind)
+            || proxy::parse_truthy(std::env::var("PROMTECT_ALLOW_PUBLIC_BIND").ok().as_deref()))
+        {
             eprintln!(
                 "promtect dashboard: refusing to bind non-loopback address ({bind}). The metrics \
                  endpoint would be reachable off-host.\n  Set PROMTECT_ALLOW_PUBLIC_BIND=1 to allow \
@@ -197,235 +192,13 @@ async fn main() {
         return;
     }
 
+    // ── default: the proxy + dashboard ──────────────────────────────────────
+    // The startup itself lives in promtect::run::run_proxy so a downstream binary
+    // (promtect-pro) can run the exact same proxy with an injected extra detector.
+    // The public core passes `None`, which is behavior-identical to the previous
+    // inlined startup. run_proxy returns the exit code rather than exiting itself.
     let no_dashboard = args.iter().any(|a| a == "--no-dashboard");
-
-    let port = match proxy::parse_port(
-        "PROMTECT_PORT",
-        std::env::var("PROMTECT_PORT").ok().as_deref(),
-        8790,
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("promtect: {e}");
-            std::process::exit(1);
-        }
-    };
-    // Upstream selection: PROMTECT_UPSTREAM (explicit override / chaining knob)
-    // wins; otherwise PROMTECT_MODE picks a known provider; default Anthropic.
-    let mode = std::env::var("PROMTECT_MODE").ok();
-    let upstream_override = std::env::var("PROMTECT_UPSTREAM").ok();
-    let upstream = match proxy::resolve_upstream(mode.as_deref(), upstream_override.as_deref()) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("promtect: {e}");
-            std::process::exit(1);
-        }
-    };
-    // Where does this upstream send data, and is it rotate-worthy? Classify it for the
-    // startup banner, and honor PROMTECT_BLOCK_RISKY (fail-closed: refuse high-risk
-    // upstreams like DeepSeek or an unverified unknown host).
-    let risk = promtect::provider::classify(&upstream);
-    let block_risky = proxy::parse_truthy(std::env::var("PROMTECT_BLOCK_RISKY").ok().as_deref());
-    if promtect::provider::is_blocked(&risk, block_risky) {
-        eprintln!(
-            "promtect: refusing to proxy to a high-risk upstream — {note}\n  \
-             ({upstream}). Unset PROMTECT_BLOCK_RISKY to allow it.",
-            note = risk.note,
-        );
-        std::process::exit(1);
-    }
-
-    let audit_path =
-        std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
-
-    // Operator-tunable body cap (default 32 MiB); fail closed on an invalid value.
-    let max_body_bytes =
-        match proxy::parse_max_body_bytes(std::env::var("PROMTECT_MAX_BODY_BYTES").ok().as_deref())
-        {
-            Ok(n) => n,
-            Err(e) => {
-                eprintln!("promtect: {e}");
-                std::process::exit(1);
-            }
-        };
-
-    // Restore secrets in the response (transparent mode) by default; PROMTECT_RESTORE
-    // falsey → strict mode (secrets never re-enter the response).
-    let restore = proxy::parse_restore(std::env::var("PROMTECT_RESTORE").ok().as_deref());
-
-    let audit_path_for_dash = audit_path.clone();
-    let upstream_for_log = upstream.clone();
-    let ctx = Ctx {
-        upstream,
-        audit: Arc::new(audit::Audit::to_file(audit_path)),
-        client: promtect::net::http_client(),
-        max_body_bytes,
-        restore,
-        requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        extra_detect: None,
-    };
-
-    let app = proxy::app(ctx);
-    let bind = std::env::var("PROMTECT_BIND").unwrap_or_else(|_| "127.0.0.1".into());
-    let addr = format!("{bind}:{port}");
-    // Delegate to net::is_loopback so the safety decision is unit-tested in isolation.
-    let is_loopback = promtect::net::is_loopback(&bind);
-    // Refuse an off-loopback bind unless the operator has explicitly opted in via
-    // PROMTECT_ALLOW_PUBLIC_BIND. Binding the secrets proxy to a host network is a
-    // serious exposure, so fail-closed rather than warn-then-bind.
-    if !public_bind_allowed(
-        is_loopback,
-        std::env::var("PROMTECT_ALLOW_PUBLIC_BIND").ok().as_deref(),
-    ) {
-        eprintln!(
-            "promtect: refusing to bind non-loopback address ({bind}). This would expose your \
-             secrets proxy to other machines.\n  Set PROMTECT_ALLOW_PUBLIC_BIND=1 to allow this \
-             (only inside a container whose port is published to 127.0.0.1, or behind trusted \
-             network controls), or set PROMTECT_BIND=127.0.0.1."
-        );
-        std::process::exit(1);
-    }
-    // Graceful exit (not a panic/backtrace) when the port is taken.
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!(
-                "promtect: cannot bind {addr} ({e}).\n\
-                 That port is already in use — set PROMTECT_PORT to a free port and retry."
-            );
-            std::process::exit(1);
-        }
-    };
-    let hint = if is_loopback {
-        format!("http://{addr}")
-    } else {
-        format!("http://127.0.0.1:{port}")
-    };
-
-    // Auto-start the dashboard on a background task so users don't need a
-    // second process. Pass --no-dashboard to skip. Non-fatal if port taken.
-    let dash_hint = if no_dashboard {
-        None
-    } else {
-        match proxy::parse_port(
-            "PROMTECT_DASHBOARD_PORT",
-            std::env::var("PROMTECT_DASHBOARD_PORT").ok().as_deref(),
-            8799,
-        ) {
-            Err(e) => {
-                eprintln!("promtect: dashboard port config error — {e}; running without dashboard");
-                None
-            }
-            Ok(dash_port) => {
-                let dash_addr = format!("{bind}:{dash_port}");
-                match tokio::net::TcpListener::bind(&dash_addr).await {
-                    Err(e) => {
-                        eprintln!(
-                            "promtect: dashboard could not bind {dash_addr} ({e}); running without dashboard"
-                        );
-                        None
-                    }
-                    Ok(dash_listener) => {
-                        let dash_app = dashboard::app(dashboard::DashCtx {
-                            audit_path: Arc::new(audit_path_for_dash.as_str().into()),
-                        });
-                        tokio::task::spawn(async move {
-                            // Graceful drain: stop accepting new dashboard
-                            // connections on signal before the main proxy
-                            // shuts down, so metrics pages aren't cut mid-stream.
-                            if let Err(e) = axum::serve(dash_listener, dash_app)
-                                .with_graceful_shutdown(shutdown_signal())
-                                .await
-                            {
-                                eprintln!("promtect: dashboard error: {e}");
-                            }
-                        });
-                        Some(format!("http://127.0.0.1:{dash_port}"))
-                    }
-                }
-            }
-        }
-    };
-
-    let restore_note = if restore {
-        ""
-    } else {
-        "  [strict: restore off]"
-    };
-    let dash_note = dash_hint
-        .as_deref()
-        .map(|u| format!("\n  dashboard: {u}"))
-        .unwrap_or_default();
-    println!(
-        "promtect listening on {addr} (upstream: {upstream_for_log}){restore_note}\n  point your tool's base URL at {hint}{dash_note}\n  upstream risk: {risk_note}",
-        risk_note = risk.note,
-    );
-    // Graceful shutdown on SIGINT / SIGTERM: stop accepting new connections
-    // and let in-flight requests drain rather than dropping mid-stream restores.
-    if let Err(e) = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
-        eprintln!("promtect: server error: {e}");
-        std::process::exit(1);
-    }
-}
-
-/// Decide whether an off-loopback bind is permitted.
-///
-/// Loopback binds are always allowed. A non-loopback bind is only allowed when
-/// the operator has explicitly opted in via a truthy `PROMTECT_ALLOW_PUBLIC_BIND`
-/// (reusing [`proxy::parse_truthy`] so the truthiness grammar matches the rest of
-/// the config surface). Extracted as a pure function so the fail-closed decision
-/// is unit-tested without spawning a server.
-fn public_bind_allowed(is_loopback: bool, allow_env: Option<&str>) -> bool {
-    is_loopback || proxy::parse_truthy(allow_env)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loopback_bind_is_always_allowed() {
-        // Loopback is safe regardless of the opt-in flag.
-        assert!(public_bind_allowed(true, None));
-        assert!(public_bind_allowed(true, Some("0")));
-        assert!(public_bind_allowed(true, Some("1")));
-    }
-
-    #[test]
-    fn off_loopback_bind_refused_without_optin() {
-        // The default and any falsey/garbage flag must refuse a public bind.
-        for env in [
-            None,
-            Some(""),
-            Some("0"),
-            Some("false"),
-            Some("no"),
-            Some("nope"),
-        ] {
-            assert!(
-                !public_bind_allowed(false, env),
-                "off-loopback with {env:?} must be refused"
-            );
-        }
-    }
-
-    #[test]
-    fn off_loopback_bind_allowed_with_truthy_optin() {
-        // Explicit opt-in (matching parse_truthy's grammar) permits a public bind.
-        for env in [
-            Some("1"),
-            Some("true"),
-            Some("yes"),
-            Some("on"),
-            Some("TRUE"),
-        ] {
-            assert!(
-                public_bind_allowed(false, env),
-                "off-loopback with {env:?} must be allowed"
-            );
-        }
-    }
+    std::process::exit(i32::from(
+        promtect::run::run_proxy(None, no_dashboard).await,
+    ));
 }
