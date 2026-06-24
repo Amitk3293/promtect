@@ -33,7 +33,10 @@ pub struct Audit {
 impl Audit {
     pub fn to_file(path: impl Into<PathBuf>) -> Self {
         Audit {
-            sink: Mutex::new(Some(FileSink { path: path.into(), handle: None })),
+            sink: Mutex::new(Some(FileSink {
+                path: path.into(),
+                handle: None,
+            })),
             warned: AtomicBool::new(false),
         }
     }
