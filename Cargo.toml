@@ -1,9 +1,9 @@
 [package]
 name = "promtect"
-version = "0.1.23"
+version = "0.1.25"
 edition = "2024"
 description = "Local-first privacy proxy for AI coding tools: masks secrets out of outbound LLM requests and restores them in the response. No cloud, no root CA."
-license = "Apache-2.0"
+license-file = "LICENSE"
 repository = "https://github.com/amitk3293/promtect"
 homepage = "https://promtect.org"
 readme = "README.md"

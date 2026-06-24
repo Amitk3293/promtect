@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 use crate::audit::Audit;
 use crate::detect;
 use crate::vault::Vault;

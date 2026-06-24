@@ -1,12 +1,16 @@
 Promtect
-Copyright 2026 Promtect
+Copyright 2026 AK DevOps Solutions SL (ESB26575522)
+Plaça de la Llana 3-4, 08003 Barcelona, Spain
 
 This product includes software developed as the open-source core of Promtect
-(https://promtect.org), licensed under the Apache License, Version 2.0.
+(https://promtect.org), licensed under the Sustainable Use License (a fair-code,
+source-available license). See the LICENSE file for the full terms.
 
-The name "Promtect" and the Promtect logo are trademarks and are not licensed
-under the Apache License. See the trademark policy for permitted uses.
+The name "Promtect" and the Promtect logo are trademarks of AK DevOps Solutions SL
+and are not licensed under the Sustainable Use License. See TRADEMARK.md for
+permitted uses.
 
 Paid Promtect features (entropy/generic detection, PII/PHI/PCI compliance
 detection, LLM response scanning, fleet policy, and enterprise integrations)
-are NOT part of this open-source distribution and are licensed separately.
+are NOT part of this distribution and are licensed separately under a proprietary
+commercial license. See COMMERCIAL.md.

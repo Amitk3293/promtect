@@ -10,7 +10,7 @@ kinds**, before your AI tool can send them. Each secret is masked on the way out
 then restored in the reply (or kept masked in strict mode, your call). The model
 does its job on your real code; your secrets stay on your machine.
 
-**Open source. Runs entirely on your machine. No cloud, no telemetry, no root
+**Source-available. Runs entirely on your machine. No cloud, no telemetry, no root
 certificate. Secrets are never written to disk.**
 
 ![Promtect masks every secret, keys, tokens, DB passwords, before the model sees it, and restores them in the reply](docs/demo.gif)
@@ -109,7 +109,7 @@ standalone to tail an existing audit log without starting a proxy.
 | Secrets wiped from memory (Rust + zeroize) | ✅ | ❌ | ❌ |
 | Value-free audit log | ✅ | ❌ logs to SQLite | ❌ |
 | Runs locally / no cloud | ✅ | ✅ | ❌ server-side |
-| Open source | ✅ Apache-2.0 | ✅ | ✅ |
+| Source available | ✅ SUL (fair-code) | ✅ | ✅ |
 
 **The gap no one else fills:** other tools hand the model `[REDACTED]` and you
 get useless code back. Promtect is the only one that can restore, and it lets
@@ -127,19 +127,23 @@ and tears it down on exit, no manual env-var wiring:
 
 ```sh
 promtect guard claude                     # Claude Code, secrets masked → Anthropic
-promtect guard codex "fix the s3 upload"   # Codex → OpenAI
-promtect guard ollama run deepseek-r1      # Ollama CLI → masked → local Ollama server
-promtect guard aider --model openai/gpt-5.5 # Aider → masked → OpenAI-compatible
-promtect guard claude --headroom           # chain Headroom: mask → compress → Anthropic
-promtect guard codex --strict              # never re-insert secrets in the response
+promtect guard codex                      # Codex → OpenAI
+promtect guard ollama run deepseek-r1     # local Ollama, nothing leaves your box
+promtect guard ollama --cloud run gpt-oss:120b-cloud   # Ollama Cloud → masked → ollama.com
+promtect guard aider --model openai/gpt-5.5  # Aider → masked → OpenAI-compatible
+promtect guard claude --headroom          # chain Headroom: mask → compress → Anthropic
+promtect guard codex --strict             # never re-insert secrets in the response
 promtect guard --exec <tool> --base-var OPENAI_API_BASE --base-path /v1   # wrap any tool
 ```
 
-Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY`) flow through untouched,
-Promtect only masks the request body. The base URL each tool needs is set for you
-(`ANTHROPIC_BASE_URL` for Claude, `OPENAI_BASE_URL` for Codex, `OLLAMA_HOST` for
-Ollama). Combine with [Headroom](https://github.com/chopratejas/headroom) for
-secrets-safe **and** ~90% cheaper sessions.
+Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OLLAMA_API_KEY`) flow
+through untouched, Promtect only masks the request body. The base URL each tool
+needs is set for you (`ANTHROPIC_BASE_URL` for Claude, `OPENAI_BASE_URL` for Codex,
+`OLLAMA_HOST` for Ollama). Local Ollama runs on your own machine, so there is little
+to protect; `--cloud` points it at `ollama.com`, where your prompt leaves the box and
+masking earns its keep. Combine with
+[Headroom](https://github.com/chopratejas/headroom) for secrets-safe **and** ~90%
+cheaper sessions.
 
 ---
 
@@ -334,4 +338,18 @@ mask → forward → restore round-trip against a mock upstream.
 
 ## License
 
-Apache-2.0, open source, all of it.
+Promtect is **open-core**.
+
+The core in this repo (the proxy and all 71 known-secret detectors) is licensed under
+the **Sustainable Use License**, a fair-code, source-available license. It is free for
+internal business, personal, and non-commercial use. You can read, run, modify, and
+self-host it. You cannot resell it or run it as a paid service for others. Full terms
+in [LICENSE](LICENSE).
+
+Paid detector classes (entropy, PII/PHI/PCI, output scanning) and enterprise features
+are a separate product under a commercial license. See [COMMERCIAL.md](COMMERCIAL.md).
+
+"Promtect" is a trademark of AK DevOps Solutions SL. See [TRADEMARK.md](TRADEMARK.md).
+
+Source-available and fair-code, not OSI "open source". Copyright 2026 AK DevOps
+Solutions SL.

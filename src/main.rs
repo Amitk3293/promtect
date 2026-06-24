@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 use std::sync::Arc;
 
 use promtect::{
@@ -41,7 +44,7 @@ async fn main() {
             "    PROMTECT_PORT              Proxy bind port (default 8790)\n",
             "    PROMTECT_BIND              Proxy bind address (default 127.0.0.1)\n",
             "    PROMTECT_ALLOW_PUBLIC_BIND Allow non-loopback bind (default false)\n",
-            "    PROMTECT_MODE              anthropic|openai|ollama|openrouter (default anthropic)\n",
+            "    PROMTECT_MODE              anthropic|openai|ollama|ollama-cloud|openrouter (default anthropic)\n",
             "    PROMTECT_UPSTREAM          Explicit upstream URL (overrides mode)\n",
             "    PROMTECT_RESTORE           Restore sentinels in response (default true)\n",
             "    PROMTECT_BLOCK_RISKY       Block high-risk upstreams (default false)\n",
@@ -104,8 +107,9 @@ async fn main() {
     // One-command protected session: start an ephemeral proxy, point the tool at
     // it, run the tool with the user's args, tear down on exit.
     //   promtect guard claude
-    //   promtect guard codex "fix the s3 upload"
+    //   promtect guard codex
     //   promtect guard ollama run deepseek-r1
+    //   promtect guard ollama --cloud run gpt-oss:120b-cloud
     //   promtect guard aider --model openai/gpt-5.5
     //   promtect guard claude --headroom
     if args.get(1).map(|s| s.as_str()) == Some("guard") {
@@ -115,7 +119,7 @@ async fn main() {
                 eprintln!(
                     "promtect guard: {e}\n\
                      usage: promtect guard <claude|codex|ollama|aider|--exec CMD> \
-                     [--headroom[=URL]] [--openrouter] [--upstream URL] [--strict] \
+                     [--cloud] [--headroom[=URL]] [--openrouter] [--upstream URL] [--strict] \
                      [--port N] [-- TOOL_ARGS...]"
                 );
                 std::process::exit(2);

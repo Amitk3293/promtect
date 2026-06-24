@@ -32,7 +32,7 @@ class Promtect < Formula
   desc "Mask secrets out of AI coding tool requests before they reach the model"
   homepage "https://promtect.org"
   version "${ver}"
-  license "Apache-2.0"
+  license :cannot_represent
 
   on_macos do
     on_arm do

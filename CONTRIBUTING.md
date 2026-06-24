@@ -42,7 +42,8 @@ registry. Two helpers build an entry:
 
 ## What belongs here
 
-All the credential/key/token detectors here are open source. Adding a new
+All the credential/key/token detectors here are part of the source-available core.
+Adding a new
 known-format detector is the most valuable contribution you can make.
 
 ## Code standards
@@ -60,7 +61,22 @@ Use the issue templates. For security vulnerabilities, follow
 
 ## Contributor License Agreement
 
-Contributors are asked to agree to the project CLA (a bot will prompt you on your
-first PR). You retain copyright to your contribution.
+Promtect is open-core: the core ships under the Sustainable Use License (see
+[LICENSE](LICENSE)) and AK DevOps Solutions SL also offers paid editions under a
+separate commercial license (see [COMMERCIAL.md](COMMERCIAL.md)). For that model to
+work, the maintainer must be able to license every contribution under both.
 
-By contributing you agree your work is licensed under Apache-2.0.
+By submitting a contribution (a pull request, a patch, or any other work) you:
+
+1. **Certify origin.** You wrote it, or have the right to submit it, under the
+   [Developer Certificate of Origin](https://developercertificate.org).
+2. **Grant a dual-license right.** You license your contribution to AK DevOps
+   Solutions SL under the Sustainable Use License, and you grant AK DevOps Solutions
+   SL a perpetual, worldwide, irrevocable, royalty-free right to also license your
+   contribution under other terms, including proprietary commercial terms, without
+   further notice or compensation.
+3. **Keep your copyright.** This is a license grant, not an assignment. You retain
+   copyright to your contribution.
+
+Sign off each commit with `git commit -s` (it adds a `Signed-off-by:` line) to
+record your agreement. A CLA-assistant bot will confirm on your first PR.

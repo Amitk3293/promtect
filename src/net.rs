@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! Network-address helpers for deciding how Promtect may bind, plus the
 //! upstream HTTP client construction.
 

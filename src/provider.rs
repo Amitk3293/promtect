@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! Per-upstream data-handling risk.
 //!
 //! Promtect masks known-format secrets before they leave the machine. But *where*

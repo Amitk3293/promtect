@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 use regex::Regex;
 use std::sync::LazyLock;
 use zeroize::Zeroizing;

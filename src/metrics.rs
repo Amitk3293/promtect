@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 //! Value-free observability metrics, aggregated from the audit log.
 //!
 //! This module is intentionally free of secret values. It reads the audit JSONL

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-SUL-1.0
+// Copyright (c) 2026 AK DevOps Solutions SL
+
 use crate::audit::Audit;
 use crate::detect;
 use crate::mask::mask_text;
@@ -98,9 +101,14 @@ pub fn resolve_upstream(
         None | Some("") | Some("anthropic") => Ok("https://api.anthropic.com".to_string()),
         Some("openai") => Ok("https://api.openai.com".to_string()),
         Some("ollama") => Ok("http://localhost:11434".to_string()),
+        // Ollama Cloud: ollama.com acts as a remote Ollama host (native /api paths,
+        // OLLAMA_API_KEY Bearer auth). This is the high-value masking case — unlike
+        // local ollama, the prompt leaves the user's machine.
+        Some("ollama-cloud") => Ok("https://ollama.com".to_string()),
         Some("openrouter") => Ok("https://openrouter.ai".to_string()),
         Some(other) => Err(format!(
-            "unknown PROMTECT_MODE '{other}' (expected anthropic|openai|ollama|openrouter); \
+            "unknown PROMTECT_MODE '{other}' \
+             (expected anthropic|openai|ollama|ollama-cloud|openrouter); \
              or set PROMTECT_UPSTREAM to a custom URL"
         )),
     }
@@ -481,6 +489,10 @@ mod tests {
         assert_eq!(
             resolve_upstream(Some("ollama"), None).unwrap(),
             "http://localhost:11434"
+        );
+        assert_eq!(
+            resolve_upstream(Some("ollama-cloud"), None).unwrap(),
+            "https://ollama.com"
         );
         assert_eq!(
             resolve_upstream(Some("openrouter"), None).unwrap(),
