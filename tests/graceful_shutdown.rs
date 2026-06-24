@@ -77,8 +77,8 @@ async fn shutdown_signal_is_callable_and_sigterm_registers() {
     use tokio::signal::unix::{SignalKind, signal};
 
     // SIGTERM handler registration is eager (constructor, not first poll).
-    let _sigterm_handle = signal(SignalKind::terminate())
-        .expect("SIGTERM handler must register successfully");
+    let _sigterm_handle =
+        signal(SignalKind::terminate()).expect("SIGTERM handler must register successfully");
 
     // shutdown_signal() must be callable from library code without error
     // (guard.rs uses crate::proxy::shutdown_signal()).
