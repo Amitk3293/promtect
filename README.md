@@ -346,8 +346,12 @@ internal business, personal, and non-commercial use. You can read, run, modify, 
 self-host it. You cannot resell it or run it as a paid service for others. Full terms
 in [LICENSE](LICENSE).
 
-Paid detector classes (entropy, PII/PHI/PCI, output scanning) and enterprise features
-are a separate product under a commercial license. See [COMMERCIAL.md](COMMERCIAL.md).
+Pro adds the next layer, on the same machine, no cloud: secrets that don't match a known
+pattern, your customers' personal info (names, emails, phone numbers, addresses) and payment
+details (card and ID numbers), a check that the AI tools and plug-ins you install aren't
+quietly stealing your data, and a scan of what the model sends back. One leaked customer
+record or API key can mean a breach and a fine. Pro is coffee-price insurance against it.
+See [COMMERCIAL.md](COMMERCIAL.md).
 
 "Promtect" is a trademark of AK DevOps Solutions SL. See [TRADEMARK.md](TRADEMARK.md).
 
