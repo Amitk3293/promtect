@@ -54,7 +54,7 @@ Prices below are indicative ahead of launch. Pay annually and get two months fre
 | Feeds your security monitoring tools (SIEM) |  |  |  | ✅ |
 | SOC 2 / HIPAA mapping, support agreement (SLA) |  |  |  | ✅ |
 
-Pro and Team start with a 14-day trial, no card. The first 100 paid customers get a
+Pro and Team start with a 14-day trial. The first 100 paid customers get a
 time-limited year-1 discount (year one only, not a lifetime deal). Cancel any time.
 30-day refund if it does not earn its keep.
 
