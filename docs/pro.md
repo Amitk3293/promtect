@@ -21,10 +21,10 @@ detectors keep running unchanged; Pro adds:
   rotated tokens, base64 blobs. It is guarded by length and shape checks so a
   long English sentence or a git SHA does not read as a secret. This is the
   catch for the credential you invented in-house that GitGuardian never heard of.
-- **Structured PII / PCI.** Email addresses, phone numbers, credit card numbers
-  (Luhn-validated, so a random 16-digit string is not flagged), and US Social
-  Security numbers (range-guarded against impossible groups). This is the GDPR
-  and HIPAA exposure surface, not only API keys.
+- **Personal and payment data.** Email addresses, phone numbers, credit card
+  numbers (Luhn-validated, so a random 16-digit string is not flagged), and US
+  Social Security numbers (range-guarded against impossible groups). This is the
+  data that turns one leak into a GDPR or HIPAA problem, not only API keys.
 - **Heuristic Skills scanner.** `promtect-pro skills scan <path>` walks
   `SKILL.md` files and flags three things: instruction-injection patterns,
   secret-exfiltration shapes (`curl`, `scp`, `nc`, piping `$VAR` to a remote),
@@ -42,7 +42,7 @@ detectors keep running unchanged; Pro adds:
 ## How composition works
 
 Pro does not replace the core, it wraps it. On each request Pro runs the core
-`detect()` and then its own passes (entropy, PII / PCI, response scan), then
+`detect()` and then its own passes (entropy, personal data, response scan), then
 merges the results into one match list. That merged list goes through the
 **same** pipeline the core already proves correct: the per-request vault, the
 end-to-start masking, the streaming restore, and the value-free audit log.
@@ -51,7 +51,7 @@ The consequence that matters: a masked email or card number restores in the
 reply exactly the way a masked API key does, so the model still gets a usable
 answer instead of `[REDACTED]` noise. And because the merged list flows through
 the existing audit path, the dashboard and the JSONL log already show the Pro
-detector kinds (entropy, pii, pci) next to the core ones, with no secret values
+detector kinds (`entropy`, `pii`, `pci`) next to the core ones, with no secret values
 written, no new logging path to trust.
 
 Everything stays local. Same loopback proxy, no root CA, no TLS interception, no
@@ -82,7 +82,7 @@ promtect-pro skills scan ./skills  # scan SKILL.md / MCP config files for inject
 ```
 
 Strict mode still applies (`PROMTECT_RESTORE=false` keeps everything masked,
-including Pro-detected PII). The proxy, dashboard, and audit log behave as
+including Pro-detected personal data). The proxy, dashboard, and audit log behave as
 documented in [architecture.md](architecture.md); Pro only adds detector kinds
 to the same flow.
 
@@ -95,7 +95,7 @@ Honesty over polish, so you can decide with eyes open:
   and a clean scan is not a safety guarantee. Treat it as a tripwire, not a
   proof.
 - **Response scanning is regex v1.** It catches signature-shaped secrets in the
-  reply. It is not entropy-aware or PII-aware on the inbound side yet.
+  reply. It is not entropy-aware or personal-data-aware on the inbound side yet.
 - **No fleet, no central plane.** Shared policy across a team, central audit,
   SSO, RBAC, and SIEM export are Team and Enterprise work, not in this binary.
   See [COMMERCIAL.md](../COMMERCIAL.md) and [ROADMAP.md](../ROADMAP.md).

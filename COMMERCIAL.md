@@ -34,7 +34,7 @@ The free core is the floor. Pro is the ceiling.
 
 ## Pricing
 
-Prices below are indicative ahead of launch. Pay annually and get two months free.
+Prices below are indicative ahead of general availability. Pay annually and get two months free.
 
 |  | Free | Pro | Team (most popular) | Enterprise |
 |---|---|---|---|---|
