@@ -40,6 +40,25 @@ fn code_expressions_are_not_secrets() {
 }
 
 #[test]
+fn new_prefix_detectors_do_not_overmatch() {
+    // Supabase's publishable key is non-secret and must not be masked; only
+    // `sb_secret_`/`sbp_` are secrets.
+    clean("sb_publishable_aBcDeFgHiJkLmNoPqRsTuV");
+    // `rnd_` code identifiers carry underscores, so they never reach the 30-char
+    // underscore-free run a real Render key needs.
+    clean("let rnd_seed_value = make_rng_seed(input_entropy_source);");
+    clean("rnd_next_value_from_the_generator_helper_function");
+    // `xai-` is followed by an unbroken alphanumeric run; hyphenated identifiers
+    // break the run well before the 20-char minimum.
+    clean("xai-experimental-feature-toggle-name");
+    clean("xai-beta");
+    // `fly_token` needs the `fm2_` macaroon lead-in and 20+ following chars, and
+    // stops at whitespace — bare `FlyV1` prose and short stubs must not match.
+    clean("deploy with FlyV1 over the fm2 transport layer today");
+    clean("FlyV1 fm2_short");
+}
+
+#[test]
 fn innocuous_prose_and_code_are_clean() {
     clean("the quick brown fox jumps over the lazy dog");
     clean("GET /api/users?id=42 HTTP/1.1");

@@ -51,6 +51,17 @@ async fn main() {
         return;
     }
 
+    // Version must print and exit before any port binding, exactly like --help.
+    // Without this branch `--version`/`version` fall through to the proxy and
+    // start it instead of reporting the version.
+    if args.get(1).map(|s| s.as_str()) == Some("--version")
+        || args.get(1).map(|s| s.as_str()) == Some("-V")
+        || args.get(1).map(|s| s.as_str()) == Some("version")
+    {
+        println!(concat!("promtect ", env!("CARGO_PKG_VERSION")));
+        return;
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("selftest") {
         let ok = promtect::mask::selftest();
         println!(
@@ -199,6 +210,6 @@ async fn main() {
     // inlined startup. run_proxy returns the exit code rather than exiting itself.
     let no_dashboard = args.iter().any(|a| a == "--no-dashboard");
     std::process::exit(i32::from(
-        promtect::run::run_proxy(None, no_dashboard).await,
+        promtect::run::run_proxy(None, None, no_dashboard).await,
     ));
 }

@@ -347,6 +347,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         restore: plan.restore,
         requests: requests.clone(),
         extra_detect: None,
+        output_scan: None,
     };
 
     // Banner + notes go to STDERR so they never pollute the tool's stdout (some

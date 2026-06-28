@@ -244,7 +244,7 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             "db_password",
             // Guillemets «» excluded for the same sentinel-anti-smuggling reason
             // as env_secret: a partial sentinel must not be absorbed into the match.
-            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql)://[^:@/\s]+:([^@\s\\«»]+)@",
+            r"(?i)(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|rediss?|amqps?|mariadb|mssql|clickhouse|cockroachdb)://[^:@/\s]+:([^@\s\\«»]+)@",
             1,
             Some(looks_like_db_placeholder),
         ),
@@ -321,6 +321,9 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
         d("perplexity_key", r"\bpplx-[A-Za-z0-9]{40,}\b"),
         d("fireworks_key", r"\bfw_[A-Za-z0-9]{24,}\b"),
         d("nvidia_key", r"\bnvapi-[A-Za-z0-9_-]{60,}\b"),
+        // xAI (Grok). Prefix `xai-`; xAI documents the prefix but not a fixed
+        // length, so anchor on the prefix and a generous tail.
+        d("xai_key", r"\bxai-[A-Za-z0-9]{20,}\b"),
         // ── Cloud / infrastructure ──────────────────────────────────────────
         d("digitalocean_token", r"\bdop_v1_[a-f0-9]{64}\b"),
         d("doppler_token", r"\bdp\.pt\.[A-Za-z0-9]{40,}\b"),
@@ -335,6 +338,16 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             r"\bpscale_(?:pw|tkn)_[A-Za-z0-9_-]{32,}\b",
         ),
         d("tailscale_key", r"\btskey-(?:auth|api)-[A-Za-z0-9-]{40,}\b"),
+        // Supabase's new-format secret keys (`sb_secret_…`) and personal access
+        // tokens (`sbp_…`). The legacy anon/service_role keys are JWTs already
+        // caught by `jwt`. The `sb_publishable_…` key is non-secret, so excluded.
+        d("supabase_key", r"\b(?:sb_secret_|sbp_)[A-Za-z0-9_]{20,}\b"),
+        // Render API key. The tail is underscore-free, so requiring 30+ such
+        // chars avoids matching `rnd_`-prefixed code identifiers.
+        d("render_key", r"\brnd_[A-Za-z0-9]{30,}\b"),
+        // Fly.io access token (macaroon). The `FlyV1 fm2_` lead-in is highly
+        // distinctive; the macaroon body is base64-ish.
+        d("fly_token", r"\bFlyV1 fm2_[A-Za-z0-9/+=_-]{20,}"),
         // Azure Storage account key: 88-char base64 after `AccountKey=`.
         dg(
             "azure_storage_key",
@@ -492,6 +505,17 @@ mod tests {
         assert!(
             hits.iter()
                 .any(|m| m.kind == "db_password" && m.value.as_str() == "s3cr3tPass1")
+        );
+    }
+
+    /// Newer database URL schemes (e.g. ClickHouse) are also covered.
+    #[test]
+    fn finds_db_password_for_clickhouse_scheme() {
+        let hits = detect("DSN=clickhouse://svc:Th3RealP4ss@ch.internal:9000/analytics");
+        assert!(
+            hits.iter()
+                .any(|m| m.kind == "db_password" && m.value.as_str() == "Th3RealP4ss"),
+            "clickhouse:// credentials must be detected"
         );
     }
 
@@ -792,6 +816,10 @@ mod tests {
             (format!("dapi{}", h(32)), "databricks_token"),
             (format!("pscale_pw_{}", a(32)), "planetscale_token"),
             (format!("tskey-auth-{}", a(40)), "tailscale_key"),
+            (format!("xai-{}", a(20)), "xai_key"),
+            (format!("sb_secret_{}", a(20)), "supabase_key"),
+            (format!("rnd_{}", a(30)), "render_key"),
+            (format!("FlyV1 fm2_{}", a(20)), "fly_token"),
             (format!("AccountKey={}", a(88)), "azure_storage_key"),
             (format!("pypi-AgEIcHlwaS{}", a(50)), "pypi_token"),
             (format!("dckr_pat_{}", a(27)), "dockerhub_token"),

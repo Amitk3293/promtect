@@ -27,6 +27,22 @@ use futures_util::{Stream, StreamExt, stream::BoxStream};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+/// A response-side detection pass, injected by `promtect-pro` (license-gated):
+/// it scans the restored response text for secrets the model echoed back or
+/// generated itself (which were never in the request, so the request-side mask
+/// never saw them). `None` in the public core.
+///
+/// This is OBSERVE-ONLY. The scanner's matches drive an audit entry and a stderr
+/// warning; they never alter the bytes streamed to the client, so restored output
+/// stays byte-for-byte identical to a build without it.
+pub type ResponseScanner = Arc<dyn Fn(&str) -> Vec<crate::detect::Match> + Send + Sync>;
+
+/// Overlap window (bytes) carried between restored chunks so a generated secret
+/// split across a chunk boundary is still seen whole by the output scan.
+/// ponytail: fixed 256-byte window — a secret longer than this split exactly on a
+/// boundary can be missed; acceptable for a warn-only backstop, widen if needed.
+const OUTPUT_SCAN_OVERLAP: usize = 256;
+
 /// First byte of the two-byte UTF-8 encoding of `«` (U+00AB) and `»` (U+00BB).
 const GUILLEMET_LEAD: u8 = 0xC2;
 /// Second byte of `«` (U+00AB).
@@ -55,6 +71,15 @@ pub struct StreamRestorer {
     /// Sentinels already written to the audit log, so each is recorded exactly
     /// once across the whole stream rather than once per chunk it appears in.
     audited: HashSet<String>,
+    /// Optional response-side detection pass (Pro, license-gated). `None` leaves
+    /// the restorer byte-for-byte identical to the public core.
+    scanner: Option<ResponseScanner>,
+    /// Trailing window of already-restored text, prepended to the next chunk so a
+    /// generated secret split across a chunk boundary is still scanned whole.
+    scan_tail: String,
+    /// Distinct (kind, value) secrets already reported by the output scan, so each
+    /// is warned about once across the stream, not once per chunk or overlap.
+    flagged: HashSet<(&'static str, String)>,
 }
 
 impl StreamRestorer {
@@ -70,7 +95,19 @@ impl StreamRestorer {
             cap,
             carry: Vec::new(),
             audited: HashSet::new(),
+            scanner: None,
+            scan_tail: String::new(),
+            flagged: HashSet::new(),
         }
+    }
+
+    /// Attach an optional response-side output scanner (Pro). `None` is a no-op,
+    /// keeping the public core's behavior unchanged. Builder style so existing
+    /// call sites and tests that don't scan stay untouched.
+    #[must_use]
+    pub fn with_output_scanner(mut self, scanner: Option<ResponseScanner>) -> Self {
+        self.scanner = scanner;
+        self
     }
 
     /// Feed one upstream chunk. Returns the bytes now safe to emit, with every
@@ -132,14 +169,63 @@ impl StreamRestorer {
     /// so the streaming and whole-buffer paths share identical (cascade-free)
     /// restore semantics.
     fn restore_str(&mut self, s: &str) -> String {
-        restore_scan(
+        let restored = restore_scan(
             s,
             &self.vault,
             &self.audit,
             &self.request_id,
             &mut self.audited,
-        )
+        );
+        // Observe-only: scan the restored text but return it unchanged.
+        self.scan_output(&restored);
+        restored
     }
+
+    /// Scan restored output for secrets the model produced (not from the request).
+    /// Each distinct (kind, value) is recorded value-free in the audit log and
+    /// warned to stderr exactly once. The streamed bytes are never modified.
+    fn scan_output(&mut self, restored: &str) {
+        // Clone the Arc first so `self` is free to mutate (flagged/audit) below.
+        let Some(scanner) = self.scanner.clone() else {
+            return;
+        };
+        // Prepend the overlap tail so a secret straddling two chunks is seen whole.
+        let hay = format!("{}{}", self.scan_tail, restored);
+        for m in scanner(&hay) {
+            // Ignore the user's own request secrets that we just restored — those
+            // are expected in the response. Only flag values the response itself
+            // introduced (a secret the model echoed or generated).
+            if self.vault.knows_secret(m.value.as_str()) {
+                continue;
+            }
+            if self.flagged.insert((m.kind, m.value.as_str().to_owned())) {
+                // Value-free: only the detector kind is recorded, never the secret.
+                self.audit
+                    .record("output_secret", m.kind, "«output-scan»", &self.request_id);
+                let id = self.request_id.get(..8).unwrap_or(self.request_id.as_str());
+                eprintln!(
+                    "[promtect] \u{26a0}\u{fe0f}  output req {id}: response contained a {} the model produced \u{2014} not from your prompt",
+                    m.kind
+                );
+            }
+        }
+        // Roll the overlap window forward over the just-scanned text.
+        self.scan_tail = tail_of(&hay, OUTPUT_SCAN_OVERLAP);
+    }
+}
+
+/// Last `n` bytes of `s` as an owned string, snapped up to the next UTF-8 char
+/// boundary so the result is always valid UTF-8. Returns the whole string when
+/// it is already `<= n` bytes.
+fn tail_of(s: &str, n: usize) -> String {
+    if s.len() <= n {
+        return s.to_owned();
+    }
+    let mut start = s.len() - n;
+    while !s.is_char_boundary(start) {
+        start += 1;
+    }
+    s[start..].to_owned()
 }
 
 /// Byte index of the last `«` that has no `»` after it — a sentinel that may
@@ -168,7 +254,9 @@ fn rfind_pair(buf: &[u8], a: u8, b: u8) -> Option<usize> {
 /// State for [`restore_stream`]'s `unfold`: reading the upstream, about to emit a
 /// deferred error (after the carry was flushed), or finished.
 enum St<E> {
-    Reading(BoxStream<'static, Result<Bytes, E>>, StreamRestorer),
+    // The restorer is boxed: it now carries an output-scan window and dedup set,
+    // so keeping it inline would make this variant far larger than the others.
+    Reading(BoxStream<'static, Result<Bytes, E>>, Box<StreamRestorer>),
     Erroring(E),
     Done,
 }
@@ -184,7 +272,7 @@ pub fn restore_stream<E>(
 where
     E: Send + 'static,
 {
-    futures_util::stream::unfold(St::Reading(upstream, sr), |st| async move {
+    futures_util::stream::unfold(St::Reading(upstream, Box::new(sr)), |st| async move {
         match st {
             St::Reading(mut up, mut sr) => match up.next().await {
                 Some(Ok(chunk)) => {
@@ -246,6 +334,84 @@ mod tests {
 
         let expected = restore_text(&body, &vault, &Audit::null(), "req");
         assert_eq!(String::from_utf8(got).unwrap(), expected);
+    }
+
+    /// A scanner that just reuses the core detectors, for output-scan tests.
+    fn detect_scanner() -> ResponseScanner {
+        Arc::new(|t: &str| crate::detect::detect(t))
+    }
+
+    /// The output scan flags a secret the response introduced, but ignores the
+    /// user's own request secret that the restorer puts back.
+    #[test]
+    fn output_scan_flags_model_secret_but_ignores_restored_request_secret() {
+        let (vault, sentinel) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
+        let model_key = "AKIA1234567890ABCDEF";
+        let body = format!("your key {sentinel} and a fresh one {model_key} ok");
+        let mut sr =
+            StreamRestorer::new(Arc::clone(&vault), Audit::null().into(), "reqid1234".into())
+                .with_output_scanner(Some(detect_scanner()));
+        for chunk in body.as_bytes().chunks(8) {
+            let _ = sr.push(chunk);
+        }
+        let _ = sr.finish();
+
+        assert!(
+            !sr.flagged.iter().any(|(_, v)| v == "AKIAIOSFODNN7EXAMPLE"),
+            "restored request secret must be ignored by the output scan"
+        );
+        assert!(
+            sr.flagged
+                .iter()
+                .any(|(k, v)| *k == "aws_key" && v == model_key),
+            "model-generated key must be flagged, got {:?}",
+            sr.flagged
+        );
+    }
+
+    /// The output scan is observe-only: streamed bytes are identical with and
+    /// without a scanner attached.
+    #[test]
+    fn output_scan_does_not_change_streamed_bytes() {
+        let (vault, sentinel) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
+        let body = format!("a {sentinel} b AKIA1234567890ABCDEF c");
+        let baseline = run_chunked(Arc::clone(&vault), body.as_bytes(), 5);
+
+        let mut sr = StreamRestorer::new(Arc::clone(&vault), Audit::null().into(), "req".into())
+            .with_output_scanner(Some(detect_scanner()));
+        let mut scanned = Vec::new();
+        for chunk in body.as_bytes().chunks(5) {
+            scanned.extend_from_slice(&sr.push(chunk));
+        }
+        scanned.extend_from_slice(&sr.finish());
+
+        assert_eq!(
+            baseline, scanned,
+            "output scan must not alter streamed bytes"
+        );
+    }
+
+    /// A secret split across chunk boundaries is still caught via the overlap window.
+    #[test]
+    fn output_scan_catches_secret_split_across_chunks() {
+        let vault = Arc::new(Vault::new());
+        let model_key = "AKIA1234567890ABCDEF";
+        let body = format!("prefix text then {model_key} suffix");
+        let mut sr = StreamRestorer::new(vault, Audit::null().into(), "req".into())
+            .with_output_scanner(Some(detect_scanner()));
+        // 4-byte chunks guarantee the key is split across several pushes.
+        for chunk in body.as_bytes().chunks(4) {
+            let _ = sr.push(chunk);
+        }
+        let _ = sr.finish();
+
+        assert!(
+            sr.flagged
+                .iter()
+                .any(|(k, v)| *k == "aws_key" && v == model_key),
+            "a key split across chunks must still be caught, got {:?}",
+            sr.flagged
+        );
     }
 
     #[test]
