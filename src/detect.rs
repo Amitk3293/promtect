@@ -435,6 +435,45 @@ static DETECTORS: LazyLock<Vec<RegexDetector>> = LazyLock::new(|| {
             "teams_webhook",
             r"https://[a-z0-9.-]+\.webhook\.office\.com/webhookb2/[\w@./-]+",
         ),
+        // ── Extended providers (prefix-anchored, GitHub-secret-scanning style) ──
+        // Each has a distinctive literal prefix, the low-false-positive design
+        // GitHub's own token formats use. Patterns are prefix + length + charclass;
+        // no keyword gating needed, so they are safe in the public core.
+        //
+        // AI / LLM
+        d("jina_key", r"\bjina_[A-Za-z0-9_]{20,}\b"),
+        d("anyscale_key", r"\besecret_[A-Za-z0-9_]{20,}\b"),
+        // Cloud / infra / platform
+        d("vercel_token", r"\b(?:vca|vci|vcp)_[A-Za-z0-9]{20,}\b"),
+        d("alibaba_key", r"\bLTAI[A-Za-z0-9]{20}\b"),
+        d("yandex_token", r"\by0_[A-Za-z0-9_-]{20,}\b"),
+        d("onepassword_token", r"\bops_[A-Za-z0-9_-]{40,}\b"),
+        d("prefect_token", r"\bpnu_[A-Za-z0-9_]{30,}\b"),
+        // Payments / fintech
+        d("flutterwave_key", r"\bFLWSECK[_-][A-Za-z0-9-]{12,}\b"),
+        d("easypost_key", r"\bEZ[AT]K[A-Za-z0-9]{50,}\b"),
+        // Email / comms / SaaS
+        d("brevo_key", r"\bxkeysib-[A-Za-z0-9]{40,}\b"),
+        d("typeform_token", r"\btfp_[A-Za-z0-9]{40,}\b"),
+        d("frameio_token", r"\bfio-u-[A-Za-z0-9_-]{20,}\b"),
+        d(
+            "duffel_token",
+            r"\bduffel_(?:test|live)_[A-Za-z0-9_-]{40,}\b",
+        ),
+        d("readme_key", r"\brdme_[A-Za-z0-9]{40,}\b"),
+        // CI / package registries
+        d("buildkite_token", r"\bbkua_[A-Za-z0-9]{40,}\b"),
+        d("artifactory_key", r"\bAKCp[A-Za-z0-9]{60,}\b"),
+        d("clojars_token", r"\bCLOJARS_[a-z0-9]{60,}\b"),
+        d("pulumi_token", r"\bpul-[a-f0-9]{40}\b"),
+        // Monitoring / observability
+        d(
+            "dynatrace_token",
+            r"\bdt0[a-z]\d{2}\.[A-Z0-9]{24}\.[A-Z0-9]{64}\b",
+        ),
+        d("honeycomb_key", r"\bhcx[ilm]k_[A-Za-z0-9]{20,}\b"),
+        // Other
+        d("adobe_key", r"\bp8e-[a-z0-9]{32}\b"),
     ]
 });
 
@@ -880,6 +919,28 @@ mod tests {
                     .to_string(),
                 "teams_webhook",
             ),
+            // Extended providers (prefix-anchored batch).
+            (format!("jina_{}", a(20)), "jina_key"),
+            (format!("esecret_{}", a(20)), "anyscale_key"),
+            (format!("vcp_{}", a(20)), "vercel_token"),
+            (format!("LTAI{}", a(20)), "alibaba_key"),
+            (format!("y0_{}", a(20)), "yandex_token"),
+            (format!("ops_{}", a(40)), "onepassword_token"),
+            (format!("pnu_{}", a(30)), "prefect_token"),
+            (format!("FLWSECK-{}", a(12)), "flutterwave_key"),
+            (format!("EZAK{}", a(50)), "easypost_key"),
+            (format!("xkeysib-{}", a(40)), "brevo_key"),
+            (format!("tfp_{}", a(40)), "typeform_token"),
+            (format!("fio-u-{}", a(20)), "frameio_token"),
+            (format!("duffel_live_{}", a(40)), "duffel_token"),
+            (format!("rdme_{}", a(40)), "readme_key"),
+            (format!("bkua_{}", a(40)), "buildkite_token"),
+            (format!("AKCp{}", a(60)), "artifactory_key"),
+            (format!("CLOJARS_{}", h(60)), "clojars_token"),
+            (format!("pul-{}", h(40)), "pulumi_token"),
+            (format!("dt0c01.{}.{}", a(24), a(64)), "dynatrace_token"),
+            (format!("hcxik_{}", a(20)), "honeycomb_key"),
+            (format!("p8e-{}", h(32)), "adobe_key"),
         ]
     }
 

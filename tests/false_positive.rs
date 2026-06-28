@@ -59,6 +59,17 @@ fn new_prefix_detectors_do_not_overmatch() {
 }
 
 #[test]
+fn extended_prefix_detectors_need_full_form() {
+    // The prefix-anchored providers require their full length + charclass; short
+    // stubs and `prefix_`-shaped code identifiers must not match.
+    clean("y0_value"); // yandex needs 20+ chars
+    clean("vcp_short"); // vercel needs 20+ chars
+    clean("ops_team_settings_config"); // 1password needs 40+ chars
+    clean("pul-request-handler-name"); // pulumi needs 40 hex, not words
+    clean("call jina_init() to begin"); // jina_init too short
+}
+
+#[test]
 fn innocuous_prose_and_code_are_clean() {
     clean("the quick brown fox jumps over the lazy dog");
     clean("GET /api/users?id=42 HTTP/1.1");

@@ -22,6 +22,12 @@ async fn mock(State(seen): State<Seen>, headers: HeaderMap, body: String) -> Jso
     Json(json!({ "echo": body }))
 }
 
+/// Leaky handler: returns a reply containing a secret the "model" produced, which
+/// was never in the request. Used to exercise the response output scan.
+async fn mock_leaky() -> Json<Value> {
+    Json(json!({ "reply": "sure, your key is AKIA1234567890ABCDEF done" }))
+}
+
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 /// Bind `app` on a random loopback port, serve it in a background task, and
@@ -97,6 +103,55 @@ async fn auth_header_forwarded_untouched() {
         Some("sk-ant-api03-thisisafakeapikeyvalue00"),
         "x-api-key header must be forwarded verbatim"
     );
+}
+
+/// End-to-end output scan: a secret the model places in the RESPONSE (never in the
+/// request) is flagged by the Pro response scan through the real proxy app —
+/// recorded value-free in the audit log, with the response bytes left unchanged.
+#[tokio::test]
+async fn output_scan_flags_model_secret_in_live_response() {
+    let audit_path =
+        std::env::temp_dir().join(format!("promtect_outputscan_{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&audit_path);
+
+    // Upstream returns a reply carrying a key that was never in the request.
+    let upstream = spawn(axum::Router::new().route("/", axum::routing::post(mock_leaky))).await;
+
+    // Proxy with a real audit file and an output scanner (the core detectors).
+    let mut c = ctx(&upstream);
+    c.audit = std::sync::Arc::new(promtect::audit::Audit::to_file(
+        audit_path.to_string_lossy().into_owned(),
+    ));
+    c.output_scan = Some(std::sync::Arc::new(|t: &str| promtect::detect::detect(t)));
+    let promtect_url = spawn(promtect::proxy::app(c)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(r#"{"q":"hello"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let body = resp.text().await.unwrap();
+
+    // Observe-only: the model's key reaches the client unchanged.
+    assert!(
+        body.contains("AKIA1234567890ABCDEF"),
+        "output scan must not alter the response body: {body}"
+    );
+
+    // The scan recorded the model-generated key, value-free.
+    let log = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    assert!(
+        log.contains("output_secret") && log.contains("aws_key"),
+        "audit must record an output_secret aws_key event, got: {log}"
+    );
+    assert!(
+        !log.contains("AKIA1234567890ABCDEF"),
+        "audit must be value-free, got: {log}"
+    );
+    let _ = std::fs::remove_file(&audit_path);
 }
 
 /// Three distinct secrets in one body are each masked before reaching the upstream
