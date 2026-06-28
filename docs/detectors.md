@@ -1,6 +1,6 @@
 # Detector reference
 
-Promtect ships **75 detectors** today (the list keeps growing) covering known
+Promtect ships **96 detectors** today (the list keeps growing) covering known
 credential formats across ~70 providers. Each detector has a `kind` — the label that appears in the sentinel
 (`«promtect:aws_key:0001»`), the audit log, and the dashboard breakdown.
 
@@ -127,6 +127,35 @@ format only — Promtect never phones a provider to validate a key.
 `changeme`, `your_key_here`, `${VAR}`, `{{…}}`, and call expressions like
 `getenv("X")` / `os.environ.get("X")` are **not** masked. See `looks_like_placeholder`
 in `src/detect.rs`.
+
+## Extended providers (prefix-anchored)
+
+Distinctive-prefix tokens, following the low-false-positive design GitHub's own
+token formats use (a unique prefix is enough to identify the secret).
+
+| kind | Service | Shape |
+|------|---------|-------|
+| `jina_key` | Jina AI | `jina_…` |
+| `anyscale_key` | Anyscale | `esecret_…` |
+| `vercel_token` | Vercel | `vcp_…` / `vci_…` / `vca_…` |
+| `alibaba_key` | Alibaba Cloud | `LTAI…` |
+| `yandex_token` | Yandex Cloud | `y0_…` |
+| `onepassword_token` | 1Password (service account) | `ops_…` |
+| `prefect_token` | Prefect | `pnu_…` |
+| `flutterwave_key` | Flutterwave | `FLWSECK-…` |
+| `easypost_key` | EasyPost | `EZAK…` / `EZTK…` |
+| `brevo_key` | Brevo (Sendinblue) | `xkeysib-…` |
+| `typeform_token` | Typeform | `tfp_…` |
+| `frameio_token` | Frame.io | `fio-u-…` |
+| `duffel_token` | Duffel | `duffel_live_…` / `duffel_test_…` |
+| `readme_key` | ReadMe | `rdme_…` |
+| `buildkite_token` | Buildkite | `bkua_…` |
+| `artifactory_key` | JFrog Artifactory | `AKCp…` |
+| `clojars_token` | Clojars | `CLOJARS_…` |
+| `pulumi_token` | Pulumi | `pul-…` |
+| `dynatrace_token` | Dynatrace | `dt0c01.….…` |
+| `honeycomb_key` | Honeycomb | `hcxik_…` / `hcxlk_…` / `hcxmk_…` |
+| `adobe_key` | Adobe | `p8e-…` |
 
 ## How matches are chosen
 
