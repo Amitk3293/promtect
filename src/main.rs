@@ -51,6 +51,17 @@ async fn main() {
         return;
     }
 
+    // Version must print and exit before any port binding, exactly like --help.
+    // Without this branch `--version`/`version` fall through to the proxy and
+    // start it instead of reporting the version.
+    if args.get(1).map(|s| s.as_str()) == Some("--version")
+        || args.get(1).map(|s| s.as_str()) == Some("-V")
+        || args.get(1).map(|s| s.as_str()) == Some("version")
+    {
+        println!(concat!("promtect ", env!("CARGO_PKG_VERSION")));
+        return;
+    }
+
     if args.get(1).map(|s| s.as_str()) == Some("selftest") {
         let ok = promtect::mask::selftest();
         println!(
