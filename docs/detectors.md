@@ -1,7 +1,7 @@
 # Detector reference
 
-Promtect ships **71 detectors** covering known credential formats across ~70
-providers. Each detector has a `kind` — the label that appears in the sentinel
+Promtect ships **71 detectors** today (the list keeps growing) covering known
+credential formats across ~70 providers. Each detector has a `kind` — the label that appears in the sentinel
 (`«promtect:aws_key:0001»`), the audit log, and the dashboard breakdown.
 
 Every example below is a **synthetic shape**, not a real secret. Detection is by

@@ -12,7 +12,7 @@ auditors. For *what* it protects and what it deliberately doesn't, read
  POST body  ──http──▶  detect ─▶ vault ─▶ mask_text  ──https──▶   (sees only
  (plaintext)               │        │         │                    sentinels)
                            │        │         │
-                       71 regexes  secret↔   splice               response
+                          regexes  secret↔   splice               response
                                    sentinel  sentinels                │
                                                                       ▼
  your tool  ◀──http──   StreamRestorer ◀── restore_scan ◀──http── streamed chunks
@@ -27,7 +27,7 @@ between requests, and nothing is written to disk except the value-free audit log
 | Stage | Module | Entry point | Job |
 |---|---|---|---|
 | Request handler | `src/proxy.rs` | `handle()` (~`proxy.rs:161`) | Buffer body, mint vault, mask, forward, restore |
-| Detect | `src/detect.rs` | `detect(text) -> Vec<Match>` | Run 71 regex detectors, de-overlap |
+| Detect | `src/detect.rs` | `detect(text) -> Vec<Match>` | Run the regex detectors, de-overlap |
 | Vault | `src/vault.rs` | `Vault::sentinel_for` / `secret_for` | Bidirectional secret↔sentinel map, zeroized on drop |
 | Mask | `src/mask.rs` | `mask_text(...) -> String` | Splice each secret out for a sentinel |
 | Restore (whole) | `src/mask.rs` | `restore_scan(...)` | Single-pass sentinel→secret |
