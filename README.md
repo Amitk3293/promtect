@@ -100,6 +100,12 @@ so it shows counts and detector names, never a secret value, never request/respo
 Pass `--no-dashboard` to start the proxy without it, or run `promtect dashboard`
 standalone to tail an existing audit log without starting a proxy.
 
+The same counts are exposed for Prometheus at `/metrics`, including
+`promtect_output_secrets_total` for anything the Pro output scan caught in a
+model's reply. And `promtect guard` prints a one-line session summary when your
+tool exits — how many secrets it masked this session and by which detectors — so
+you get the signal without it cluttering the tool while you work.
+
 ![Promtect's local dashboard: secrets masked, per-detector breakdown, clean rate, and recent value-free request summaries](docs/dashboard.png)
 
 ## How Promtect compares

@@ -778,5 +778,8 @@ mod tests {
         assert!(json.contains("bytes_in_total"));
         assert!(json.contains("bytes_out_total"));
         assert!(json.contains("recent"));
+        // Output-scan fields must serialize too, so the dashboard JSON exposes them.
+        assert!(json.contains("output_secrets_total"));
+        assert!(json.contains("output_by_detector"));
     }
 }
