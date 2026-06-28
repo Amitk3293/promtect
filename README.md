@@ -229,12 +229,14 @@ masks your secrets before any of them see them.
 
 ## What it detects
 
-Promtect ships detectors covering known credential formats across ~70 providers:
+Promtect ships detectors covering known credential formats across a wide range
+of providers:
 
 - **AI/LLM:** Anthropic, OpenAI, Groq, OpenRouter, Replicate, Perplexity,
-  Fireworks, NVIDIA, HuggingFace, Google AI
+  Fireworks, NVIDIA, HuggingFace, Google AI, xAI
 - **Cloud/infra:** AWS (keys + secret), GCP, Azure Storage, DigitalOcean,
-  Doppler, HashiCorp Vault, Terraform, Databricks, PlanetScale, Tailscale
+  Doppler, HashiCorp Vault, Terraform, Databricks, PlanetScale, Tailscale,
+  Supabase, Render, Fly.io
 - **Dev tools:** GitHub, GitLab, npm, PyPI, Docker Hub, Shopify, Linear,
   Atlassian, Figma, Notion, Airtable, RubyGems, Postman, SonarQube, CircleCI
 - **SaaS/pay:** Slack, Discord, Twilio, SendGrid, Mailgun, Stripe, Square,

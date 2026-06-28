@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 Promtect: a local-first security proxy (Rust, Axum). It sits on loopback, masks secrets
-(API keys, DB passwords, JWTs, PEM keys — ~70 detectors) in outbound AI-tool requests
+(API keys, DB passwords, JWTs, PEM keys — ~75 detectors) in outbound AI-tool requests
 before they reach a provider (Anthropic/OpenAI/Ollama/OpenRouter), then restores them in
 the streamed response. No root CA, no cloud, no telemetry. Free core is under the
 Sustainable Use License (fair-code, source-available);
@@ -64,7 +64,8 @@ high-context detectors.
 ## Config (env vars)
 `PROMTECT_PORT`(8790) · `PROMTECT_MODE`(anthropic|openai|ollama|openrouter) ·
 `PROMTECT_UPSTREAM`(explicit URL, overrides mode) · `PROMTECT_RESTORE`(true; `false`=strict,
-secrets never reinserted) · `PROMTECT_BLOCK_RISKY`(false) · `PROMTECT_BIND`(127.0.0.1) ·
+secrets never reinserted) · `PROMTECT_OUTPUT_SCAN`(true; `false`=disabled; gates the
+Pro response output scan, no-op in core) · `PROMTECT_BLOCK_RISKY`(false) · `PROMTECT_BIND`(127.0.0.1) ·
 `PROMTECT_AUDIT`(promtect-audit.jsonl) · `PROMTECT_MAX_BODY_BYTES`(33554432) ·
 `PROMTECT_DASHBOARD_PORT`(8799) · `PROMTECT_READ_TIMEOUT`(120s; per-chunk inter-read
 timeout, safe for long SSE streams) · `PROMTECT_ALLOW_PUBLIC_BIND`(false; set truthy to

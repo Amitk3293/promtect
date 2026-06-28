@@ -1,4 +1,4 @@
-PORT ?= 8787
+PORT ?= 8790
 
 .PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test up down clean
 
@@ -35,7 +35,7 @@ docker-build:
 	docker build -t promtect .
 
 docker-run:
-	docker run --rm -p 127.0.0.1:$(PORT):8787 promtect
+	docker run --rm -p 127.0.0.1:$(PORT):8790 promtect
 
 # Docker-only test gate (fmt + clippy + cargo test). Used while GH Actions CI is capped.
 docker-test:

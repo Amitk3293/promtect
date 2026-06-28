@@ -8,12 +8,24 @@ and auto-generated notes also live on the
 
 ## [Unreleased]
 
+### Added
+- New detectors: `xai_key` (xAI / Grok), `supabase_key` (Supabase secret keys and
+  personal access tokens), `render_key` (Render), `fly_token` (Fly.io).
+- `db_password` now also matches `clickhouse://` and `cockroachdb://` connection URLs.
+- `PROMTECT_OUTPUT_SCAN` environment variable: gates the Pro response output scan.
+  Default-on when a scanner is present; a falsey value (`0`/`false`/`no`/`off`)
+  disables it. No-op in the core, which ships no scanner.
+
 ### Changed
 - **Relicensed the core from Apache-2.0 to the Sustainable Use License (SUL v1.0)**,
   a fair-code, source-available license. Free for internal business, personal, and
   non-commercial use; no reselling or paid redistribution. Past Apache-2.0 releases
   (≤ v0.1.23) remain Apache-2.0. Licensor is AK DevOps Solutions SL. See `LICENSE`,
   `NOTICE`, `COMMERCIAL.md`, and `TRADEMARK.md`.
+
+### Fixed
+- `promtect --version`, `promtect -V`, and `promtect version` now print the version
+  and exit, instead of starting the proxy.
 
 ## [0.1.7]
 
