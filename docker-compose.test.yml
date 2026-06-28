@@ -1,0 +1,28 @@
+# Dockerized test harness (Pro buildout #1b).
+#
+# WHY: the project mandates Docker-only build/test (nothing on the host), and
+# GitHub Actions is at its CI limit this week, so this compose file is the gate:
+#   make docker-test        # fmt --check + clippy -D warnings + cargo test
+#
+# Caching: the cargo registry and the build target dir are named volumes, so
+# repeat runs are incremental. The volume at /usr/local/cargo/registry only
+# shadows the registry cache, NOT the toolchain binaries under
+# /usr/local/cargo/bin, so cargo/rustc stay available.
+services:
+  test:
+    image: rust:1-bookworm # latest stable Rust toolchain, includes clippy + rustfmt
+    working_dir: /build
+    volumes:
+      - .:/build
+      - promtect-cargo-registry:/usr/local/cargo/registry
+      - promtect-cargo-target:/build/target
+    environment:
+      CARGO_TERM_COLOR: "always"
+    # NOTE: `bash -c`, NOT `bash -lc` — a login shell resets PATH and drops the
+    # image's /usr/local/cargo/bin, which makes `cargo` "command not found".
+    command: >
+      bash -c "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
+
+volumes:
+  promtect-cargo-registry:
+  promtect-cargo-target:

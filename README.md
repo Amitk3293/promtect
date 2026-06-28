@@ -1,5 +1,10 @@
 # Promtect
 
+[![License: SUL (fair-code)](https://img.shields.io/badge/license-SUL%20fair--code-3b82f6)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/Amitk3293/promtect?color=10b981&label=release)](https://github.com/Amitk3293/promtect/releases)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Install: Homebrew](https://img.shields.io/badge/install-brew-f59e0b)](https://github.com/Amitk3293/homebrew-tap)
+
 ### Your AI coding tool just saw your secrets. Promtect makes sure the model never does.
 
 **One file with a key in it, handed to an AI tool, is a key you no longer control. You
@@ -329,7 +334,11 @@ See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
 - **[Detector reference](docs/detectors.md)** — every one of the 71 detectors, by provider.
 - **[Architecture](docs/architecture.md)** — how a request flows through detect → vault → mask → streaming restore.
 - **[Integrations](docs/integrations/README.md)** — Claude Code, Cursor, Codex, Ollama, OpenRouter, chaining.
+- **[Pro overview](docs/pro.md)** — what the paid layer adds and how it composes with the core.
+- **[Pricing & editions](COMMERCIAL.md)** — Free, Pro, Team, Enterprise.
 - **[Threat model](THREAT-MODEL.md)** · **[Roadmap](ROADMAP.md)** · **[Security policy](SECURITY.md)**
+
+Full index: **[docs/](docs/README.md)**.
 
 Or run it locally with no setup: `promtect playground` narrates a full
 mask → forward → restore round-trip against a mock upstream.
@@ -346,8 +355,12 @@ internal business, personal, and non-commercial use. You can read, run, modify, 
 self-host it. You cannot resell it or run it as a paid service for others. Full terms
 in [LICENSE](LICENSE).
 
-Paid detector classes (entropy, PII/PHI/PCI, output scanning) and enterprise features
-are a separate product under a commercial license. See [COMMERCIAL.md](COMMERCIAL.md).
+Pro adds the next layer, on the same machine, no cloud: secrets that don't match a known
+pattern, your customers' personal info (names, emails, phone numbers, addresses) and payment
+details (card and ID numbers), a check that the AI tools and plug-ins you install aren't
+quietly stealing your data, and a scan of what the model sends back. One leaked customer
+record or API key can mean a breach and a fine. Pro is coffee-price insurance against it.
+See [COMMERCIAL.md](COMMERCIAL.md).
 
 "Promtect" is a trademark of AK DevOps Solutions SL. See [TRADEMARK.md](TRADEMARK.md).
 

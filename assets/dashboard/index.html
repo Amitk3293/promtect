@@ -5,71 +5,65 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Promtect — Dashboard</title>
 <!--
-  Promtect dashboard — a single self-contained file, ported from the Promtect
-  Design System (project "Promtect Design System"). ALL CSS and JS are inline.
-  ZERO external network: no CDN, no React/Babel, no Google Fonts. The brand
-  marks are inline SVG. Promtect is a privacy tool, so the dashboard that watches
-  your secrets must never phone home.
+  Promtect dashboard — one self-contained file. ALL CSS and JS are inline.
+  ZERO external network: no CDN, no framework, no web fonts, no telemetry.
+  Promtect guards your secrets, so the dashboard that watches it must never
+  phone home. It reads ONLY the value-free GET /api/metrics feed (counts,
+  detector kind names, byte totals) and NEVER a secret value or body content.
 
-  The original design was React + Babel loaded from unpkg with mock data; here it
-  is re-implemented as vanilla JS that builds the same DOM (same class names and
-  structure as the design's parts.jsx) and is wired to the live GET /api/metrics
-  endpoint, polled every 4s. The design system is the source of truth for the
-  visuals (colors, type, spacing, component shapes, layout).
+  Aesthetic: dark technical minimalist. Near-black canvas, white type, a single
+  teal accent, mono uppercase micro-labels, numbered cards. The signature motif
+  is a live mask -> restore pipeline at the top with sync-pulse badges. Every
+  animation is CSS-only and CSP-safe; all motion honours prefers-reduced-motion.
 
-  Fonts: the design uses Geist + Geist Mono (loaded from Google Fonts in the
-  source). Offline, those are substituted with the platform's native UI/mono
-  stacks via --font-sans / --font-mono, exactly as the design's fonts.css note
-  prescribes for the fully-offline product dashboard.
+  The page polls /api/metrics every 4s and rebuilds the same value-free model the
+  previous version used (buildModel), so the JSON shape and endpoint are unchanged.
 -->
 <style>
   /* ============================================================
-     TOKENS — fonts (offline substitution for Geist / Geist Mono)
+     TOKENS — type, scale, weights, tracking
+     Offline substitution for Geist / Geist Mono via native stacks.
      ============================================================ */
   :root {
     --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, "Geist", system-ui, sans-serif;
     --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", "Geist Mono", Menlo, Consolas, monospace;
 
-    /* --- Type scale (px on a 4px rhythm) --- */
     --text-2xs:  11px;
     --text-xs:   12px;
     --text-sm:   13px;
     --text-base: 15px;
     --text-md:   17px;
     --text-lg:   20px;
-    --text-xl:   24px;
-    --text-2xl:  32px;
-    --text-3xl:  44px;
+    --text-xl:   26px;
+    --text-2xl:  34px;
+    --text-3xl:  52px;
+    --text-4xl:  68px;
 
-    /* --- Weights --- */
     --weight-regular:  400;
     --weight-medium:   500;
     --weight-semibold: 600;
     --weight-bold:     700;
 
-    /* --- Line heights --- */
-    --leading-tight:   1.18;
-    --leading-snug:    1.35;
+    --leading-tight:   1.08;
+    --leading-snug:    1.3;
     --leading-normal:  1.5;
     --leading-relaxed: 1.65;
 
-    /* --- Letter spacing --- */
     --tracking-tight: -0.02em;
     --tracking-snug:  -0.01em;
-    --tracking-caps:   0.08em;
+    --tracking-caps:   0.14em;
   }
 
   /* ============================================================
-     TOKENS — colors (base ramps + semantic aliases, light defaults)
-     Dark-first product surface; dark theme overrides below.
+     TOKENS — color ramps (cool graphite ink + accent families)
      ============================================================ */
   :root {
-    /* Neutral ink ramp (cool graphite / slate) */
-    --ink-950: #090c10;
+    --ink-950: #07090c;
+    --ink-925: #0a0d11;
     --ink-900: #0e1217;
-    --ink-850: #131922;
-    --ink-800: #1a212b;
-    --ink-750: #1f2832;
+    --ink-850: #12171e;
+    --ink-800: #181f28;
+    --ink-750: #1e2630;
     --ink-700: #28323e;
     --ink-600: #364350;
     --ink-500: #4a5a6a;
@@ -78,97 +72,46 @@
     --ink-200: #bcc7d1;
     --ink-100: #dde4ea;
     --ink-50:  #eef2f5;
-    --ink-25:  #f7f9fa;
     --white:   #ffffff;
 
-    /* Seal (primary brand) — sealed-chamber teal/cyan */
-    --seal-50:  #e6faf7;
-    --seal-100: #c2f3ec;
-    --seal-200: #8fe8dc;
+    /* Seal (primary accent) — sealed-chamber teal */
     --seal-300: #54d8c8;
     --seal-400: #25c2b1;
     --seal-500: #12b5a6;
     --seal-600: #0c9387;
     --seal-700: #0c756c;
-    --seal-800: #0d5d57;
-    --seal-900: #0c4843;
 
-    /* Caught (amber) — a secret was detected & masked */
-    --caught-50:  #fdf3e2;
-    --caught-100: #fbe3bb;
+    /* Caught (amber) — a secret was detected and masked */
     --caught-300: #f4c060;
     --caught-400: #efa838;
     --caught-500: #e2901e;
-    --caught-600: #bd7113;
-    --caught-700: #935613;
 
-    /* Clear (green) — clean traffic, passed through */
-    --clear-50:  #e7f7ee;
-    --clear-100: #c3ecd5;
+    /* Clear (green) — clean traffic */
     --clear-300: #6fcf97;
     --clear-400: #43b87a;
     --clear-500: #2ba566;
-    --clear-600: #1f8451;
-    --clear-700: #1a6741;
 
-    /* Leak (red) — danger / a real leak risk */
-    --leak-50:  #fdecea;
-    --leak-100: #fbd2cc;
+    /* Leak (red) — danger / offline */
     --leak-300: #f0917f;
     --leak-400: #ea6850;
     --leak-500: #df4a31;
-    --leak-600: #bb3722;
-    --leak-700: #932c1d;
 
-    /* Semantic aliases (light theme defaults) */
-    --bg-canvas:      var(--ink-25);
-    --bg-sunken:      var(--ink-50);
-    --surface-card:   var(--white);
-    --surface-raised: var(--white);
-    --surface-inset:  var(--ink-25);
-    --surface-code:   var(--ink-900);
-
-    --border-subtle:  var(--ink-100);
-    --border-default: var(--ink-200);
-    --border-strong:  var(--ink-300);
-
-    --text-strong:    var(--ink-900);
-    --text-body:      var(--ink-700);
-    --text-muted:     var(--ink-400);
-    --text-faint:     var(--ink-300);
-    --text-on-accent: var(--white);
-    --text-on-code:   var(--ink-100);
-
-    --accent:         var(--seal-600);
-    --accent-hover:   var(--seal-700);
-    --accent-soft:    var(--seal-50);
-    --accent-border:  var(--seal-200);
-
-    --caught:         var(--caught-600);
-    --caught-soft:    var(--caught-50);
-    --caught-border:  var(--caught-100);
-
-    --clear:          var(--clear-600);
-    --clear-soft:     var(--clear-50);
-    --clear-border:   var(--clear-100);
-
-    --leak:           var(--leak-600);
-    --leak-soft:      var(--leak-50);
-    --leak-border:    var(--leak-100);
-
-    --focus-ring:     var(--seal-500);
+    /* Pro (violet) — paid-class detectors */
+    --pro-300: #b69cff;
+    --pro-400: #9a78f0;
+    --pro-500: #8159e6;
   }
 
-  /* Dark theme — primary product surface */
+  /* Dark theme — the only product surface here */
   [data-theme="dark"] {
     --bg-canvas:      var(--ink-950);
-    --bg-sunken:      var(--ink-900);
-    --surface-card:   var(--ink-850);
-    --surface-raised: var(--ink-800);
-    --surface-inset:  var(--ink-900);
-    --surface-code:   var(--ink-900);
+    --bg-sunken:      var(--ink-925);
+    --surface-card:   var(--ink-900);
+    --surface-raised: var(--ink-850);
+    --surface-inset:  var(--ink-925);
+    --surface-code:   #06080b;
 
-    --border-subtle:  var(--ink-800);
+    --border-subtle:  color-mix(in oklab, var(--ink-700) 55%, transparent);
     --border-default: var(--ink-700);
     --border-strong:  var(--ink-600);
 
@@ -177,33 +120,35 @@
     --text-muted:     var(--ink-400);
     --text-faint:     var(--ink-500);
     --text-on-accent: var(--ink-950);
-    --text-on-code:   var(--ink-100);
 
     --accent:         var(--seal-400);
     --accent-hover:   var(--seal-300);
     --accent-soft:    color-mix(in oklab, var(--seal-500) 16%, transparent);
-    --accent-border:  color-mix(in oklab, var(--seal-500) 38%, transparent);
+    --accent-border:  color-mix(in oklab, var(--seal-500) 40%, transparent);
 
     --caught:         var(--caught-400);
     --caught-soft:    color-mix(in oklab, var(--caught-500) 15%, transparent);
-    --caught-border:  color-mix(in oklab, var(--caught-500) 36%, transparent);
+    --caught-border:  color-mix(in oklab, var(--caught-500) 38%, transparent);
 
     --clear:          var(--clear-400);
     --clear-soft:     color-mix(in oklab, var(--clear-500) 15%, transparent);
-    --clear-border:   color-mix(in oklab, var(--clear-500) 36%, transparent);
+    --clear-border:   color-mix(in oklab, var(--clear-500) 38%, transparent);
 
     --leak:           var(--leak-400);
     --leak-soft:      color-mix(in oklab, var(--leak-500) 16%, transparent);
-    --leak-border:    color-mix(in oklab, var(--leak-500) 38%, transparent);
+    --leak-border:    color-mix(in oklab, var(--leak-500) 40%, transparent);
+
+    --pro:            var(--pro-300);
+    --pro-soft:       color-mix(in oklab, var(--pro-500) 18%, transparent);
+    --pro-border:     color-mix(in oklab, var(--pro-500) 42%, transparent);
 
     --focus-ring:     var(--seal-400);
   }
 
   /* ============================================================
-     TOKENS — spacing, radii, layout (4px grid)
+     TOKENS — spacing, radii, layout, motion
      ============================================================ */
   :root {
-    --space-0:  0;
     --space-1:  0.25rem;
     --space-2:  0.5rem;
     --space-3:  0.75rem;
@@ -214,52 +159,28 @@
     --space-10: 2.5rem;
     --space-12: 3rem;
     --space-16: 4rem;
-    --space-20: 5rem;
 
     --radius-xs:   3px;
     --radius-sm:   5px;
     --radius-md:   8px;
     --radius-lg:   12px;
     --radius-xl:   16px;
-    --radius-2xl:  22px;
     --radius-pill: 999px;
 
-    --container-max: 1240px;
-    --gutter:        var(--space-6);
-    --topbar-h:      60px;
-
     --hairline: 1px;
-  }
-
-  /* ============================================================
-     TOKENS — elevation & motion (light defaults; dark overrides)
-     ============================================================ */
-  :root {
-    --shadow-xs:  0 1px 2px rgba(9, 12, 16, 0.06);
-    --shadow-sm:  0 1px 3px rgba(9, 12, 16, 0.08), 0 1px 2px rgba(9, 12, 16, 0.04);
-    --shadow-md:  0 4px 12px rgba(9, 12, 16, 0.08), 0 2px 4px rgba(9, 12, 16, 0.05);
-    --shadow-lg:  0 12px 28px rgba(9, 12, 16, 0.12), 0 4px 10px rgba(9, 12, 16, 0.06);
-    --shadow-xl:  0 24px 56px rgba(9, 12, 16, 0.16), 0 8px 20px rgba(9, 12, 16, 0.08);
-
-    --glow-seal: 0 0 0 1px var(--accent-border), 0 0 24px -6px var(--seal-500);
-    --ring: 0 0 0 3px color-mix(in oklab, var(--focus-ring) 35%, transparent);
 
     --ease-out:   cubic-bezier(0.22, 0.61, 0.36, 1);
     --ease-inout: cubic-bezier(0.45, 0, 0.2, 1);
     --dur-fast:   120ms;
-    --dur-base:   180ms;
-    --dur-slow:   280ms;
-  }
-  [data-theme="dark"] {
-    --shadow-xs:  0 1px 2px rgba(0, 0, 0, 0.4);
-    --shadow-sm:  0 1px 3px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.3);
-    --shadow-md:  0 6px 16px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.35);
-    --shadow-lg:  0 16px 36px rgba(0, 0, 0, 0.55), 0 6px 14px rgba(0, 0, 0, 0.4);
-    --shadow-xl:  0 28px 64px rgba(0, 0, 0, 0.6), 0 10px 24px rgba(0, 0, 0, 0.45);
+    --dur-base:   200ms;
+    --dur-slow:   320ms;
+
+    --ring: 0 0 0 3px color-mix(in oklab, var(--focus-ring) 38%, transparent);
+    --glow-accent: 0 0 0 1px var(--accent-border), 0 0 28px -8px var(--seal-500);
   }
 
   /* ============================================================
-     BASE ELEMENTS
+     BASE
      ============================================================ */
   *, *::before, *::after { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
@@ -273,8 +194,17 @@
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
     font-feature-settings: 'cv01', 'ss01';
+    /* Atmospheric backdrop: a faint accent glow top-left + a fine grid. No images,
+       no requests — pure CSS gradients painted once, fixed to the viewport. */
+    background-image:
+      radial-gradient(820px 520px at 12% -8%, color-mix(in oklab, var(--seal-500) 12%, transparent), transparent 70%),
+      radial-gradient(680px 480px at 100% 0%, color-mix(in oklab, var(--pro-500) 8%, transparent), transparent 72%),
+      linear-gradient(transparent calc(100% - 1px), color-mix(in oklab, var(--ink-700) 22%, transparent) 100%),
+      linear-gradient(90deg, transparent calc(100% - 1px), color-mix(in oklab, var(--ink-700) 22%, transparent) 100%);
+    background-size: 100% 100%, 100% 100%, 64px 64px, 64px 64px;
+    background-attachment: fixed;
   }
-  h1, h2, h3, h4, h5, h6 {
+  h1, h2, h3, h4 {
     margin: 0;
     color: var(--text-strong);
     font-weight: var(--weight-semibold);
@@ -283,26 +213,13 @@
     text-wrap: balance;
   }
   p { margin: 0; text-wrap: pretty; }
-  a {
-    color: var(--accent);
-    text-decoration: none;
-    transition: color var(--dur-fast) var(--ease-out);
-  }
+  a { color: var(--accent); text-decoration: none; transition: color var(--dur-fast) var(--ease-out); }
   a:hover { color: var(--accent-hover); }
   code, pre, kbd, samp { font-family: var(--font-mono); font-size: 0.92em; }
-  ::selection { background: color-mix(in oklab, var(--seal-500) 28%, transparent); }
-  :focus-visible {
-    outline: none;
-    box-shadow: var(--ring);
-    border-radius: var(--radius-sm);
-  }
-  hr {
-    border: none;
-    border-top: var(--hairline) solid var(--border-subtle);
-    margin: var(--space-6) 0;
-  }
+  ::selection { background: color-mix(in oklab, var(--seal-500) 30%, transparent); }
+  :focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--radius-sm); }
 
-  /* --- Reusable text helpers --- */
+  /* --- Text helpers --- */
   .al-eyebrow {
     font-family: var(--font-mono);
     font-size: var(--text-2xs);
@@ -310,7 +227,6 @@
     text-transform: uppercase;
     color: var(--text-muted);
     font-weight: var(--weight-medium);
-    margin-bottom: 4px;
   }
   .al-mono { font-family: var(--font-mono); }
   .al-tabular { font-variant-numeric: tabular-nums; }
@@ -318,90 +234,72 @@
   .al-right { text-align: right; }
 
   /* ============================================================
-     COMPONENT CLASSES (from the design's components.css)
+     PRIMITIVES — badge, detector chip, card, metric, tabs, button
      ============================================================ */
 
-  /* ---------- Button ---------- */
-  .al-btn {
-    display: inline-flex; align-items: center; justify-content: center;
-    gap: var(--space-2);
-    font-family: var(--font-sans); font-weight: var(--weight-medium);
-    letter-spacing: var(--tracking-snug);
-    border: 1px solid transparent; border-radius: var(--radius-md);
-    cursor: pointer; white-space: nowrap;
-    transition: background var(--dur-fast) var(--ease-out),
-                border-color var(--dur-fast) var(--ease-out),
-                color var(--dur-fast) var(--ease-out),
-                transform var(--dur-fast) var(--ease-out);
-    user-select: none;
-  }
-  .al-btn:focus-visible { outline: none; box-shadow: var(--ring); }
-  .al-btn:active { transform: translateY(0.5px); }
-  .al-btn[disabled], .al-btn[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; transform: none; }
-  .al-btn--sm { font-size: var(--text-sm); padding: 6px 12px; height: 32px; }
-  .al-btn--md { font-size: var(--text-base); padding: 8px 16px; height: 38px; }
-  .al-btn--primary { background: var(--accent); color: var(--text-on-accent); }
-  .al-btn--primary:hover:not([disabled]) { background: var(--accent-hover); }
-  .al-btn--secondary { background: var(--surface-card); color: var(--text-strong); border-color: var(--border-default); }
-  .al-btn--secondary:hover:not([disabled]) { border-color: var(--border-strong); background: var(--surface-inset); }
-  .al-btn--ghost { background: transparent; color: var(--text-body); }
-  .al-btn--ghost:hover:not([disabled]) { background: var(--surface-inset); color: var(--text-strong); }
-  .al-btn__icon { display: inline-flex; width: 1em; height: 1em; }
-  .al-btn__icon svg { width: 100%; height: 100%; }
-
-  /* ---------- Icon button ---------- */
-  .al-iconbtn {
-    display: inline-flex; align-items: center; justify-content: center;
-    background: transparent; color: var(--text-muted);
-    border: 1px solid transparent; border-radius: var(--radius-md);
-    cursor: pointer; padding: 0;
-    transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
-  }
-  .al-iconbtn--md { width: 38px; height: 38px; }
-  .al-iconbtn:hover { background: var(--surface-inset); color: var(--text-strong); }
-  .al-iconbtn:focus-visible { outline: none; box-shadow: var(--ring); }
-  .al-iconbtn svg { width: 1.05em; height: 1.05em; }
-  .al-iconbtn--md svg { font-size: 18px; }
-  .al-iconbtn.is-spinning svg { animation: al-spin var(--dur-slow) var(--ease-out); }
-  @keyframes al-spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
-
-  /* ---------- Badge / status pill ---------- */
+  /* ---- Sync-pulse badge: a dot that breathes in time across the row ---- */
   .al-badge {
-    display: inline-flex; align-items: center; gap: 6px;
-    font-family: var(--font-sans); font-size: var(--text-xs);
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--font-mono); font-size: var(--text-2xs);
+    letter-spacing: var(--tracking-caps); text-transform: uppercase;
     font-weight: var(--weight-medium); line-height: 1;
-    padding: 4px 9px; border-radius: var(--radius-pill);
+    padding: 5px 10px; border-radius: var(--radius-pill);
     border: 1px solid transparent; white-space: nowrap;
   }
-  .al-badge__dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .al-badge__dot {
+    width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+    box-shadow: 0 0 0 0 currentColor;
+    animation: al-sync 2200ms var(--ease-inout) infinite;
+  }
+  /* Sync-pulse: shared keyframe + shared duration => every dot pulses together. */
+  @keyframes al-sync {
+    0%, 100% { box-shadow: 0 0 0 0 color-mix(in oklab, currentColor 70%, transparent); opacity: 1; }
+    50%      { box-shadow: 0 0 0 5px color-mix(in oklab, currentColor 0%, transparent); opacity: 0.55; }
+  }
   .al-badge--neutral { background: var(--surface-inset); color: var(--text-muted); border-color: var(--border-subtle); }
   .al-badge--caught  { background: var(--caught-soft); color: var(--caught); border-color: var(--caught-border); }
   .al-badge--clear   { background: var(--clear-soft);  color: var(--clear);  border-color: var(--clear-border); }
   .al-badge--leak    { background: var(--leak-soft);   color: var(--leak);   border-color: var(--leak-border); }
   .al-badge--accent  { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+  .al-badge--pro     { background: var(--pro-soft);    color: var(--pro);    border-color: var(--pro-border); }
+  /* A static (non-pulsing) variant for labels that aren't a live signal. */
+  .al-badge--static .al-badge__dot { animation: none; box-shadow: none; }
 
-  /* ---------- Detector tag (mono token chip) ---------- */
+  /* ---- Detector chip (mono token) ---- */
   .al-detector {
     display: inline-flex; align-items: center; gap: 6px;
     font-family: var(--font-mono); font-size: var(--text-xs);
     font-weight: var(--weight-medium);
-    padding: 3px 8px; border-radius: var(--radius-sm);
+    padding: 3px 9px; border-radius: var(--radius-sm);
     background: var(--surface-inset); color: var(--text-body);
     border: 1px solid var(--border-subtle);
   }
-  .al-detector__mark { width: 7px; height: 7px; border-radius: 2px; background: var(--caught-500); }
+  .al-detector__mark { width: 7px; height: 7px; border-radius: 2px; background: var(--caught-400); flex: none; }
+  .al-detector--pro { color: var(--pro); border-color: var(--pro-border); }
+  .al-detector--pro .al-detector__mark { background: var(--pro-400); }
 
-  /* ---------- Card ---------- */
+  /* ---- Card: numbered, hairline, hover-lift ---- */
   .al-card {
-    background: var(--surface-card);
+    position: relative;
+    background:
+      linear-gradient(180deg, color-mix(in oklab, var(--white) 2%, transparent), transparent 42%),
+      var(--surface-card);
     border: 1px solid var(--border-subtle);
     border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-sm);
+    transition: border-color var(--dur-base) var(--ease-out), transform var(--dur-base) var(--ease-out);
   }
   .al-card--pad { padding: var(--space-5); }
+  .al-card[data-index]::before {
+    content: attr(data-index);
+    position: absolute; top: 14px; right: 16px;
+    font-family: var(--font-mono); font-size: var(--text-2xs);
+    letter-spacing: var(--tracking-caps); color: var(--text-faint);
+    font-weight: var(--weight-medium);
+  }
+  .al-card:hover { border-color: var(--border-strong); }
 
-  /* ---------- Metric stat ---------- */
-  .al-metric { display: flex; flex-direction: column; gap: 6px; }
+  /* ---- Metric stat ---- */
+  .al-metric { display: flex; flex-direction: column; gap: 10px; }
   .al-metric__label {
     font-family: var(--font-mono); font-size: var(--text-2xs);
     letter-spacing: var(--tracking-caps); text-transform: uppercase;
@@ -409,100 +307,202 @@
   }
   .al-metric__value {
     font-family: var(--font-mono); font-variant-numeric: tabular-nums;
-    font-weight: var(--weight-medium); letter-spacing: -0.01em;
+    font-weight: var(--weight-medium); letter-spacing: -0.02em;
     color: var(--text-strong); line-height: 1; font-size: var(--text-3xl);
   }
   .al-metric__foot { display: flex; align-items: center; gap: 6px; font-size: var(--text-xs); color: var(--text-muted); }
-  .al-metric__delta--up { color: var(--clear); }
-  .al-metric__delta--down { color: var(--leak); }
   .al-metric--caught .al-metric__value { color: var(--caught); }
   .al-metric--clear  .al-metric__value { color: var(--clear); }
   .al-metric--accent .al-metric__value { color: var(--accent); }
 
-  /* ---------- Tabs ---------- */
+  /* ---- Tabs ---- */
   .al-tabs { display: inline-flex; gap: 2px; padding: 3px; background: var(--surface-inset); border-radius: var(--radius-md); border: 1px solid var(--border-subtle); }
   .al-tab {
-    font-family: var(--font-sans); font-size: var(--text-sm); font-weight: var(--weight-medium);
+    font-family: var(--font-mono); font-size: var(--text-2xs); font-weight: var(--weight-medium);
+    letter-spacing: var(--tracking-caps); text-transform: uppercase;
     color: var(--text-muted); background: transparent; border: none; cursor: pointer;
-    padding: 6px 14px; border-radius: var(--radius-sm);
+    padding: 7px 13px; border-radius: var(--radius-sm);
     transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
   }
   .al-tab:hover { color: var(--text-strong); }
-  .al-tab--active { background: var(--surface-card); color: var(--text-strong); box-shadow: var(--shadow-xs); }
+  .al-tab--active { background: var(--surface-raised); color: var(--text-strong); }
   .al-tab:focus-visible { outline: none; box-shadow: var(--ring); }
 
-  /* ============================================================
-     DASHBOARD LAYOUT (from the design's dashboard.css)
-     ============================================================ */
-  .al-app { min-height: 100vh; background: var(--bg-canvas); color: var(--text-body); }
+  /* ---- Icon button ---- */
+  .al-iconbtn {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 38px; height: 38px;
+    background: transparent; color: var(--text-muted);
+    border: 1px solid var(--border-subtle); border-radius: var(--radius-md);
+    cursor: pointer; padding: 0;
+    transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+  }
+  .al-iconbtn:hover { background: var(--surface-inset); color: var(--text-strong); border-color: var(--border-strong); }
+  .al-iconbtn:focus-visible { outline: none; box-shadow: var(--ring); }
+  .al-iconbtn svg { width: 18px; height: 18px; }
+  .al-iconbtn.is-spinning svg { animation: al-spin 600ms var(--ease-out); }
+  @keyframes al-spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
 
-  /* ---- Top bar ---- */
+  /* ============================================================
+     SHELL — top bar + page
+     ============================================================ */
+  .al-app { min-height: 100vh; }
+
   .al-topbar {
     display: flex; align-items: center; gap: var(--space-6);
-    height: var(--topbar-h); padding: 0 var(--space-6);
+    height: 62px; padding: 0 var(--space-8);
     border-bottom: 1px solid var(--border-subtle);
-    background: var(--bg-sunken);
-    position: sticky; top: 0; z-index: 10;
+    background: color-mix(in oklab, var(--bg-sunken) 82%, transparent);
+    backdrop-filter: blur(10px);
+    position: sticky; top: 0; z-index: 20;
   }
-  .al-topbar__brand { display: flex; align-items: center; gap: var(--space-3); }
+  .al-topbar__brand { display: flex; align-items: center; gap: var(--space-4); }
   .al-topbar__sep { width: 1px; height: 22px; background: var(--border-default); }
-  .al-topbar__title { font-size: var(--text-base); font-weight: var(--weight-medium); color: var(--text-strong); }
+  .al-topbar__title {
+    font-family: var(--font-mono); font-size: var(--text-2xs);
+    letter-spacing: var(--tracking-caps); text-transform: uppercase;
+    color: var(--text-muted);
+  }
   .al-topbar__status { display: flex; align-items: center; gap: var(--space-2); }
   .al-topbar__actions { display: flex; align-items: center; gap: var(--space-3); margin-left: auto; }
 
-  /* ---- Page ---- */
-  .al-page { max-width: 1180px; margin: 0 auto; padding: var(--space-8) var(--space-6) var(--space-16); }
-  .al-page__head { margin-bottom: var(--space-6); }
-  .al-page__h1 { font-size: var(--text-2xl); font-weight: var(--weight-semibold); }
-  .al-page__sub { font-size: var(--text-sm); color: var(--text-muted); margin-top: 6px; max-width: 64ch; }
+  .al-page { max-width: 1240px; margin: 0 auto; padding: var(--space-12) var(--space-8) var(--space-16); }
 
-  /* ---- Headline metrics ---- */
-  .al-headline { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-bottom: var(--space-5); }
-  .al-headline .al-card { padding: var(--space-5); display: flex; align-items: flex-start; gap: var(--space-4); }
-  .al-headline__icon {
-    flex: none; width: 44px; height: 44px; border-radius: var(--radius-md);
+  /* Staggered entrance for top-level sections. Disabled under reduced-motion. */
+  .al-rise { opacity: 0; transform: translateY(10px); animation: al-rise 560ms var(--ease-out) forwards; }
+  @keyframes al-rise { to { opacity: 1; transform: none; } }
+
+  /* ---- Page head ---- */
+  .al-page__head { margin-bottom: var(--space-10); max-width: 70ch; }
+  .al-page__kicker { margin-bottom: var(--space-4); }
+  .al-page__h1 {
+    font-size: var(--text-2xl); font-weight: var(--weight-semibold);
+    letter-spacing: var(--tracking-tight);
+  }
+  .al-page__sub { font-size: var(--text-sm); color: var(--text-muted); margin-top: var(--space-3); max-width: 62ch; line-height: var(--leading-relaxed); }
+
+  /* ============================================================
+     PIPELINE MOTIF — the signature mask -> restore flow
+     A row of three nodes (DETECT, MASK, RESTORE) joined by wires down
+     which a packet travels on a loop, syncing with the badge pulse.
+     ============================================================ */
+  .al-pipeline { padding: var(--space-6) var(--space-8); overflow: hidden; }
+  .al-pipeline__head { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-6); flex-wrap: wrap; }
+  .al-pipeline__flow {
+    display: grid;
+    grid-template-columns: 1fr auto 1fr auto 1fr;
+    align-items: center; gap: 0;
+  }
+  .al-node {
+    display: flex; flex-direction: column; gap: 8px;
+    padding: var(--space-4) var(--space-5);
+    border: 1px solid var(--border-subtle); border-radius: var(--radius-md);
+    background: var(--surface-inset);
+    min-width: 0;
+  }
+  .al-node__top { display: flex; align-items: center; gap: 9px; }
+  .al-node__no {
+    font-family: var(--font-mono); font-size: var(--text-2xs);
+    letter-spacing: var(--tracking-caps); color: var(--text-faint);
+  }
+  .al-node__name {
+    font-family: var(--font-mono); font-size: var(--text-xs);
+    letter-spacing: var(--tracking-caps); text-transform: uppercase;
+    color: var(--text-strong); font-weight: var(--weight-medium);
+  }
+  .al-node__icon {
+    width: 28px; height: 28px; flex: none; border-radius: var(--radius-sm);
     display: inline-flex; align-items: center; justify-content: center;
-    font-size: 22px;
+    border: 1px solid var(--accent-border); color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .al-node__icon svg { width: 15px; height: 15px; }
+  .al-node--restore .al-node__icon { border-color: var(--clear-border); color: var(--clear); background: var(--clear-soft); }
+  .al-node--mask .al-node__icon { border-color: var(--caught-border); color: var(--caught); background: var(--caught-soft); }
+  .al-node__val {
+    font-family: var(--font-mono); font-variant-numeric: tabular-nums;
+    font-size: var(--text-lg); color: var(--text-strong); line-height: 1; font-weight: var(--weight-medium);
+  }
+  .al-node__cap { font-family: var(--font-mono); font-size: var(--text-2xs); letter-spacing: var(--tracking-caps); color: var(--text-muted); text-transform: uppercase; }
+
+  /* Wire between two nodes: a track with a travelling packet. */
+  .al-wire { position: relative; height: 2px; min-width: 36px; margin: 0 6px; align-self: center; background: var(--border-default); border-radius: 2px; overflow: visible; }
+  .al-wire__pulse {
+    position: absolute; top: 50%; left: 0; width: 8px; height: 8px; margin-top: -4px;
+    border-radius: 50%; background: var(--accent);
+    box-shadow: 0 0 10px 1px color-mix(in oklab, var(--seal-400) 80%, transparent);
+    animation: al-travel 2200ms var(--ease-inout) infinite;
+  }
+  .al-wire--restore { background: var(--clear-500); opacity: 0.5; }
+  .al-wire--restore .al-wire__pulse { background: var(--clear-400); box-shadow: 0 0 10px 1px color-mix(in oklab, var(--clear-400) 80%, transparent); animation-delay: 1100ms; }
+  @keyframes al-travel {
+    0%   { left: 0;    opacity: 0; }
+    12%  { opacity: 1; }
+    88%  { opacity: 1; }
+    100% { left: 100%; opacity: 0; }
+  }
+
+  /* ============================================================
+     GRIDS
+     ============================================================ */
+  .al-headline { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-bottom: var(--space-5); }
+  .al-headline .al-card { padding: var(--space-6); display: flex; align-items: flex-start; gap: var(--space-4); }
+  .al-headline__icon {
+    flex: none; width: 42px; height: 42px; border-radius: var(--radius-md);
+    display: inline-flex; align-items: center; justify-content: center;
     background: var(--surface-inset); color: var(--text-muted);
     border: 1px solid var(--border-subtle);
   }
+  .al-headline__icon svg { width: 20px; height: 20px; }
   .al-headline__icon--caught { background: var(--caught-soft); color: var(--caught); border-color: var(--caught-border); }
   .al-headline__icon--accent { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
   .al-headline__icon--clear  { background: var(--clear-soft);  color: var(--clear);  border-color: var(--clear-border); }
-  .al-headline .al-metric { flex: 1; }
+  .al-headline .al-metric { flex: 1; min-width: 0; }
 
-  /* ---- Two-column grid (timeline + detectors) ---- */
   .al-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: var(--space-4); margin-bottom: var(--space-5); }
+  .al-grid--license { grid-template-columns: 1fr 1fr; gap: var(--space-4); margin-bottom: var(--space-5); }
 
   /* ---- Panel ---- */
-  .al-panel { padding: var(--space-5); }
-  .al-panel__head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-5); }
+  .al-panel { padding: var(--space-6); }
+  .al-panel__head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); margin-bottom: var(--space-6); }
   .al-panel__title { font-size: var(--text-md); font-weight: var(--weight-semibold); color: var(--text-strong); }
 
   /* ---- Legend ---- */
-  .al-legend { display: flex; align-items: center; gap: var(--space-4); font-size: var(--text-xs); color: var(--text-muted); }
-  .al-legend__item { display: inline-flex; align-items: center; gap: 6px; }
+  .al-legend { display: flex; align-items: center; gap: var(--space-4); font-family: var(--font-mono); font-size: var(--text-2xs); letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-muted); }
+  .al-legend__item { display: inline-flex; align-items: center; gap: 7px; }
   .al-legend__item i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
 
-  /* ---- Caught-vs-clean chart (hand-rolled bars) ---- */
-  .al-chart { display: flex; align-items: flex-end; gap: var(--space-3); height: 200px; padding-top: var(--space-2); }
+  /* ---- Traffic chart (hand-rolled bars) ---- */
+  .al-chart { display: flex; align-items: flex-end; gap: var(--space-3); height: 196px; padding-top: var(--space-2); }
   .al-chart__col { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; gap: var(--space-2); min-width: 0; }
   .al-chart__bar {
-    width: 100%; max-width: 46px; min-height: 3px;
-    background: var(--seal-500); border-radius: var(--radius-sm) var(--radius-sm) 2px 2px;
+    width: 100%; max-width: 44px; min-height: 3px;
+    background: var(--seal-600); border-radius: var(--radius-sm) var(--radius-sm) 2px 2px;
     position: relative; display: flex; flex-direction: column; justify-content: flex-start;
     overflow: hidden; transition: height var(--dur-slow) var(--ease-out);
   }
   .al-chart__caught { width: 100%; background: var(--caught-500); transition: height var(--dur-slow) var(--ease-out); }
   .al-chart__lbl { font-family: var(--font-mono); font-size: var(--text-2xs); color: var(--text-faint); white-space: nowrap; }
-  .al-chart__empty { display: flex; align-items: center; justify-content: center; height: 200px; color: var(--text-faint); font-size: var(--text-sm); text-align: center; }
+  .al-chart__empty, .al-empty { display: flex; align-items: center; justify-content: center; min-height: 160px; color: var(--text-faint); font-size: var(--text-sm); text-align: center; flex-direction: column; gap: 8px; padding: var(--space-6); }
+  .al-empty__title { font-size: var(--text-md); color: var(--text-strong); }
 
   /* ---- Detector breakdown ---- */
-  .al-detlist { display: flex; flex-direction: column; gap: var(--space-3); }
-  .al-detrow { display: grid; grid-template-columns: 132px 1fr 48px; align-items: center; gap: var(--space-3); }
-  .al-detrow__track { height: 8px; background: var(--surface-inset); border-radius: var(--radius-pill); overflow: hidden; }
+  .al-detlist { display: flex; flex-direction: column; gap: var(--space-4); }
+  .al-detrow { display: grid; grid-template-columns: 142px 1fr 52px; align-items: center; gap: var(--space-4); }
+  .al-detrow__track { height: 7px; background: var(--surface-inset); border-radius: var(--radius-pill); overflow: hidden; }
   .al-detrow__fill { height: 100%; background: linear-gradient(90deg, var(--seal-600), var(--seal-400)); border-radius: var(--radius-pill); transition: width var(--dur-slow) var(--ease-out); }
-  .al-detrow__count { font-size: var(--text-sm); color: var(--text-body); text-align: right; }
+  .al-detrow--pro .al-detrow__fill { background: linear-gradient(90deg, var(--pro-500), var(--pro-300)); }
+  .al-detrow__count { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--text-body); text-align: right; }
+
+  /* ---- License panel ---- */
+  .al-license { display: flex; flex-direction: column; gap: var(--space-5); }
+  .al-license__tier { display: flex; align-items: baseline; gap: var(--space-3); }
+  .al-license__tiername { font-family: var(--font-mono); font-size: var(--text-xl); letter-spacing: -0.01em; color: var(--text-strong); font-weight: var(--weight-medium); }
+  .al-license__rows { display: flex; flex-direction: column; gap: var(--space-3); }
+  .al-license__row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 0; border-top: 1px solid var(--border-subtle); }
+  .al-license__row:first-child { border-top: none; }
+  .al-license__k { font-family: var(--font-mono); font-size: var(--text-xs); letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-muted); }
+  .al-license__v { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--text-body); }
 
   /* ---- Table ---- */
   .al-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
@@ -516,31 +516,54 @@
   .al-table tbody tr { transition: background var(--dur-fast) var(--ease-out); }
   .al-table tbody tr:hover { background: var(--surface-inset); }
   .al-detcell { display: flex; gap: 6px; flex-wrap: wrap; }
-  .al-empty { padding: var(--space-8); text-align: center; color: var(--text-muted); }
-  .al-empty__title { font-size: var(--text-md); color: var(--text-strong); margin-bottom: 6px; }
 
   /* ---- Endpoints ---- */
   .al-endpoints { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-4); }
   .al-code {
     margin: 0; padding: var(--space-4); border-radius: var(--radius-md);
-    background: var(--surface-code); color: var(--text-on-code);
+    background: var(--surface-code); color: var(--text-body);
     font-family: var(--font-mono); font-size: var(--text-xs); line-height: var(--leading-relaxed);
     overflow: auto; white-space: pre; border: 1px solid var(--border-subtle);
   }
-  .al-note { font-size: var(--text-sm); color: var(--text-muted); }
+  .al-note { font-size: var(--text-sm); color: var(--text-muted); line-height: var(--leading-relaxed); }
   .al-note + .al-note { margin-top: var(--space-3); }
 
-  /* ---- Connection status ---- */
-  .al-conn--ok   { color: var(--clear); }
-  .al-conn--down { color: var(--leak); }
+  /* ---- Section spacer ---- */
+  .al-stack { margin-top: var(--space-5); }
 
-  /* ---- Responsive ---- */
-  @media (max-width: 920px) {
+  /* ============================================================
+     RESPONSIVE
+     ============================================================ */
+  @media (max-width: 980px) {
     .al-headline { grid-template-columns: 1fr; }
-    .al-grid { grid-template-columns: 1fr; }
+    .al-grid, .al-grid--license { grid-template-columns: 1fr; }
     .al-endpoints { grid-template-columns: 1fr; }
-    .al-topbar { flex-wrap: wrap; height: auto; padding: var(--space-3) var(--space-4); gap: var(--space-3); }
-    .al-topbar__actions { width: 100%; flex-wrap: wrap; margin-left: 0; }
+    .al-pipeline__flow { grid-template-columns: 1fr; gap: var(--space-3); }
+    .al-wire { width: 2px; height: 28px; min-width: 0; margin: 0 auto; }
+    .al-wire__pulse { left: 50%; top: 0; margin-left: -4px; margin-top: 0; animation-name: al-travel-v; }
+    @keyframes al-travel-v { 0% { top: 0; opacity: 0; } 12% { opacity: 1; } 88% { opacity: 1; } 100% { top: 100%; opacity: 0; } }
+    .al-topbar { padding: 0 var(--space-4); gap: var(--space-3); }
+    .al-page { padding: var(--space-8) var(--space-4) var(--space-12); }
+    .al-topbar__status .al-badge--static { display: none; }
+  }
+  @media (max-width: 620px) {
+    .al-pipeline { padding: var(--space-5); }
+    .al-detrow { grid-template-columns: 110px 1fr 44px; gap: var(--space-3); }
+  }
+
+  /* ============================================================
+     REDUCED MOTION — turn off every animation and transition
+     ============================================================ */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.001ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.001ms !important;
+      scroll-behavior: auto !important;
+    }
+    .al-rise { opacity: 1; transform: none; }
+    .al-wire__pulse { opacity: 0; }
+    .al-badge__dot { box-shadow: none; opacity: 1; }
   }
 </style>
 </head>
@@ -549,9 +572,10 @@
 
   <script>
   /* ============================================================================
-     Promtect dashboard — vanilla JS port of the design's parts.jsx.
-     No framework. Builds the same DOM (same class names / structure) and wires
-     it to the live GET /api/metrics endpoint.
+     Promtect dashboard — vanilla JS. No framework. Builds the DOM and wires it to
+     the live, value-free GET /api/metrics feed (polled every 4s). The data model
+     (buildModel) and JSON shape are unchanged from the previous version; only the
+     presentation layer was rebuilt. Nothing here ever touches a secret value.
      ============================================================================ */
   (function () {
     "use strict";
@@ -583,12 +607,12 @@
         node.appendChild(typeof children === "object" ? children : document.createTextNode(String(children)));
       }
     }
-    function svg(inner, extraClass) {
-      // Inline lucide-style icon (stroke 1.75). No namespace decl / URL — offline-safe.
-      var wrap = el("span", { class: "al-btn__icon" + (extraClass ? " " + extraClass : "") });
+    // Inline lucide-style icon, stroke 1.75. No namespace decl / URL — offline-safe.
+    function iconSpan(inner, cls) {
+      var wrap = el("span", { class: cls || "" });
       wrap.innerHTML =
         '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor"' +
-        ' stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">' + inner + "</svg>";
+        ' stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + inner + "</svg>";
       return wrap;
     }
 
@@ -596,14 +620,15 @@
       shield:  '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/>',
       refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
       activity:'<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
-      lock:    '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>'
+      lock:    '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+      scan:    '<path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M7 12h10"/>',
+      mask:    '<path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><line x1="2" y1="2" x2="22" y2="22"/>',
+      undo:    '<path d="M9 14 4 9l5-5"/><path d="M4 9h11a5 5 0 0 1 0 10h-1"/>',
+      sparkle: '<path d="M12 3v4M12 17v4M3 12h4M17 12h4"/><path d="m6.3 6.3 2.4 2.4M15.3 15.3l2.4 2.4M17.7 6.3l-2.4 2.4M8.7 15.3l-2.4 2.4"/>'
     };
 
-    // ---- formatting helpers (mirror the design's data.js) ---------------------
-    function fmt(n) {
-      n = Number(n) || 0;
-      return n.toLocaleString("en-US");
-    }
+    // ---- formatting helpers ---------------------------------------------------
+    function fmt(n) { n = Number(n) || 0; return n.toLocaleString("en-US"); }
     function ago(tsMs) {
       var s = Math.round((Date.now() - Number(tsMs)) / 1000);
       if (s < 0) s = 0;
@@ -618,59 +643,59 @@
       b = Number(b) || 0;
       if (b < 1024) return b + " B";
       if (b < 1024 * 1024) return (b / 1024).toFixed(1) + " KB";
-      return (b / 1024 / 1024).toFixed(1) + " MB";
+      if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + " MB";
+      return (b / 1024 / 1024 / 1024).toFixed(2) + " GB";
     }
-    function rid8(id) {
-      return (id || "").replace(/-/g, "").slice(0, 8) || "--------";
-    }
+    function rid8(id) { return (id || "").replace(/-/g, "").slice(0, 8) || "--------"; }
 
-    // ---- reusable component builders (DS primitives) --------------------------
+    // ---- Pro-class detector heuristic -----------------------------------------
+    // The free core masks provider credentials (kinds ending in _key/_token/_pat/
+    // _secret, e.g. aws_key, github_token). The paid promtect-pro crate adds a
+    // DIFFERENT CLASS of detector: entropy-based and PII/PHI. We do NOT hardcode
+    // the free list — instead we recognise the small, stable set of Pro-class kind
+    // names. If any Pro-class kind appears in the live audit, Pro is "active".
+    // (/api/metrics has no explicit license field today; presence is the signal.)
+    var PRO_KINDS = {
+      entropy: 1, email: 1, credit_card: 1, ssn: 1, phone: 1, ipv4: 1, ipv6: 1,
+      iban: 1, swift: 1, us_passport: 1, dob: 1, mrn: 1, npi: 1, dea: 1,
+      ip_address: 1, jwt_pii: 1, pii: 1, phi: 1
+    };
+    function isProKind(kind) { return Object.prototype.hasOwnProperty.call(PRO_KINDS, String(kind)); }
+
+    // ---- reusable component builders ------------------------------------------
     function Badge(opts) {
       var tone = opts.tone || "neutral";
-      var node = el("span", { class: "al-badge al-badge--" + tone });
+      var cls = "al-badge al-badge--" + tone + (opts.staticDot ? " al-badge--static" : "");
+      var node = el("span", { class: cls });
       if (opts.dot) node.appendChild(el("span", { class: "al-badge__dot" }));
-      appendChildren(node, opts.children != null ? opts.children : opts.label);
+      appendChildren(node, opts.label);
       return node;
     }
     function DetectorTag(kind) {
-      return el("span", { class: "al-detector" }, [
+      var pro = isProKind(kind);
+      return el("span", { class: "al-detector" + (pro ? " al-detector--pro" : ""), title: pro ? "Pro-class detector" : null }, [
         el("span", { class: "al-detector__mark" }),
         kind
       ]);
     }
-    function Card(className, children) {
-      return el("div", { class: "al-card" + (className ? " " + className : "") }, children);
+    function Card(opts, children) {
+      opts = opts || {};
+      var attrs = { class: "al-card" + (opts.className ? " " + opts.className : "") };
+      if (opts.index) attrs["data-index"] = opts.index;
+      return el("div", attrs, children);
     }
     function MetricStat(opts) {
       var cls = "al-metric" + (opts.tone ? " al-metric--" + opts.tone : "");
-      var foot = [];
-      if (opts.delta) {
-        var up = String(opts.delta).indexOf("-") !== 0;
-        foot.push(el("span", { class: "al-metric__delta--" + (up ? "up" : "down") }, opts.delta));
-      }
-      if (opts.foot) foot.push(el("span", { class: "al-faint" }, opts.foot));
       return el("div", { class: cls }, [
         el("div", { class: "al-metric__label" }, opts.label),
-        el("div", { class: "al-metric__value" }, opts.value),
-        foot.length ? el("div", { class: "al-metric__foot" }, foot) : null
+        el("div", { class: "al-metric__value al-tabular" }, opts.value),
+        opts.foot ? el("div", { class: "al-metric__foot" }, el("span", { class: "al-faint al-mono" }, opts.foot)) : null
       ]);
     }
-    function Tabs(value, items, onChange) {
-      return el("div", { class: "al-tabs", role: "tablist" }, items.map(function (it) {
-        return el("button", {
-          class: "al-tab" + (it.value === value ? " al-tab--active" : ""),
-          type: "button",
-          "aria-selected": it.value === value ? "true" : "false",
-          onclick: function () { onChange(it.value); }
-        }, it.label);
-      }));
-    }
-
-    // ---- panel head helper ----------------------------------------------------
     function panelHead(eyebrow, title, right) {
       return el("div", { class: "al-panel__head" }, [
         el("div", null, [
-          el("div", { class: "al-eyebrow" }, eyebrow),
+          el("div", { class: "al-eyebrow", style: "margin-bottom: 6px" }, eyebrow),
           el("h3", { class: "al-panel__title" }, title)
         ]),
         right || null
@@ -678,13 +703,10 @@
     }
 
     // ===========================================================================
-    //  SECTIONS — each mirrors a component in the design's parts.jsx
+    //  TOP BAR — brand + sync-pulse status pills + view tabs + refresh
     // ===========================================================================
-
-    // Top bar: brand + status pills + (Overview/Endpoints) + range tab + refresh.
     function TopBar(state, actions) {
       var brand = el("div", { class: "al-topbar__brand" });
-      // Inline wordmark SVG (brand). Mark circle + three dots + "Promtect".
       brand.innerHTML =
         '<svg width="150" height="30" viewBox="0 0 200 48" fill="none" role="img" aria-label="Promtect">' +
         '<circle cx="24" cy="24" r="18.25" stroke="#25c2b1" stroke-width="3.5"></circle>' +
@@ -699,14 +721,14 @@
       var connTone = state.connected ? "clear" : "leak";
       var connText = state.connected ? "live" : "offline";
       var status = el("div", { class: "al-topbar__status" }, [
-        Badge({ tone: "accent", dot: true, label: "127.0.0.1:8799" }),
-        Badge({ tone: "neutral", label: "loopback" }),
+        Badge({ tone: "accent", staticDot: true, dot: true, label: "127.0.0.1:8799" }),
+        Badge({ tone: "neutral", staticDot: true, dot: true, label: "loopback" }),
         Badge({ tone: connTone, dot: true, label: connText })
       ]);
 
       var refreshBtn = el("button", {
-        class: "al-iconbtn al-iconbtn--md", type: "button",
-        "aria-label": "Refresh", title: "Refresh",
+        class: "al-iconbtn", type: "button",
+        "aria-label": "Refresh metrics", title: "Refresh",
         onclick: function (e) {
           var b = e.currentTarget;
           b.classList.remove("is-spinning");
@@ -715,57 +737,103 @@
           actions.onRefresh();
         }
       });
-      refreshBtn.appendChild(svg(ICON.refresh).firstChild);
+      refreshBtn.appendChild(iconSpan(ICON.refresh).firstChild);
 
-      var actionsRow = el("div", { class: "al-topbar__actions" }, [
-        Tabs(state.view, [
-          { value: "overview", label: "Overview" },
-          { value: "endpoints", label: "Endpoints" }
-        ], actions.onView),
-        Tabs(state.range, [{ value: "all", label: "All-time" }], function () {}),
-        refreshBtn
-      ]);
+      var tabs = el("div", { class: "al-tabs", role: "tablist" }, [
+        { value: "overview", label: "Overview" },
+        { value: "endpoints", label: "Endpoints" }
+      ].map(function (it) {
+        return el("button", {
+          class: "al-tab" + (it.value === state.view ? " al-tab--active" : ""),
+          type: "button", role: "tab",
+          "aria-selected": it.value === state.view ? "true" : "false",
+          onclick: function () { actions.onView(it.value); }
+        }, it.label);
+      }));
 
+      var actionsRow = el("div", { class: "al-topbar__actions" }, [tabs, refreshBtn]);
       return el("header", { class: "al-topbar" }, [brand, status, actionsRow]);
     }
 
-    // Headline: secrets blocked / requests protected / clean rate.
+    // ===========================================================================
+    //  PIPELINE MOTIF — live mask -> restore flow with sync-pulse badges
+    // ===========================================================================
+    function Pipeline(d, state) {
+      var restoreLabel = d.restoreOn ? "restore on" : "strict mode";
+      var head = el("div", { class: "al-pipeline__head" }, [
+        el("div", null, [
+          el("div", { class: "al-eyebrow", style: "margin-bottom: 6px" }, "Pipeline · request lifecycle"),
+          el("h3", { class: "al-panel__title" }, "Mask, forward, restore")
+        ]),
+        el("div", { class: "al-legend", style: "gap: var(--space-3)" }, [
+          Badge({ tone: state.connected ? "clear" : "leak", dot: true, label: state.connected ? "syncing" : "paused" }),
+          Badge({ tone: "accent", staticDot: true, dot: true, label: restoreLabel })
+        ])
+      ]);
+
+      function node(no, name, icon, mod, value, cap) {
+        var icn = el("span", { class: "al-node__icon" });
+        icn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + icon + "</svg>";
+        return el("div", { class: "al-node" + (mod ? " al-node--" + mod : "") }, [
+          el("div", { class: "al-node__top" }, [
+            icn,
+            el("div", null, [
+              el("div", { class: "al-node__no" }, no),
+              el("div", { class: "al-node__name" }, name)
+            ])
+          ]),
+          el("div", { class: "al-node__val al-tabular" }, value),
+          el("div", { class: "al-node__cap" }, cap)
+        ]);
+      }
+      function wire(restore) {
+        return el("div", { class: "al-wire" + (restore ? " al-wire--restore" : "") },
+          el("span", { class: "al-wire__pulse" }));
+      }
+
+      var flow = el("div", { class: "al-pipeline__flow" }, [
+        node("01", "Detect", ICON.scan, "detect", fmt(d.headline.requestsProtected), "requests scanned"),
+        wire(false),
+        node("02", "Mask", ICON.mask, "mask", fmt(d.headline.secretsBlocked), "secrets sealed"),
+        wire(true),
+        node("03", "Restore", ICON.undo, "restore", fmt(d.headline.requestsClean), "passed clean")
+      ]);
+
+      return Card({ className: "al-pipeline al-rise" }, [head, flow]);
+    }
+
+    // ===========================================================================
+    //  HEADLINE — secrets blocked / requests protected / clean rate
+    // ===========================================================================
     function Headline(d) {
       var h = d.headline;
-      var caughtIcon = el("div", { class: "al-headline__icon al-headline__icon--caught" });
-      caughtIcon.innerHTML = '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">' + ICON.shield + "</svg>";
-      var accentIcon = el("div", { class: "al-headline__icon al-headline__icon--accent" });
-      accentIcon.innerHTML = '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">' + ICON.activity + "</svg>";
-      var clearIcon = el("div", { class: "al-headline__icon al-headline__icon--clear" });
-      clearIcon.innerHTML = '<svg viewBox="0 0 24 24" width="1em" height="1em" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round">' + ICON.lock + "</svg>";
-
-      return el("div", { class: "al-headline" }, [
-        Card(null, [caughtIcon, MetricStat({
-          label: "Secrets blocked", value: fmt(h.secretsBlocked), tone: "caught",
-          foot: "all-time"
+      function icon(mod, glyph) {
+        var n = el("div", { class: "al-headline__icon al-headline__icon--" + mod });
+        n.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + glyph + "</svg>";
+        return n;
+      }
+      return el("div", { class: "al-headline al-rise", style: "animation-delay: 60ms" }, [
+        Card({ index: "01" }, [icon("caught", ICON.shield), MetricStat({
+          label: "Secrets blocked", value: fmt(h.secretsBlocked), tone: "caught", foot: "all-time"
         })]),
-        Card(null, [accentIcon, MetricStat({
-          label: "Requests protected", value: fmt(h.requestsProtected), tone: "accent",
-          foot: "all-time"
+        Card({ index: "02" }, [icon("accent", ICON.activity), MetricStat({
+          label: "Requests protected", value: fmt(h.requestsProtected), tone: "accent", foot: "all-time"
         })]),
-        Card(null, [clearIcon, MetricStat({
-          label: "Clean rate", value: h.cleanPct + "%", tone: "clear",
-          foot: fmt(h.requestsClean) + " clean"
+        Card({ index: "03" }, [icon("clear", ICON.lock), MetricStat({
+          label: "Clean rate", value: h.cleanPct + "%", tone: "clear", foot: fmt(h.requestsClean) + " clean"
         })])
       ]);
     }
 
-    // Timeline: caught vs clean, bucketed by hour from recent[].ts_ms.
+    // ===========================================================================
+    //  TRAFFIC — caught vs clean, bucketed by hour from recent[].ts_ms
+    // ===========================================================================
     function Timeline(d) {
       var legend = el("div", { class: "al-legend" }, [
-        el("span", { class: "al-legend__item" }, [
-          el("i", { style: "background: var(--caught-500)" }), "caught"
-        ]),
-        el("span", { class: "al-legend__item" }, [
-          el("i", { style: "background: var(--seal-500)" }), "clean"
-        ])
+        el("span", { class: "al-legend__item" }, [el("i", { style: "background: var(--caught-500)" }), "caught"]),
+        el("span", { class: "al-legend__item" }, [el("i", { style: "background: var(--seal-500)" }), "clean"])
       ]);
-      var head = panelHead("Traffic", "Caught vs clean", legend);
+      var head = panelHead("Traffic · by hour", "Caught vs clean", legend);
 
       var body;
       if (!d.timeline.length) {
@@ -776,24 +844,22 @@
           var total = b.caught + b.clean;
           var hPct = (total / max) * 100;
           var caughtPct = total ? (b.caught / total) * 100 : 0;
-          var bar = el("div", {
-            class: "al-chart__bar",
-            style: "height: " + hPct + "%"
-          }, [el("div", { class: "al-chart__caught", style: "height: " + caughtPct + "%" })]);
-          return el("div", {
-            class: "al-chart__col",
-            title: fmt(b.caught) + " caught · " + fmt(b.clean) + " clean"
-          }, [bar, el("span", { class: "al-chart__lbl" }, b.label)]);
+          var bar = el("div", { class: "al-chart__bar", style: "height: " + hPct + "%" },
+            [el("div", { class: "al-chart__caught", style: "height: " + caughtPct + "%" })]);
+          return el("div", { class: "al-chart__col", title: fmt(b.caught) + " caught · " + fmt(b.clean) + " clean" },
+            [bar, el("span", { class: "al-chart__lbl" }, b.label)]);
         }));
       }
-      return Card("al-panel", [head, body]);
+      return Card({ className: "al-panel", index: "04" }, [head, body]);
     }
 
-    // Detectors: horizontal bars by detector, sorted desc.
+    // ===========================================================================
+    //  DETECTORS — horizontal bars by kind, sorted desc (Pro kinds tinted violet)
+    // ===========================================================================
     function Detectors(d) {
       var top = d.byDetector.slice(0, 8);
-      var head = panelHead("Breakdown", "Secrets by detector",
-        Badge({ tone: "neutral", label: top.length + " kinds" }));
+      var head = panelHead("Breakdown · live", "Secrets by detector",
+        Badge({ tone: "neutral", staticDot: false, label: top.length + " kinds" }));
       var body;
       if (!top.length) {
         body = el("div", { class: "al-empty" }, [
@@ -803,7 +869,7 @@
       } else {
         var max = top.reduce(function (a, x) { return Math.max(a, x.count); }, 1);
         body = el("div", { class: "al-detlist" }, top.map(function (row) {
-          return el("div", { class: "al-detrow" }, [
+          return el("div", { class: "al-detrow" + (row.pro ? " al-detrow--pro" : "") }, [
             DetectorTag(row.kind),
             el("div", { class: "al-detrow__track" }, [
               el("div", { class: "al-detrow__fill", style: "width: " + (row.count / max) * 100 + "%" })
@@ -812,12 +878,63 @@
           ]);
         }));
       }
-      return Card("al-panel", [head, body]);
+      return Card({ className: "al-panel", index: "05" }, [head, body]);
     }
 
-    // Recent requests table.
+    // ===========================================================================
+    //  LICENSE — Pro / license status driven by Pro-class kind presence
+    // ===========================================================================
+    function License(d) {
+      var active = d.pro.active;
+      var head = panelHead("License · detector tier",
+        active ? "Pro detectors active" : "Free core active",
+        Badge({ tone: active ? "pro" : "neutral", dot: true, label: active ? "pro" : "free" }));
+
+      var tier = el("div", { class: "al-license__tier" }, [
+        el("span", { class: "al-license__tiername" }, active ? "Promtect Pro" : "Promtect Free"),
+        Badge({ tone: active ? "pro" : "clear", staticDot: true, dot: true, label: active ? "entropy · PII/PHI" : "known detectors" })
+      ]);
+
+      var rows = el("div", { class: "al-license__rows" }, [
+        row("Free-core kinds", fmt(d.pro.freeKinds) + " active"),
+        row("Pro-class kinds", active ? fmt(d.pro.proKinds) + " active" : "none observed"),
+        row("Status", active ? "Pro-class detectors firing" : "Inferred from audit")
+      ]);
+
+      var note = el("p", { class: "al-note", style: "margin-top: var(--space-2)" },
+        active
+          ? "Pro-class detectors (entropy, PII/PHI) have masked secrets in this log. The tier is inferred from the kinds present in the value-free audit feed."
+          : "Only known free-core detectors have fired. Pro adds a different class — entropy and PII/PHI. The tier is inferred from kind presence; the metrics feed exposes no license value.");
+
+      function row(k, v) {
+        return el("div", { class: "al-license__row" }, [
+          el("span", { class: "al-license__k" }, k),
+          el("span", { class: "al-license__v" }, v)
+        ]);
+      }
+
+      return Card({ className: "al-panel", index: "06" }, [head, el("div", { class: "al-license" }, [tier, rows, note])]);
+    }
+
+    // ===========================================================================
+    //  BYTES — real bytes_in / bytes_out totals
+    // ===========================================================================
+    function Bytes(d) {
+      var head = panelHead("Throughput · all-time", "Bytes processed",
+        Badge({ tone: "accent", staticDot: true, dot: true, label: "before · after" }));
+      var body = el("div", { class: "al-headline", style: "margin: 0; grid-template-columns: repeat(2, 1fr)" }, [
+        Card({ index: "in" }, [MetricStat({ label: "Bytes in", value: bytes(d.bytesIn), tone: "accent", foot: fmt(d.bytesIn) + " B before masking" })]),
+        Card({ index: "out" }, [MetricStat({ label: "Bytes out", value: bytes(d.bytesOut), foot: fmt(d.bytesOut) + " B after masking" })])
+      ]);
+      return Card({ className: "al-panel", index: "07" }, [head, body]);
+    }
+
+    // ===========================================================================
+    //  RECENT — value-free request table
+    // ===========================================================================
     function Recent(d) {
-      var head = panelHead("Live", "Recent requests", Badge({ tone: "neutral", label: "value-free" }));
+      var head = panelHead("Stream · newest first", "Recent requests",
+        Badge({ tone: "neutral", staticDot: false, label: "value-free" }));
       var thead = el("thead", null, el("tr", null, [
         el("th", null, "Time"), el("th", null, "Request"), el("th", null, "Result"),
         el("th", null, "Detectors"), el("th", { class: "al-right" }, "Masked")
@@ -846,20 +963,12 @@
           ]);
         });
       }
-      return Card("al-panel", [head, el("table", { class: "al-table" }, [thead, el("tbody", null, rows)])]);
+      return Card({ className: "al-panel", index: "08" }, [head, el("table", { class: "al-table" }, [thead, el("tbody", null, rows)])]);
     }
 
-    // Bytes panel — replaces a synthetic figure with the real bytes_in/out totals.
-    function Bytes(d) {
-      var head = panelHead("Throughput", "Bytes processed", Badge({ tone: "accent", label: "all-time" }));
-      var body = el("div", { class: "al-headline", style: "margin: 0; grid-template-columns: repeat(2, 1fr)" }, [
-        Card(null, [MetricStat({ label: "Bytes in", value: bytes(d.bytesIn), tone: "accent", foot: fmt(d.bytesIn) + " B" })]),
-        Card(null, [MetricStat({ label: "Bytes out", value: bytes(d.bytesOut), foot: fmt(d.bytesOut) + " B" })])
-      ]);
-      return Card("al-panel", [head, body]);
-    }
-
-    // Endpoints view — honest: shows the two real, live endpoints this UI exposes.
+    // ===========================================================================
+    //  ENDPOINTS VIEW — the two real, live endpoints this UI exposes
+    // ===========================================================================
     function Endpoints(d) {
       var h = d.headline;
       var prom = [
@@ -886,36 +995,39 @@
         bytes_out_total: d.bytesOut
       }, null, 2);
 
-      var promCard = Card("al-panel", [
-        panelHead("Observability", "GET /metrics", Badge({ tone: "accent", label: "Prometheus" })),
+      var promCard = Card({ className: "al-panel", index: "A" }, [
+        panelHead("Observability", "GET /metrics", Badge({ tone: "accent", staticDot: true, dot: true, label: "Prometheus" })),
         el("pre", { class: "al-code" }, prom)
       ]);
-      var jsonCard = Card("al-panel", [
-        panelHead("Web UI feed", "GET /api/metrics", Badge({ tone: "accent", label: "JSON" })),
+      var jsonCard = Card({ className: "al-panel", index: "B" }, [
+        panelHead("Web UI feed", "GET /api/metrics", Badge({ tone: "accent", staticDot: true, dot: true, label: "JSON" })),
         el("pre", { class: "al-code" }, json)
       ]);
-      var noteCard = Card("al-panel", [
-        panelHead("Scope", "All-time, value-free", Badge({ tone: "neutral", label: "honest" })),
-        el("p", { class: "al-note" }, "Promtect's metrics are aggregated live from the value-free audit log and are cumulative (all-time). The proxy does not yet record per-endpoint counts or a time-series history, so this dashboard shows no per-route breakdown and labels every range as all-time — never fabricated history."),
-        el("p", { class: "al-note" }, "The “Caught vs clean” chart is derived honestly by bucketing the recent requests feed by hour; when traffic is sparse it shows only the buckets that actually have data.")
+      var noteCard = Card({ className: "al-panel", index: "C" }, [
+        panelHead("Scope", "All-time, value-free", Badge({ tone: "neutral", staticDot: false, label: "honest" })),
+        el("p", { class: "al-note" }, "Promtect's metrics are aggregated live from the value-free audit log and are cumulative (all-time). The proxy does not record per-endpoint counts or a time-series history, so this dashboard shows no per-route breakdown and labels every range as all-time. Nothing here is fabricated."),
+        el("p", { class: "al-note" }, "The Caught vs clean chart is derived by bucketing the recent requests feed by hour. When traffic is sparse it shows only the buckets that actually have data.")
       ]);
 
-      return el("div", { class: "al-endpoints" }, [promCard, jsonCard, noteCard]);
+      return el("div", { class: "al-endpoints al-rise" }, [promCard, jsonCard, noteCard]);
     }
 
-    // Empty / zero state.
+    // ===========================================================================
+    //  EMPTY STATE
+    // ===========================================================================
     function EmptyState() {
-      return Card("al-panel", [
+      return Card({ className: "al-panel al-rise", index: "00" }, [
         el("div", { class: "al-empty" }, [
           el("div", { class: "al-empty__title" }, "No traffic yet"),
-          el("p", { class: "al-note" }, "Point your AI tool at the Promtect proxy (default 127.0.0.1:8787) and your secrets are masked at the door. Counts, detector kinds and byte sizes appear here — never a secret value.")
+          el("p", { class: "al-note", style: "max-width: 52ch" }, "Point your AI tool at the Promtect proxy (default 127.0.0.1:8790) and your secrets are masked at the door. Counts, detector kinds and byte sizes appear here — never a secret value.")
         ])
       ]);
     }
 
     // ===========================================================================
-    //  DATA — map the live /api/metrics payload into the shape the UI renders.
-    //  The design's data.js is replaced entirely by this live mapping.
+    //  DATA — map the live /api/metrics payload into the render model.
+    //  Identical field reads to the previous version, plus a Pro-tier inference
+    //  derived purely from which detector kinds are present (no new API field).
     // ===========================================================================
     function buildModel(m) {
       m = m || {};
@@ -925,8 +1037,13 @@
       var byDetObj = m.by_detector || {};
 
       var byDetector = Object.keys(byDetObj)
-        .map(function (k) { return { kind: k, count: Number(byDetObj[k]) || 0 }; })
+        .map(function (k) { return { kind: k, count: Number(byDetObj[k]) || 0, pro: isProKind(k) }; })
         .sort(function (a, b) { return b.count - a.count; });
+
+      // Pro-tier inference: count free-core vs Pro-class kinds among those that
+      // actually fired. Any Pro-class kind present => Pro is active.
+      var proKinds = 0, freeKinds = 0;
+      byDetector.forEach(function (x) { if (x.pro) proKinds += 1; else freeKinds += 1; });
 
       var recent = (Array.isArray(m.recent) ? m.recent : []).map(function (r) {
         return {
@@ -937,12 +1054,11 @@
         };
       });
 
-      // Timeline: bucket recent[].ts_ms by hour into caught/clean counts. This is
-      // the only honest time-series we can derive — the API has no history.
       var timeline = deriveTimeline(m.recent);
-
       var cleanPct = total > 0 ? ((clean / total) * 100).toFixed(1) : "0.0";
 
+      // restore on/off is not exposed by the API; default to "on" (the proxy
+      // default) so the pipeline motif reads truthfully in the common case.
       return {
         empty: total === 0,
         headline: {
@@ -956,12 +1072,14 @@
         byDetector: byDetector,
         recent: recent,
         bytesIn: Number(m.bytes_in_total) || 0,
-        bytesOut: Number(m.bytes_out_total) || 0
+        bytesOut: Number(m.bytes_out_total) || 0,
+        restoreOn: true,
+        pro: { active: proKinds > 0, proKinds: proKinds, freeKinds: freeKinds }
       };
     }
 
-    // Bucket the recent feed by clock-hour. Each bucket carries caught (masked>0)
-    // vs clean (masked===0) counts. Returns oldest->newest, max ~12 buckets.
+    // Bucket the recent feed by clock-hour: caught (masked>0) vs clean (masked===0).
+    // Oldest -> newest, capped at the 12 most-recent buckets.
     function deriveTimeline(recent) {
       if (!Array.isArray(recent) || !recent.length) return [];
       var HOUR = 3600 * 1000;
@@ -974,9 +1092,7 @@
         if ((Number(r.masked) || 0) > 0) buckets[key].caught += 1;
         else buckets[key].clean += 1;
       });
-      var keys = Object.keys(buckets).map(Number).sort(function (a, b) { return a - b; });
-      // Keep at most the 12 most-recent buckets so the chart stays readable.
-      keys = keys.slice(-12);
+      var keys = Object.keys(buckets).map(Number).sort(function (a, b) { return a - b; }).slice(-12);
       return keys.map(function (k) {
         var b = buckets[k];
         var dt = new Date(k * HOUR);
@@ -993,7 +1109,6 @@
 
     var state = {
       view: "overview",
-      range: "all",
       connected: false,
       model: buildModel(null)
     };
@@ -1001,24 +1116,27 @@
     function render() {
       var d = state.model;
       var main = el("main", { class: "al-page" }, [
-        el("div", { class: "al-page__head" }, [
+        el("div", { class: "al-page__head al-rise" }, [
+          el("div", { class: "al-page__kicker" },
+            Badge({ tone: "accent", staticDot: true, dot: true, label: "Local · offline · value-free" })),
           el("h1", { class: "al-page__h1" }, "Secrets, caught at the door."),
           el("p", { class: "al-page__sub" },
-            "Local, fully-offline metrics for the Promtect proxy — counts, detector kinds and byte sizes only. Never a secret value or body content.")
+            "Local, fully-offline metrics for the Promtect proxy. Counts, detector kinds and byte sizes only — never a secret value or body content.")
         ])
       ]);
 
       if (state.view === "overview") {
+        main.appendChild(Pipeline(d, state));
         if (d.empty) {
-          main.appendChild(EmptyState());
+          main.appendChild(el("div", { class: "al-stack" }, EmptyState()));
         } else {
-          main.appendChild(Headline(d));
-          main.appendChild(el("div", { class: "al-grid" }, [Timeline(d), Detectors(d)]));
-          main.appendChild(Recent(d));
-          main.appendChild(el("div", { style: "margin-top: var(--space-5)" }, Bytes(d)));
+          main.appendChild(el("div", { class: "al-stack" }, Headline(d)));
+          main.appendChild(el("div", { class: "al-grid al-rise", style: "animation-delay: 120ms" }, [Timeline(d), Detectors(d)]));
+          main.appendChild(el("div", { class: "al-grid--license al-rise", style: "animation-delay: 160ms" }, [License(d), Bytes(d)]));
+          main.appendChild(el("div", { class: "al-rise", style: "animation-delay: 200ms" }, Recent(d)));
         }
       } else {
-        main.appendChild(Endpoints(d));
+        main.appendChild(el("div", { class: "al-stack" }, Endpoints(d)));
       }
 
       var app = el("div", { class: "al-app" }, [
@@ -1052,7 +1170,6 @@
         });
     }
 
-    // Initial paint (empty model), first fetch, then poll every POLL_MS.
     render();
     poll();
     setInterval(poll, POLL_MS);

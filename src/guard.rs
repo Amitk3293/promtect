@@ -346,6 +346,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         max_body_bytes: proxy::DEFAULT_MAX_BODY_BYTES,
         restore: plan.restore,
         requests: requests.clone(),
+        extra_detect: None,
     };
 
     // Banner + notes go to STDERR so they never pollute the tool's stdout (some

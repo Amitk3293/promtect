@@ -21,6 +21,23 @@ pub struct Match {
     pub end: usize,
 }
 
+impl Match {
+    /// Build a match for an externally-detected secret. Used by downstream
+    /// composition (`promtect-pro`) that runs extra detection passes on top of
+    /// the core and feeds the merged list to [`crate::mask::mask_with_matches`].
+    ///
+    /// `value` must equal `text[start..end]`, and `start`/`end` must be byte
+    /// offsets on `char` boundaries, for masking to round-trip correctly.
+    pub fn new(kind: &'static str, value: String, start: usize, end: usize) -> Self {
+        Match {
+            kind,
+            value: Zeroizing::new(value),
+            start,
+            end,
+        }
+    }
+}
+
 /// One regex detector. `group` picks which capture is the secret: 0 = the whole
 /// match (token-shaped secrets), N = a sub-group (the value in `KEY=value`, the
 /// password in a DB URL). `guard_fn` is an optional predicate: when `Some(f)`,
