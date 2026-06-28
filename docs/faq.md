@@ -33,7 +33,7 @@ Check, in order:
 2. **Is the mode right for the tool?** Claude → default; Cursor/Codex →
    `PROMTECT_MODE=openai`; Ollama → `PROMTECT_MODE=ollama`. A mismatch forwards to
    the wrong upstream. See [integrations/](integrations/README.md).
-3. **Is the secret a known format?** Promtect masks the 71 formats in
+3. **Is the secret a known format?** Promtect masks the known formats in
    [detectors.md](detectors.md). An unknown-format / high-entropy secret with no
    recognizable shape is **not** caught (that's a documented gap — see below).
 4. **Is it a non-text body?** Binary, multipart, compressed, or base64 bodies are

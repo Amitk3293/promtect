@@ -6,7 +6,7 @@ URL to Promtect.
 ## Quickest: one command
 
 ```sh
-promtect guard codex "fix the s3 upload"   # starts the proxy, runs Codex, masks + restores
+promtect guard codex                       # starts the proxy, runs Codex, masks + restores
 promtect guard codex --openrouter          # route Codex to OpenRouter (see note below)
 ```
 

@@ -14,7 +14,7 @@ it at the source, on your machine, for the price of a couple of coffees a month.
 
 ## What you pay for
 
-The free core catches passwords and API keys it can recognize: 71 known formats from AWS,
+The free core catches passwords and API keys it can recognize: known formats from AWS,
 OpenAI, Stripe, GitHub, and the rest. Pro adds the things a known-format scanner can't see.
 
 - **Secrets that don't match a known pattern.** Homegrown keys, internal tokens, anything
@@ -40,7 +40,7 @@ Prices below are indicative ahead of general availability. Pay annually and get 
 |---|---|---|---|---|
 | Price | $0 | **$12 / dev / month** | **$25 / dev / month** | from quote |
 | Billing | forever | annual ($96/yr), or $12 monthly | annual ($240/yr), 3-seat minimum | contact sales |
-| Catches 71 known passwords and API key formats | ✅ | ✅ | ✅ | ✅ |
+| Catches known passwords and API key formats | ✅ | ✅ | ✅ | ✅ |
 | Runs on your machine, no cloud, nothing to install in your browser | ✅ | ✅ | ✅ | ✅ |
 | Catches secrets that don't match a known pattern |  | ✅ | ✅ | ✅ |
 | Catches customer personal info (names, emails, phones, addresses) and payment details (card numbers, ID numbers) |  | ✅ | ✅ | ✅ |

@@ -1,6 +1,6 @@
 # Promtect Pro
 
-The free core in this repo masks 71 known secret formats before your AI coding
+The free core in this repo masks known secret formats before your AI coding
 tool sends them upstream. That is the floor. Most secrets that leak are not a
 named token format, and the request body is not the only surface worth watching.
 Pro is the backstop for the rest: it adds detector classes the core cannot
@@ -13,7 +13,7 @@ This doc is what Pro is and how it works. For pricing and tiers, see
 
 ## What Pro adds
 
-Pro layers extra detection passes on top of the core's `detect()`. The free 71
+Pro layers extra detection passes on top of the core's `detect()`. The free
 detectors keep running unchanged; Pro adds:
 
 - **Entropy / unknown-format secrets.** A Shannon-entropy pass catches

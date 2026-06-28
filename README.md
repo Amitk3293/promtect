@@ -10,8 +10,7 @@
 **One file with a key in it, handed to an AI tool, is a key you no longer control. You
 can rotate it. You can't un-send it.**
 
-Promtect is a local proxy that catches every API key, token, and password, **71
-kinds**, before your AI tool can send them. Each secret is masked on the way out,
+Promtect is a local proxy that catches every API key, token, and password before your AI tool can send them. Each secret is masked on the way out,
 then restored in the reply (or kept masked in strict mode, your call). The model
 does its job on your real code; your secrets stay on your machine.
 
@@ -108,7 +107,7 @@ standalone to tail an existing audit log without starting a proxy.
 |  | **Promtect** | Veil | LiteLLM masking |
 |---|:---:|:---:|:---:|
 | **Restore secrets in the response** | ✅ yes, or keep masked (`PROMTECT_RESTORE=false`) | ❌ cannot | ❌ cannot |
-| Detect secrets in transit | ✅ 71 detectors | ⚠️ limited | ✅ |
+| Detect secrets in transit | ✅ detectors | ⚠️ limited | ✅ |
 | Real-time restore as the answer streams in | ✅ per-token | ❌ | ❌ |
 | No root certificate to install | ✅ | ❌ installs a CA | n/a |
 | Secrets wiped from memory (Rust + zeroize) | ✅ | ❌ | ❌ |
@@ -230,7 +229,7 @@ masks your secrets before any of them see them.
 
 ## What it detects
 
-**71 detectors** ship with Promtect, covering known credential formats across ~70 providers:
+Promtect ships detectors covering known credential formats across ~70 providers:
 
 - **AI/LLM:** Anthropic, OpenAI, Groq, OpenRouter, Replicate, Perplexity,
   Fireworks, NVIDIA, HuggingFace, Google AI
@@ -331,7 +330,7 @@ See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
 ## Documentation
 
 - **[Try it (FAQ & troubleshooting)](docs/faq.md)** — prove it's masking, multi-tool setup, strict mode, common gotchas.
-- **[Detector reference](docs/detectors.md)** — every one of the 71 detectors, by provider.
+- **[Detector reference](docs/detectors.md)** — every detector, by provider, with the current count.
 - **[Architecture](docs/architecture.md)** — how a request flows through detect → vault → mask → streaming restore.
 - **[Integrations](docs/integrations/README.md)** — Claude Code, Cursor, Codex, Ollama, OpenRouter, chaining.
 - **[Pro overview](docs/pro.md)** — what the paid layer adds and how it composes with the core.
@@ -349,7 +348,7 @@ mask → forward → restore round-trip against a mock upstream.
 
 Promtect is **open-core**.
 
-The core in this repo (the proxy and all 71 known-secret detectors) is licensed under
+The core in this repo (the proxy and all its known-secret detectors) is licensed under
 the **Sustainable Use License**, a fair-code, source-available license. It is free for
 internal business, personal, and non-commercial use. You can read, run, modify, and
 self-host it. You cannot resell it or run it as a paid service for others. Full terms

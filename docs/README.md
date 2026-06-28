@@ -16,7 +16,7 @@ no telemetry. Start here.
 
 ## Reference
 
-- **[Detector reference](detectors.md)** — every one of the 71 detectors, by provider.
+- **[Detector reference](detectors.md)** — every detector, by provider, with the current count.
 - **[Architecture](architecture.md)** — the per-request mask, forward, and restore pipeline.
 - **[Threat model](../THREAT-MODEL.md)** — what Promtect protects, and what it does not.
 
