@@ -95,6 +95,7 @@ pub async fn run() {
         restore: true,
         requests: Arc::new(AtomicU64::new(0)),
         extra_detect: None,
+        output_scan: None,
     };
     let promtect_url = match spawn(proxy::app(ctx)).await {
         Ok(u) => u,

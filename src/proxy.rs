@@ -74,6 +74,10 @@ pub struct Ctx {
     /// Optional extra detection pass (see [`ExtraDetector`]). `None` in the public
     /// core; set by `promtect-pro` to compose its detectors into masking.
     pub extra_detect: Option<ExtraDetector>,
+    /// Optional response-side output scan (see [`crate::stream::ResponseScanner`]).
+    /// `None` in the public core; set by `promtect-pro` to flag secrets the model
+    /// echoes back or generates. Observe-only — never alters the response bytes.
+    pub output_scan: Option<crate::stream::ResponseScanner>,
 }
 
 /// Core detectors plus any extra (Pro) detection pass, merged into one match list.
@@ -476,7 +480,8 @@ async fn restore_response(
         // streams. SSE answers reach the client token-by-token instead of being
         // buffered whole (the M0 "hang"). The vault moves into the stream, which
         // the server polls after this handler returns.
-        let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id);
+        let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id)
+            .with_output_scanner(ctx.output_scan.clone());
         Body::from_stream(restore_stream(r.bytes_stream().boxed(), sr))
     } else {
         // Strict mode (PROMTECT_RESTORE=false), or a binary/compressed response:

@@ -43,7 +43,11 @@ use crate::{
 /// high-risk upstream, refused off-loopback bind, port already in use) or an
 /// `axum::serve` error. The function never calls `std::process::exit` itself, so
 /// the caller decides how to terminate.
-pub async fn run_proxy(extra_detect: Option<ExtraDetector>, no_dashboard: bool) -> u8 {
+pub async fn run_proxy(
+    extra_detect: Option<ExtraDetector>,
+    output_scan: Option<crate::stream::ResponseScanner>,
+    no_dashboard: bool,
+) -> u8 {
     let port = match proxy::parse_port(
         "PROMTECT_PORT",
         std::env::var("PROMTECT_PORT").ok().as_deref(),
@@ -98,6 +102,17 @@ pub async fn run_proxy(extra_detect: Option<ExtraDetector>, no_dashboard: bool) 
     // falsey → strict mode (secrets never re-enter the response).
     let restore = proxy::parse_restore(std::env::var("PROMTECT_RESTORE").ok().as_deref());
 
+    // The output scan runs whenever a scanner is supplied (Pro, entitled), unless
+    // the operator disables it. PROMTECT_OUTPUT_SCAN shares the default-on /
+    // explicit-falsey convention of PROMTECT_RESTORE. The public core supplies no
+    // scanner, so this is a no-op there regardless of the variable.
+    let output_scan = if proxy::parse_restore(std::env::var("PROMTECT_OUTPUT_SCAN").ok().as_deref())
+    {
+        output_scan
+    } else {
+        None
+    };
+
     let audit_path_for_dash = audit_path.clone();
     let upstream_for_log = upstream.clone();
     let ctx = Ctx {
@@ -108,6 +123,7 @@ pub async fn run_proxy(extra_detect: Option<ExtraDetector>, no_dashboard: bool) 
         restore,
         requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         extra_detect,
+        output_scan,
     };
 
     let app = proxy::app(ctx);
