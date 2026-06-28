@@ -40,6 +40,17 @@ fn code_expressions_are_not_secrets() {
 }
 
 #[test]
+fn new_prefix_detectors_do_not_overmatch() {
+    // Supabase's publishable key is non-secret and must not be masked; only
+    // `sb_secret_`/`sbp_` are secrets.
+    clean("sb_publishable_aBcDeFgHiJkLmNoPqRsTuV");
+    // `rnd_` code identifiers carry underscores, so they never reach the 30-char
+    // underscore-free run a real Render key needs.
+    clean("let rnd_seed_value = make_rng_seed(input_entropy_source);");
+    clean("rnd_next_value_from_the_generator_helper_function");
+}
+
+#[test]
 fn innocuous_prose_and_code_are_clean() {
     clean("the quick brown fox jumps over the lazy dog");
     clean("GET /api/users?id=42 HTTP/1.1");

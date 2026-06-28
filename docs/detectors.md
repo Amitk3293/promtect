@@ -1,6 +1,6 @@
 # Detector reference
 
-Promtect ships **71 detectors** today (the list keeps growing) covering known
+Promtect ships **75 detectors** today (the list keeps growing) covering known
 credential formats across ~70 providers. Each detector has a `kind` — the label that appears in the sentinel
 (`«promtect:aws_key:0001»`), the audit log, and the dashboard breakdown.
 
@@ -24,6 +24,7 @@ format only — Promtect never phones a provider to validate a key.
 | `nvidia_key` | NVIDIA | `nvapi-…` |
 | `hf_token` | Hugging Face | `hf_…` |
 | `google_api` | Google AI (API key) | `AIza…` |
+| `xai_key` | xAI (Grok) | `xai-…` |
 
 > Providers with no distinctive prefix (Mistral, Cohere, Together, DeepSeek) are
 > still caught in `KEY=value` form by `env_secret`.
@@ -45,6 +46,9 @@ format only — Promtect never phones a provider to validate a key.
 | `databricks_token` | Databricks | `dapi<32 hex>` |
 | `planetscale_token` | PlanetScale | `pscale_pw_…` / `pscale_tkn_…` |
 | `tailscale_key` | Tailscale | `tskey-auth-…` / `tskey-api-…` |
+| `supabase_key` | Supabase (secret key / PAT) | `sb_secret_…` / `sbp_…` |
+| `render_key` | Render | `rnd_…` |
+| `fly_token` | Fly.io (access token) | `FlyV1 fm2_…` |
 
 ## Developer tools / platforms
 
@@ -116,7 +120,7 @@ format only — Promtect never phones a provider to validate a key.
 | `jwt` | JSON Web Token | `eyJ….eyJ….<sig>` |
 | `private_key` | PEM private key block | `-----BEGIN … PRIVATE KEY-----` |
 | `pgp_private_key` | PGP private key block | `-----BEGIN PGP PRIVATE KEY BLOCK-----` |
-| `db_password` | Database-URL password | `postgres://user:••••@host` (also mysql, mongodb, redis, amqp, mariadb, mssql) |
+| `db_password` | Database-URL password | `postgres://user:••••@host` (also mysql, mongodb, redis, amqp, mariadb, mssql, clickhouse, cockroachdb) |
 | `env_secret` | `.env`-style `KEY=value` | `PASSWORD=…`, `API_KEY=…`, `SECRET=…` (unquoted, `"…"`, `'…'`) |
 
 `env_secret` carries a placeholder + code-expression guard: values under 6 chars,
