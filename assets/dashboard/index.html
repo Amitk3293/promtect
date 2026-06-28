@@ -1152,6 +1152,11 @@
       root.appendChild(app);
     }
 
+    // Signature of what is currently painted. Re-rendering rebuilds the whole DOM,
+    // which re-fires the al-rise entrance animations and visibly flashes the page.
+    // So we only repaint when the connection state or the metrics actually change.
+    var lastSig = null;
+
     function poll() {
       fetch(ENDPOINT, { headers: { accept: "application/json" }, cache: "no-store" })
         .then(function (res) {
@@ -1161,11 +1166,16 @@
         .then(function (json) {
           state.connected = true;
           state.model = buildModel(json);
+          var sig = "on|" + JSON.stringify(json);
+          if (sig === lastSig) return; // unchanged → no repaint, no blink
+          lastSig = sig;
           render();
         })
         .catch(function () {
           // Keep the last good model; just flip the connection badge to offline.
           state.connected = false;
+          if (lastSig === "off") return; // already showing offline → no repaint
+          lastSig = "off";
           render();
         });
     }
