@@ -98,9 +98,11 @@ Honesty over polish, so you can decide with eyes open:
   proof.
 - **Response scanning is regex v1.** It catches signature-shaped secrets in the
   reply. It is not entropy-aware or personal-data-aware on the inbound side yet.
-- **No fleet, no central plane.** Shared policy across a team, central audit,
-  SSO, RBAC, and SIEM export are Team and Enterprise work, not in this binary.
-  See [COMMERCIAL.md](../COMMERCIAL.md) and [ROADMAP.md](../ROADMAP.md).
+- **No fleet, no central plane.** A Team license can already load an org-custom
+  detector rulebook (`PROMTECT_RULEBOOK`, one `<kind> <regex>` per line) so a team
+  masks its own internal secret formats. But distributing that rulebook across a
+  fleet, central audit, SSO, RBAC, and SIEM export are Team and Enterprise work not
+  in this binary. See [COMMERCIAL.md](../COMMERCIAL.md) and [ROADMAP.md](../ROADMAP.md).
 
 Pro is a backstop. It widens what Promtect catches before your code leaves the
 machine. It does not replace reviewing the Skills you install or rotating a key
