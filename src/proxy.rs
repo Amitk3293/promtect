@@ -49,6 +49,22 @@ fn text_response(status: u16, msg: impl Into<String>) -> Response {
 /// path. It is a leak-only seam: it can ADD matches, never remove the core's.
 pub type ExtraDetector = Arc<dyn Fn(&str) -> Vec<crate::detect::Match> + Send + Sync>;
 
+/// Process-wide "quiet" flag. When set (by `guard`, which wraps a full-screen TUI
+/// like Claude Code), routine per-request masking notifications are suppressed so
+/// they do not corrupt the tool's terminal. Security warnings (a leak, a blocked
+/// request) and the guard end-of-session summary are NOT suppressed.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Suppress (or restore) routine per-request stderr notifications process-wide.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether routine notifications are currently suppressed (see [`set_quiet`]).
+pub fn is_quiet() -> bool {
+    QUIET.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// NOTE: there is deliberately NO vault here. The vault is created fresh per
 /// request inside [`handle`] — a single shared vault would let a sentinel minted
 /// in one request restore a secret belonging to a *different* request
@@ -280,8 +296,10 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             let masked = mask_with_matches(text, matches, &vault, &ctx.audit, &request_id);
 
             // Emit a Promtect-attributed stderr line so the user can see masking
-            // in their terminal without opening the dashboard.
-            if hit_count > 0 {
+            // in their terminal without opening the dashboard. Suppressed under
+            // `guard` (quiet mode) so it does not corrupt a wrapped TUI; the count
+            // still lands in the audit log, the dashboard, and the exit summary.
+            if hit_count > 0 && !is_quiet() {
                 eprintln!(
                     "[promtect] req {}: masked {} secret{} ({})",
                     &request_id[..8],
@@ -500,6 +518,15 @@ async fn restore_response(
 #[cfg(test)]
 mod tests {
     use super::resolve_upstream;
+    use super::{is_quiet, set_quiet};
+
+    #[test]
+    fn quiet_flag_round_trips() {
+        set_quiet(true);
+        assert!(is_quiet(), "quiet should be on after set_quiet(true)");
+        set_quiet(false);
+        assert!(!is_quiet(), "quiet should be off after set_quiet(false)");
+    }
 
     #[test]
     fn default_mode_is_anthropic() {
