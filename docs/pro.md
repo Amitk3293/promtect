@@ -22,9 +22,11 @@ detectors keep running unchanged; Pro adds:
   long English sentence or a git SHA does not read as a secret. This is the
   catch for the credential you invented in-house that GitGuardian never heard of.
 - **Personal and payment data.** Email addresses, phone numbers, credit card
-  numbers (Luhn-validated, so a random 16-digit string is not flagged), and US
-  Social Security numbers (range-guarded against impossible groups). This is the
-  data that turns one leak into a GDPR or HIPAA problem, not only API keys.
+  numbers (Luhn-validated, so a random 16-digit string is not flagged), bank
+  account numbers (IBAN, checksum-validated), individual and employer tax IDs
+  (ITIN and EIN), and US Social Security numbers (range-guarded against impossible
+  groups). This is the data that turns one leak into a GDPR or HIPAA problem, not
+  only API keys.
 - **Heuristic Skills scanner.** `promtect-pro skills scan <path>` walks
   `SKILL.md` files and flags three things: instruction-injection patterns,
   secret-exfiltration shapes (`curl`, `scp`, `nc`, piping `$VAR` to a remote),

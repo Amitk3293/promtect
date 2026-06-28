@@ -6,7 +6,7 @@ direction, not a delivery contract. Have a need that's not here? Open an issue.
 ## Principle
 
 **The free core stays free.** Everything that ships in this repo — the proxy, the
-71 known-format detectors, mask + restore, strict mode, the value-free audit log
+96 known-format detectors, mask + restore, strict mode, the value-free audit log
 and dashboard — is licensed under the Sustainable Use License (fair-code,
 source-available), free to use, modify, and self-host, and always will be. Paid
 work is a *different class*
@@ -15,7 +15,7 @@ of detection and team tooling built on top, never a paywall around what's here.
 ## Shipped (v0.1)
 
 - Loopback masking proxy, no root CA, no telemetry.
-- 71 known-format detectors ([detectors.md](docs/detectors.md)).
+- 96 known-format detectors ([detectors.md](docs/detectors.md)).
 - Mask outbound + streaming restore inbound; strict mode (`PROMTECT_RESTORE=false`).
 - Per-request vault, zeroized memory, single-pass restore.
 - Upstream risk classification + `PROMTECT_BLOCK_RISKY` fail-closed.

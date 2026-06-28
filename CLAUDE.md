@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 Promtect: a local-first security proxy (Rust, Axum). It sits on loopback, masks secrets
-(API keys, DB passwords, JWTs, PEM keys — ~75 detectors) in outbound AI-tool requests
+(API keys, DB passwords, JWTs, PEM keys — 96 detectors) in outbound AI-tool requests
 before they reach a provider (Anthropic/OpenAI/Ollama/OpenRouter), then restores them in
 the streamed response. No root CA, no cloud, no telemetry. Free core is under the
 Sustainable Use License (fair-code, source-available);
