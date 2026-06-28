@@ -87,6 +87,14 @@ impl Vault {
         self.lock().by_sentinel.get(sentinel).cloned()
     }
 
+    /// Whether `secret` was registered during request masking (one of the user's
+    /// own secrets, which the restorer puts back into the response). The output
+    /// scan uses this to ignore restored request secrets and flag only secrets the
+    /// response itself introduced.
+    pub fn knows_secret(&self, secret: &str) -> bool {
+        self.lock().by_secret.contains_key(secret)
+    }
+
     /// Longest sentinel currently registered. Bounds the streaming restorer's
     /// look-back buffer: a `«`-led run longer than this cannot be a sentinel.
     pub fn max_sentinel_len(&self) -> usize {

@@ -210,6 +210,6 @@ async fn main() {
     // inlined startup. run_proxy returns the exit code rather than exiting itself.
     let no_dashboard = args.iter().any(|a| a == "--no-dashboard");
     std::process::exit(i32::from(
-        promtect::run::run_proxy(None, no_dashboard).await,
+        promtect::run::run_proxy(None, None, no_dashboard).await,
     ));
 }

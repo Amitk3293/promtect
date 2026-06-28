@@ -44,6 +44,7 @@ fn ctx(upstream_url: &str) -> promtect::proxy::Ctx {
         restore: true,
         requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         extra_detect: None,
+        output_scan: None,
     }
 }
 
@@ -188,6 +189,7 @@ async fn upstream_error_returns_502() {
         restore: true,
         requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         extra_detect: None,
+        output_scan: None,
     };
     let promtect_url = spawn(promtect::proxy::app(dead_ctx)).await;
 
@@ -391,6 +393,7 @@ async fn oversized_body_is_rejected_with_413() {
         restore: true,
         requests: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         extra_detect: None,
+        output_scan: None,
     };
     let promtect_url = spawn(promtect::proxy::app(small_cap)).await;
 
