@@ -202,11 +202,15 @@ impl StreamRestorer {
                 // Value-free: only the detector kind is recorded, never the secret.
                 self.audit
                     .record("output_secret", m.kind, "«output-scan»", &self.request_id);
-                let id = self.request_id.get(..8).unwrap_or(self.request_id.as_str());
-                eprintln!(
-                    "[promtect] \u{26a0}\u{fe0f}  output req {id}: response contained a {} the model produced \u{2014} not from your prompt",
-                    m.kind
-                );
+                // Suppressed under guard (quiet mode) so it does not corrupt a
+                // wrapped TUI; the event is still audited and shown in the summary.
+                if !crate::proxy::is_quiet() {
+                    let id = self.request_id.get(..8).unwrap_or(self.request_id.as_str());
+                    eprintln!(
+                        "[promtect] \u{26a0}\u{fe0f}  output req {id}: response contained a {} the model produced \u{2014} not from your prompt",
+                        m.kind
+                    );
+                }
             }
         }
         // Roll the overlap window forward over the just-scanned text.

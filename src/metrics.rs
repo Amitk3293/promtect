@@ -34,6 +34,13 @@ pub struct Metrics {
     pub bytes_out_total: u64,
     /// Most-recent request summaries, value-free, newest first (capped at 20).
     pub recent: Vec<RecentRequest>,
+    /// Total secrets the Pro output scan flagged in responses — ones the model
+    /// echoed back or generated, which were never in the request. Stays `0` unless
+    /// the Pro response output scan ran (the public core emits no such events).
+    pub output_secrets_total: u64,
+    /// Per-detector counts of output-scan findings (same kind names as
+    /// [`Metrics::by_detector`], e.g. `"aws_key" -> 2`).
+    pub output_by_detector: BTreeMap<String, u64>,
 }
 
 /// A single value-free request summary entry in [`Metrics::recent`].
@@ -173,6 +180,18 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                     *m.by_detector.entry(det.to_string()).or_default() += 1;
                 }
             }
+            // Pro output scan: a secret found in the RESPONSE (model-echoed or
+            // generated). Same value-free shape as a mask event; counted into its
+            // own totals so the dashboard can distinguish inbound-reply leaks from
+            // outbound request masking.
+            "output_secret" => {
+                m.output_secrets_total += 1;
+                if let Some(det) = val.get("detector").and_then(|v| v.as_str())
+                    && is_valid_detector_name(det)
+                {
+                    *m.output_by_detector.entry(det.to_string()).or_default() += 1;
+                }
+            }
             // "unmask" and unknown actions are intentionally ignored for counts.
             _ => {}
         }
@@ -235,6 +254,25 @@ impl Metrics {
             // direct interpolation into the label cannot break out or inject.
             out.push_str(&format!(
                 "promtect_secrets_masked_total{{detector=\"{detector}\"}} {count}\n"
+            ));
+        }
+
+        // Pro output scan: secrets found in the RESPONSE (model-echoed/generated).
+        push_counter(
+            &mut out,
+            "promtect_output_secrets_total",
+            "Secrets the output scan found in responses (model-echoed or generated).",
+            self.output_secrets_total,
+            None,
+        );
+        out.push_str(
+            "# HELP promtect_output_secrets_by_detector Output-scan findings, by detector.\n",
+        );
+        out.push_str("# TYPE promtect_output_secrets_by_detector counter\n");
+        for (detector, count) in &self.output_by_detector {
+            // Names are validated to [a-z0-9_]+ by aggregate(); safe to interpolate.
+            out.push_str(&format!(
+                "promtect_output_secrets_by_detector{{detector=\"{detector}\"}} {count}\n"
             ));
         }
 
@@ -318,6 +356,11 @@ mod tests {
             r#"{{"ts_ms":4000,"action":"unmask","detector":"sentinel","placeholder":"«promtect:aws_key:0001»","request_id":"req-1"}}"#
         )
         .unwrap();
+        writeln!(
+            f,
+            r#"{{"ts_ms":5000,"action":"output_secret","detector":"aws_key","placeholder":"«output-scan»","request_id":"req-2"}}"#
+        )
+        .unwrap();
         writeln!(f, "{{not valid json{{").unwrap();
 
         (aggregate(&path), path)
@@ -331,6 +374,19 @@ mod tests {
         let (m, path) = fixture_metrics();
         std::fs::remove_file(&path).ok();
         assert_eq!(m.requests_total, 3);
+    }
+
+    #[test]
+    fn aggregate_counts_output_scan_findings() {
+        // 1 "output_secret" event in the fixture (aws_key) → counted into the
+        // output-scan totals and exported to Prometheus, separate from masking.
+        let (m, path) = fixture_metrics();
+        let prom = m.to_prometheus();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(m.output_secrets_total, 1);
+        assert_eq!(m.output_by_detector.get("aws_key"), Some(&1));
+        assert!(prom.contains("promtect_output_secrets_total 1"));
+        assert!(prom.contains("promtect_output_secrets_by_detector{detector=\"aws_key\"} 1"));
     }
 
     #[test]
