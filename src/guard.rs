@@ -439,6 +439,14 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     if plan.base_var == "OPENAI_API_BASE" {
         cmd.env("OPENAI_BASE_URL", &base_url);
     }
+    // Wrapping a full-screen TUI (Claude Code, Codex, …): stay quiet during the
+    // session so per-request notifications do not corrupt the tool's terminal.
+    // The audit log + dashboard still capture everything; the summary prints below.
+    crate::proxy::set_quiet(true);
+    // Snapshot the audit so the exit summary reflects THIS session, not the whole
+    // append-only log.
+    let baseline = crate::metrics::aggregate(std::path::Path::new(&audit_path_for_dash));
+
     let status = cmd.status().await;
 
     // Tripwire: if the proxy never saw a request, the tool bypassed it entirely
@@ -450,12 +458,20 @@ pub async fn guard(plan: GuardPlan) -> i32 {
             "--help" | "-h" | "--version" | "version" | "help"
         )
     });
-    if !is_dry_run && requests.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-        eprintln!(
-            "promtect guard: WARNING the proxy saw 0 requests — did '{}' use {}? \
-             secrets may have gone direct (unmasked).",
-            plan.bin, plan.base_var
-        );
+    if !is_dry_run {
+        let req_count = requests.load(std::sync::atomic::Ordering::Relaxed);
+        if req_count == 0 {
+            eprintln!(
+                "promtect guard: WARNING the proxy saw 0 requests — did '{}' use {}? \
+                 secrets may have gone direct (unmasked).",
+                plan.bin, plan.base_var
+            );
+        } else {
+            // Value-free end-of-session summary, now that the TUI has released the
+            // terminal: the useful Promtect signal without disturbing the session.
+            let after = crate::metrics::aggregate(std::path::Path::new(&audit_path_for_dash));
+            print_guard_summary(&baseline, &after);
+        }
     }
 
     match status {
@@ -492,6 +508,51 @@ fn is_stale_stub(url: &str) -> bool {
 /// Map a child `ExitStatus` to a process exit code. A child killed by a signal has
 /// no exit code — map it to the shell convention `128 + signal` and warn, so an
 /// OOM-killed or Ctrl-C'd run is NEVER reported as success (0).
+/// Print a value-free end-of-session summary for a guard run: how many secrets it
+/// masked outbound, and how many the Pro output scan caught in the model's replies.
+/// Counts are the difference between an audit snapshot taken before the tool
+/// launched and one taken now, so they reflect this session only.
+fn print_guard_summary(before: &crate::metrics::Metrics, after: &crate::metrics::Metrics) {
+    let masked = after
+        .secrets_masked_total
+        .saturating_sub(before.secrets_masked_total);
+    let echoed = after
+        .output_secrets_total
+        .saturating_sub(before.output_secrets_total);
+
+    if masked == 0 {
+        eprintln!("promtect guard: this session masked 0 secrets — nothing sensitive was sent.");
+    } else {
+        let kinds = kinds_delta(&before.by_detector, &after.by_detector);
+        eprintln!(
+            "promtect guard: this session masked {masked} secret{} ({}). Rotate anything \
+             that already leaked; Promtect kept these from arriving.",
+            if masked == 1 { "" } else { "s" },
+            kinds.join(", "),
+        );
+    }
+    if echoed > 0 {
+        eprintln!(
+            "promtect guard: the output scan flagged {echoed} secret{} in the model's replies.",
+            if echoed == 1 { "" } else { "s" },
+        );
+    }
+}
+
+/// Detector kinds whose masked count increased between two audit snapshots, sorted.
+fn kinds_delta(
+    before: &std::collections::BTreeMap<String, u64>,
+    after: &std::collections::BTreeMap<String, u64>,
+) -> Vec<String> {
+    let mut kinds: Vec<String> = after
+        .iter()
+        .filter(|(k, c)| **c > before.get(k.as_str()).copied().unwrap_or(0))
+        .map(|(k, _)| k.clone())
+        .collect();
+    kinds.sort();
+    kinds
+}
+
 fn exit_code(status: &std::process::ExitStatus, bin: &str) -> i32 {
     if let Some(code) = status.code() {
         return code;
@@ -511,6 +572,21 @@ fn exit_code(status: &std::process::ExitStatus, bin: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kinds_delta_reports_only_increased_kinds() {
+        use std::collections::BTreeMap;
+        let before = BTreeMap::from([("aws_key".to_string(), 1u64), ("jwt".to_string(), 2)]);
+        let after = BTreeMap::from([
+            ("aws_key".to_string(), 3u64),   // increased
+            ("jwt".to_string(), 2),          // unchanged → excluded
+            ("github_token".to_string(), 1), // new → included
+        ]);
+        assert_eq!(
+            kinds_delta(&before, &after),
+            vec!["aws_key".to_string(), "github_token".to_string()]
+        );
+    }
 
     fn plan(args: &[&str]) -> Result<GuardPlan, String> {
         plan_guard(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
