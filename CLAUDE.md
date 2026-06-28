@@ -50,8 +50,12 @@ Request flow:
    Fail-OPEN: an audit write failure must never block masking.
 
 Supporting: `provider.rs` (`classify()` upstream risk, backs `PROMTECT_BLOCK_RISKY`),
-`guard.rs` (`plan_guard()` pure parse + `guard()` I/O), `dashboard.rs`+`metrics.rs`
-(audit → HTML/JSON/Prometheus on :8799), `playground.rs`, `net.rs` (client + loopback check).
+`guard.rs` (`plan_guard()` pure parse + `guard()` I/O; sets `proxy::set_quiet(true)`
+to suppress routine per-request notifications while wrapping a TUI, and prints a
+value-free session summary on exit by diffing `metrics::aggregate` before/after),
+`dashboard.rs`+`metrics.rs` (audit → HTML/JSON/Prometheus on :8799; the
+`output_secret` action is aggregated into `output_secrets_total` /
+`output_by_detector`), `playground.rs`, `net.rs` (client + loopback check).
 
 Invariants worth preserving: fail-CLOSED on config (bad port/cap/blocked upstream → exit),
 fail-OPEN on audit; per-request vault; no `unwrap`/`expect`/`panic!`/`unsafe` on a production

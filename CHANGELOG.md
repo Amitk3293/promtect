@@ -11,10 +11,19 @@ and auto-generated notes also live on the
 ### Added
 - New detectors: `xai_key` (xAI / Grok), `supabase_key` (Supabase secret keys and
   personal access tokens), `render_key` (Render), `fly_token` (Fly.io).
+- 21 more prefix-anchored detectors following GitHub secret-scanning's design:
+  Jina, Anyscale, Vercel, Alibaba, Yandex, 1Password, Prefect, Flutterwave,
+  EasyPost, Brevo, Typeform, Frame.io, Duffel, ReadMe, Buildkite, JFrog Artifactory,
+  Clojars, Pulumi, Dynatrace, Honeycomb, Adobe.
 - `db_password` now also matches `clickhouse://` and `cockroachdb://` connection URLs.
 - `PROMTECT_OUTPUT_SCAN` environment variable: gates the Pro response output scan.
   Default-on when a scanner is present; a falsey value (`0`/`false`/`no`/`off`)
   disables it. No-op in the core, which ships no scanner.
+- Response output-scan metrics: `promtect_output_secrets_total` and
+  `promtect_output_secrets_by_detector` in the Prometheus export and the dashboard JSON.
+- `promtect guard` prints a value-free end-of-session summary on exit (secrets masked
+  this session, by detector, plus any output-scan findings), and stays quiet during
+  the session so its notifications do not disturb a wrapped full-screen tool.
 
 ### Changed
 - **Relicensed the core from Apache-2.0 to the Sustainable Use License (SUL v1.0)**,

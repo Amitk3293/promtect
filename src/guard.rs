@@ -505,9 +505,6 @@ fn is_stale_stub(url: &str) -> bool {
     !matches!(port, 8787 | 8788 | 8790)
 }
 
-/// Map a child `ExitStatus` to a process exit code. A child killed by a signal has
-/// no exit code — map it to the shell convention `128 + signal` and warn, so an
-/// OOM-killed or Ctrl-C'd run is NEVER reported as success (0).
 /// Print a value-free end-of-session summary for a guard run: how many secrets it
 /// masked outbound, and how many the Pro output scan caught in the model's replies.
 /// Counts are the difference between an audit snapshot taken before the tool
@@ -553,6 +550,9 @@ fn kinds_delta(
     kinds
 }
 
+/// Map a child `ExitStatus` to a process exit code. A child killed by a signal has
+/// no exit code — map it to the shell convention `128 + signal` and warn, so an
+/// OOM-killed or Ctrl-C'd run is NEVER reported as success (0).
 fn exit_code(status: &std::process::ExitStatus, bin: &str) -> i32 {
     if let Some(code) = status.code() {
         return code;
