@@ -42,5 +42,5 @@ ask. We grant reasonable requests.
 
 ---
 
-*This wordmark is being registered with the EUIPO. The policy applies to common-law
-and registered rights alike; registration simply makes it cheaper to enforce.*
+*We claim common-law trademark rights in the "Promtect" wordmark. This policy applies to
+common-law and any future registered rights alike.*

@@ -1,0 +1,27 @@
+# Promtect gitleaks configuration.
+#
+# WHY this exists: Promtect is a secret-detection tool. Its own test corpus,
+# detector definitions, and demo recording must contain sample (fake) secrets so
+# the detectors can be exercised. Stock gitleaks cannot tell a deliberate test
+# fixture from a real leak, so it flags all of them. This allowlist scopes those
+# known-fixture paths out while keeping full default scanning everywhere else.
+#
+# Tradeoff: a real secret pasted into one of the allowlisted paths would not be
+# caught. Those paths are pattern/test code by design, so the risk is low. Keep
+# real credentials out of them regardless.
+
+title = "Promtect gitleaks config"
+
+[extend]
+useDefault = true # keep every upstream gitleaks rule
+
+[allowlist]
+description = "Intentional fake secrets in the scanner's own fixtures and examples"
+paths = [
+  '''tests/.*''',            # detector test corpus + integration fixtures
+  '''src/detect\.rs''',      # detector definitions carry inline sample values
+  '''src/stream\.rs''',      # streaming-restorer tests use fake model keys
+  '''src/playground\.rs''',  # offline demo narrates fake secrets (self-documented)
+  '''docs/demo\.tape''',     # VHS demo script feeds fake secrets to the proxy
+  '''docs/detectors\.md''',  # detector reference table shows example formats
+]
