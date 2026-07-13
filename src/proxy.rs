@@ -115,6 +115,17 @@ fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Mat
     matches
 }
 
+/// Re-run the exact active request detector chain over a masked body.
+///
+/// Sentinels are neutralized first so their kind/counter syntax cannot produce
+/// false positives. Reusing [`compose_matches`] is the security invariant: a
+/// downstream paid or custom detector cannot participate in masking while being
+/// omitted from the final residual-leak check.
+fn scan_for_residual_leaks(masked: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Match> {
+    let neutralized = crate::mask::neutralize_sentinels(masked);
+    compose_matches(&neutralized, extra)
+}
+
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
 /// body, forwards to `upstream`, and restores secrets in the response.
 pub fn app(ctx: Ctx) -> Router {
@@ -349,7 +360,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
                 // Re-run detectors with sentinels stripped so their kind:HEX content
                 // can't false-positive. A surviving match means masking missed it —
                 // block rather than forward plaintext secrets.
-                let leaks = crate::mask::scan_for_leaks(&masked);
+                let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect);
                 if !leaks.is_empty() {
                     let leak_kinds: Vec<&str> = {
                         let mut v: Vec<&str> = leaks.iter().map(|m| m.kind).collect();
@@ -824,5 +835,59 @@ mod tests {
         let composed = super::compose_matches(text, &Some(extra));
         assert_eq!(composed.len(), base + 1);
         assert!(composed.iter().any(|m| m.kind == "custom"));
+    }
+
+    #[test]
+    fn residual_scan_reuses_extra_detector_after_masking_skips_a_bad_span() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let text = "payload CUSTOMSECRET";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_detector = Arc::clone(&calls);
+        let extra: super::ExtraDetector = Arc::new(move |candidate: &str| {
+            let Some(start) = candidate.find("CUSTOMSECRET") else {
+                return Vec::new();
+            };
+            let end = if calls_for_detector.fetch_add(1, Ordering::SeqCst) == 0 {
+                candidate.len() + 1
+            } else {
+                start + "CUSTOMSECRET".len()
+            };
+            vec![super::detect::Match::new(
+                "custom",
+                "CUSTOMSECRET".to_owned(),
+                start,
+                end,
+            )]
+        });
+        let active = Some(extra);
+        let vault = crate::vault::Vault::new();
+        let masked = crate::mask::mask_with_matches(
+            text,
+            super::compose_matches(text, &active),
+            &vault,
+            &crate::audit::Audit::null(),
+            "request",
+        );
+
+        assert!(
+            masked.contains("CUSTOMSECRET"),
+            "the deliberately invalid first span must survive masking"
+        );
+        let leaks = super::scan_for_residual_leaks(&masked, &active);
+        assert!(
+            leaks.iter().any(|hit| hit.kind == "custom"),
+            "the active extra detector must inspect and catch the residual canary"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn residual_scan_without_extra_remains_core_only() {
+        let leaks = super::scan_for_residual_leaks("AKIAIOSFODNN7EXAMPLE and CUSTOMSECRET", &None);
+
+        assert!(leaks.iter().any(|hit| hit.kind == "aws_key"));
+        assert!(!leaks.iter().any(|hit| hit.kind == "custom"));
     }
 }
