@@ -137,6 +137,12 @@ promtect guard codex --strict             # never re-insert secrets in the respo
 promtect guard --exec <tool> --base-var OPENAI_API_BASE --base-path /v1   # wrap any tool
 ```
 
+`guard codex` supports OpenAI API-key sessions. It fails before opening a
+provider connection for ChatGPT subscription auth, OpenRouter, custom provider
+routing, or request-compression overrides because those modes cannot currently
+guarantee interception. It also disables Codex WebSockets and provider retries,
+keeping each protected model call on one observable HTTP Responses request.
+
 Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OLLAMA_API_KEY`) flow
 through untouched, Promtect only masks the request body. The base URL each tool
 needs is set for you (`ANTHROPIC_BASE_URL` for Claude, `OPENAI_BASE_URL` for Codex,

@@ -120,17 +120,20 @@ response-only `masked:<canary>` marker after restoration. Codex uses an explicit
 custom provider with Responses transport and WebSockets disabled. Aider uses
 CLI-precedence `--openai-api-base`.
 
-Those explicit controls do not hide the automatic `guard` gap tracked by
+The A/B control documents the automatic `guard` gap fixed by
 [#87](https://github.com/Amitk3293/promtect/issues/87):
 
 - Codex 0.144.3 routes a custom provider using its documented `base_url`.
-  Current `guard codex` sets only `OPENAI_BASE_URL`, which does not override an
-  existing direct custom-provider URL. The harness runs a controlled A/B pair
+  Codex 0.144.3 does not let `OPENAI_BASE_URL` override an existing direct
+  custom-provider URL. The harness runs a controlled A/B pair
   with identical home, auth, environment, prompt, and flags. The protected URL
   produces a masked request and restored response; the direct URL sends the
   canary to an internal tripwire, which records only metadata and returns 422.
   The direct run must fail specifically from that 422, so setup or auth errors
-  cannot satisfy the known-gap assertion.
+  cannot satisfy the control assertion. It then runs the pinned real Codex CLI
+  through `promtect guard codex` and requires one protected Responses request,
+  no request `content-encoding`, a masked upstream canary, and exact restored
+  output. Guard rejects user routing and compression overrides before launch.
 
 The harness also adversarially sets a stale `AIDER_OPENAI_API_BASE` while
 providing the two variables current `guard aider` injects. Aider 0.86.2's
@@ -138,5 +141,5 @@ providing the two variables current `guard aider` injects. Aider 0.86.2's
 was not reproduced. That remains a negative regression because legacy LiteLLM
 paths may use the other variable.
 
-The correct controls prove provider compatibility; they are not evidence that
-the current automatic guard wiring is safe.
+The direct controls prove provider behavior; the separate guard canary proves
+the shipped one-command wiring.

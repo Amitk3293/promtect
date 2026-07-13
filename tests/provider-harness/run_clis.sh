@@ -29,6 +29,7 @@ source, plaintext, sentinel = sys.argv[3], sys.argv[4] == "true", sys.argv[5] ==
 with urllib.request.urlopen("http://mock-provider:9000/__observations", timeout=5) as response:
     observations = json.load(response)
 window = observations[start:end]
+assert len(window) == 1, f"expected exactly one Codex provider observation, got {window!r}"
 matches = [
     item
     for item in window
@@ -41,6 +42,7 @@ assert len(matches) == 1, (
 match = matches[0]
 assert match.get("plaintext_canary_seen") is plaintext, match
 assert match.get("sentinel_seen") is sentinel, match
+assert match.get("content_encoding_seen") is None, match
 assert "body" not in match, "real CLI body must not be retained"
 PY
 }
@@ -90,7 +92,7 @@ assert_version "Claude Code" "$CLAUDE_VERSION" claude --version
 assert_version Ollama "$OLLAMA_VERSION" ollama --version
 assert_version Aider "$AIDER_VERSION" aider --version
 
-mkdir -p /tmp/codex-base-url /tmp/claude /tmp/ollama /tmp/aider
+mkdir -p /tmp/codex-base-url /tmp/codex-guard /tmp/claude /tmp/ollama /tmp/aider
 
 # Codex A/B routing control. The two invocations share the same home, auth,
 # environment, prompt, and flags; only the documented custom-provider base_url
@@ -120,7 +122,41 @@ if ! grep -Fq 'unsafe harness request rejected' /tmp/codex-direct.out; then
   sed -n '1,120p' /tmp/codex-direct.out >&2
   exit 1
 fi
-printf 'KNOWN GAP #87: custom-provider base_url bypassed the guard environment; mock rejected plaintext\n'
+printf 'PASS Codex routing control: direct custom provider bypasses environment-only routing and hits tripwire\n'
+
+# Exercise the shipped one-command path, not just manually configured provider
+# routing. The guard must force the built-in provider through its ephemeral
+# proxy, disable request compression, mask upstream, and restore the response.
+guard_before=$(observer_count)
+if ! HOME=/tmp/codex-guard CODEX_HOME=/tmp/codex-guard \
+  OPENAI_API_KEY=fixed-dummy-key CODEX_API_KEY=fixed-dummy-key \
+  promtect guard codex --upstream http://mock-provider:9000/guard-cli -- \
+    -c 'model="synthetic-model"' \
+    exec --skip-git-repo-check --sandbox read-only -C /synthetic "$PROMPT" \
+    > /tmp/codex-guard.out 2>&1; then
+  printf 'FAIL Codex guard: protected real-CLI execution exited nonzero\n' >&2
+  sed -n '1,160p' /tmp/codex-guard.out >&2
+  exit 1
+fi
+guard_after=$(observer_count)
+assert_codex_observation_window "$guard_before" "$guard_after" guard-codex false true
+assert_output_restored "Codex guard" /tmp/codex-guard.out
+if ! grep -Fq 'Codex config check: protected Responses route accepted, WebSockets and request compression disabled' /tmp/codex-guard.out; then
+  printf 'FAIL Codex guard: fail-closed config check was not reported\n' >&2
+  exit 1
+fi
+printf 'PASS Codex guard: real CLI masked/restored with request compression absent\n'
+for comm in /proc/[0-9]*/comm; do
+  process_name=
+  if [ -r "$comm" ]; then
+    IFS= read -r process_name < "$comm" || true
+  fi
+  if [ "$process_name" = promtect ]; then
+    printf 'FAIL Codex guard: Promtect process remained after guard returned\n' >&2
+    exit 1
+  fi
+done
+printf 'PASS Codex guard: teardown left no Promtect process\n'
 
 HOME=/tmp/claude CLAUDE_CONFIG_DIR=/tmp/claude \
   ANTHROPIC_BASE_URL="$PROXY" ANTHROPIC_API_KEY=fixed-dummy-key \

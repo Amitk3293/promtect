@@ -262,6 +262,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/cli/"):
             source = "real-cli"
             logical_path = parsed.path.removeprefix("/cli")
+        elif parsed.path.startswith("/guard-cli/"):
+            source = "guard-codex"
+            logical_path = parsed.path.removeprefix("/guard-cli")
         elif parsed.path.startswith("/codex-base-url-control/"):
             source = "codex-base-url-control"
             logical_path = parsed.path.removeprefix("/codex-base-url-control")
@@ -317,6 +320,7 @@ class Handler(BaseHTTPRequestHandler):
             "body_sha256": hashlib.sha256(raw).hexdigest(),
             "body_bytes": len(raw),
             "accept_encoding_seen": self.headers.get("accept-encoding"),
+            "content_encoding_seen": self.headers.get("content-encoding"),
             "plaintext_canary_seen": leaked,
             "sentinel_seen": sentinel_match is not None,
         }
