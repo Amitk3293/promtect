@@ -1008,10 +1008,27 @@ mod tests {
     /// The OSS registry ships broad coverage of known credential formats.
     #[test]
     fn registry_has_expected_breadth() {
-        assert!(
-            DETECTORS.len() >= 70,
-            "expected >= 70 detectors, have {}",
-            DETECTORS.len()
+        let contract: serde_json::Value =
+            serde_json::from_str(include_str!("../PRODUCT-CONTRACT.json"))
+                .expect("PRODUCT-CONTRACT.json must be valid JSON");
+        let expected_unique_kinds = contract["editions"]["core"]["detector_count"]
+            .as_u64()
+            .expect("core.detector_count must be an unsigned integer");
+        let expected_registry_entries = contract["editions"]["core"]["detector_registry_entries"]
+            .as_u64()
+            .expect("core.detector_registry_entries must be an unsigned integer");
+        let unique_kinds: std::collections::HashSet<&str> =
+            DETECTORS.iter().map(|detector| detector.kind).collect();
+
+        assert_eq!(
+            unique_kinds.len() as u64,
+            expected_unique_kinds,
+            "detector registry kinds drifted from PRODUCT-CONTRACT.json"
+        );
+        assert_eq!(
+            DETECTORS.len() as u64,
+            expected_registry_entries,
+            "detector registry entries drifted from PRODUCT-CONTRACT.json"
         );
     }
 
