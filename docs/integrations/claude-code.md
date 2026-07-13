@@ -48,5 +48,12 @@ promtect selftest        # → promtect selftest: PASS — no leak
   authentication. If your Claude settings contain a gateway-specific
   `ANTHROPIC_AUTH_TOKEN`, use the matching `--upstream` or remove that credential
   before targeting a different upstream; Promtect cannot identify token ownership.
+- `guard claude` removes inherited HTTP proxy variables from the Claude child so
+  its loopback Promtect URL cannot be routed through another proxy first. Known
+  endpoint-managed settings that override routing or Stop hooks are rejected
+  before Claude starts; remove the conflict or use an unmanaged Claude profile.
+- Promtect itself ignores implicit system proxy variables. Chain a trusted
+  gateway explicitly with `--upstream` or `--headroom` so the destination is
+  visible in the guard banner and risk classification.
 - Strict mode: `PROMTECT_RESTORE=false` leaves placeholders in the response (the
   secret is never re-inserted). Use it when policy forbids restoration.

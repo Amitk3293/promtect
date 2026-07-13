@@ -374,6 +374,7 @@ struct ClaudeNoticeState {
     audit_path: Arc<std::path::PathBuf>,
     cursor: Arc<std::sync::Mutex<u64>>,
     token: Arc<str>,
+    request_prefix: Arc<str>,
     strict: bool,
 }
 
@@ -386,6 +387,7 @@ impl ClaudeNoticeState {
         Self {
             audit_path: Arc::new(audit_path),
             cursor: Arc::new(std::sync::Mutex::new(cursor)),
+            request_prefix: format!("{token}:").into(),
             token: token.into(),
             strict,
         }
@@ -459,6 +461,9 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> Option<ClaudeNotice> {
         else {
             continue;
         };
+        if !request_id.starts_with(state.request_prefix.as_ref()) {
+            continue;
+        }
 
         match action {
             "request" => {
@@ -516,6 +521,100 @@ fn detector_display_name(kind: &str) -> String {
         "stripe_key" => "Stripe API key".to_string(),
         _ => kind.replace('_', " "),
     }
+}
+
+const CLAUDE_MANAGED_ROUTING_KEYS: &[&str] = &[
+    CLAUDE_BASE_VAR,
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+];
+
+fn claude_managed_settings_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![std::path::PathBuf::from(
+            "/Library/Application Support/ClaudeCode/managed-settings.json",
+        )]
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        vec![std::path::PathBuf::from(
+            "/etc/claude-code/managed-settings.json",
+        )]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let root = std::env::var_os("ProgramFiles")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files"));
+        vec![root.join("ClaudeCode").join("managed-settings.json")]
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "windows"
+    )))]
+    {
+        Vec::new()
+    }
+}
+
+fn validate_claude_managed_settings(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    for path in paths {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(format!(
+                    "cannot verify Claude managed settings at {} ({error})",
+                    path.display()
+                ));
+            }
+        };
+        let settings: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
+            format!(
+                "cannot verify malformed Claude managed settings at {} ({error})",
+                path.display()
+            )
+        })?;
+        let routing_conflicts = settings
+            .get("env")
+            .and_then(|env| env.as_object())
+            .map(|env| {
+                CLAUDE_MANAGED_ROUTING_KEYS
+                    .iter()
+                    .copied()
+                    .filter(|key| env.contains_key(*key))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let stop_hook_conflict = settings.pointer("/hooks/Stop").is_some();
+        let hooks_locked = settings
+            .get("strictPluginOnlyCustomization")
+            .and_then(|value| value.as_array())
+            .is_some_and(|surfaces| surfaces.iter().any(|surface| surface == "hooks"));
+        if !routing_conflicts.is_empty() || stop_hook_conflict || hooks_locked {
+            let mut conflicts = routing_conflicts;
+            if stop_hook_conflict {
+                conflicts.push("hooks.Stop");
+            }
+            if hooks_locked {
+                conflicts.push("strictPluginOnlyCustomization:hooks");
+            }
+            return Err(format!(
+                "managed settings at {} override protected routing or the automatic notice ({})",
+                path.display(),
+                conflicts.join(", ")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn format_claude_notice(notice: &ClaudeNotice, strict: bool) -> String {
@@ -818,7 +917,7 @@ async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, CodexPreflightE
     }
 
     let mut cmd = tokio::process::Command::new(bin);
-    configure_codex_network_env(&mut cmd);
+    configure_guard_child_network_env(&mut cmd);
     cmd.args(["login", "status"]).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
         .await
@@ -838,7 +937,7 @@ async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, CodexPreflightE
         .map_err(|error| CodexPreflightError::Rejected(error.to_string()))
 }
 
-fn configure_codex_network_env(cmd: &mut tokio::process::Command) {
+fn configure_guard_child_network_env(cmd: &mut tokio::process::Command) {
     for key in [
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -858,7 +957,7 @@ fn configure_codex_network_env(cmd: &mut tokio::process::Command) {
 }
 
 fn configure_codex_command(cmd: &mut tokio::process::Command, auth: CodexAuthSource) {
-    configure_codex_network_env(cmd);
+    configure_guard_child_network_env(cmd);
     if auth == CodexAuthSource::CodexEnvironment
         && let Some(api_key) = std::env::var_os("CODEX_API_KEY")
     {
@@ -896,7 +995,7 @@ async fn verify_codex_config(
 
 async fn run_codex_dry_run(plan: &GuardPlan) -> i32 {
     let mut cmd = tokio::process::Command::new(&plan.bin);
-    configure_codex_network_env(&mut cmd);
+    configure_guard_child_network_env(&mut cmd);
     match cmd.args(&plan.tool_args).kill_on_drop(true).status().await {
         Ok(status) => exit_code(&status, &plan.bin),
         Err(error) => {
@@ -920,6 +1019,16 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         )
     {
         return run_codex_dry_run(&plan).await;
+    }
+
+    if plan.claude_fail_closed
+        && let Err(error) = validate_claude_managed_settings(&claude_managed_settings_paths())
+    {
+        eprintln!(
+            "promtect guard: refusing to start Claude: {error}.\n  \
+             Remove the conflict or use an unmanaged Claude profile; no provider request was sent."
+        );
+        return 1;
     }
 
     let codex_auth = if plan.codex_fail_closed {
@@ -978,10 +1087,17 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     let audit_path =
         std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
     let audit_path_for_dash = audit_path.clone();
+    let claude_notice_token = plan
+        .claude_fail_closed
+        .then(|| uuid::Uuid::new_v4().simple().to_string());
+    let audit = claude_notice_token.as_ref().map_or_else(
+        || Audit::to_file(&audit_path),
+        |scope| Audit::to_file_scoped(&audit_path, scope.clone()),
+    );
     let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = Ctx {
         upstream: plan.upstream.clone(),
-        audit: Arc::new(Audit::to_file(audit_path)),
+        audit: Arc::new(audit),
         client: crate::net::http_client(),
         max_body_bytes: proxy::DEFAULT_MAX_BODY_BYTES,
         restore: plan.restore,
@@ -1024,7 +1140,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     }
 
     let (app, claude_notice_url) = if plan.claude_fail_closed {
-        let token = uuid::Uuid::new_v4().simple().to_string();
+        let token = claude_notice_token.expect("Claude notice token must exist");
         let notice_url = format!("{base_url}/_promtect/hooks/{token}");
         let notice_state = ClaudeNoticeState::new(
             std::path::PathBuf::from(&audit_path_for_dash),
@@ -1114,6 +1230,10 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         cmd.args(codex_config_args(&base_url, auth));
     }
     if plan.claude_fail_closed {
+        // Claude honors HTTP_PROXY/HTTPS_PROXY even for loopback URLs. Remove
+        // inherited proxy routes so the guard-owned base URL cannot be sent to a
+        // different proxy before reaching Promtect.
+        configure_guard_child_network_env(&mut cmd);
         // Claude settings.json `env` values override the child process
         // environment. Use Claude's documented highest-precedence inline
         // settings so a persistent gateway cannot bypass this proxy.
@@ -1383,7 +1503,10 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), true);
-        let audit = crate::audit::Audit::to_file(path.clone());
+        let other_guard =
+            crate::audit::Audit::to_file_scoped(path.clone(), "other-guard".to_string());
+        other_guard.record_request("request-other", 9, &["jwt"], 100, 120);
+        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
         audit.record_request(
             "request-1",
             4,
@@ -1422,7 +1545,7 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
-        let audit = crate::audit::Audit::to_file(path.clone());
+        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
         audit.record_request("request-blocked", 1, &["aws_key"], 100, 120);
         audit.record(
             "request_blocked",
@@ -1439,6 +1562,34 @@ mod tests {
         );
 
         assert!(super::take_claude_notice(&state).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_rejects_managed_routing_or_hook_conflicts() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-managed-settings-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"env":{"ANTHROPIC_BASE_URL":"https://managed.invalid"}}"#,
+        )
+        .expect("write managed settings fixture");
+        let error = super::validate_claude_managed_settings(std::slice::from_ref(&path))
+            .expect_err("managed route must fail closed");
+        assert!(error.contains("ANTHROPIC_BASE_URL"));
+
+        std::fs::write(&path, r#"{"hooks":{"Stop":[{"hooks":[]}]}}"#)
+            .expect("replace managed settings fixture");
+        let error = super::validate_claude_managed_settings(std::slice::from_ref(&path))
+            .expect_err("managed Stop hook must fail closed");
+        assert!(error.contains("hooks.Stop"));
+
+        std::fs::write(&path, r#"{"env":{"EDITOR":"vim"}}"#)
+            .expect("replace safe managed settings fixture");
+        super::validate_claude_managed_settings(std::slice::from_ref(&path))
+            .expect("unrelated managed settings must remain usable");
         std::fs::remove_file(path).ok();
     }
 

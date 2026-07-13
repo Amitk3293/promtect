@@ -5,7 +5,7 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Mutable, lock-guarded state for a file-backed audit sink: the target path and
@@ -29,6 +29,10 @@ struct FileSink {
 /// the trail is incomplete, without otherwise changing behaviour.
 pub struct Audit {
     sink: Mutex<Option<FileSink>>, // None = discard (used in tests)
+    /// Optional guard-session scope prepended to request IDs in the audit only.
+    /// This keeps concurrent guards sharing one append-only log attributable
+    /// without changing the proxy's internal request identifier.
+    request_scope: Option<Arc<str>>,
     /// Set once, the first time a write fails, to gate a one-shot stderr warning.
     warned: AtomicBool,
 }
@@ -40,6 +44,18 @@ impl Audit {
                 path: path.into(),
                 handle: None,
             })),
+            request_scope: None,
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn to_file_scoped(path: impl Into<PathBuf>, request_scope: String) -> Self {
+        Audit {
+            sink: Mutex::new(Some(FileSink {
+                path: path.into(),
+                handle: None,
+            })),
+            request_scope: Some(request_scope.into()),
             warned: AtomicBool::new(false),
         }
     }
@@ -48,8 +64,16 @@ impl Audit {
     pub fn null() -> Self {
         Audit {
             sink: Mutex::new(None),
+            request_scope: None,
             warned: AtomicBool::new(false),
         }
+    }
+
+    fn scoped_request_id(&self, request_id: &str) -> String {
+        self.request_scope.as_ref().map_or_else(
+            || request_id.to_string(),
+            |scope| format!("{scope}:{request_id}"),
+        )
     }
 
     /// Lock the sink, recovering the guard if a previous holder panicked. The
@@ -249,6 +273,7 @@ impl Audit {
         bytes_out: usize,
         blocked: bool,
     ) {
+        let request_id = self.scoped_request_id(request_id);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -268,6 +293,7 @@ impl Audit {
 
     /// Record one event. `placeholder` is a sentinel id, NOT a secret.
     pub fn record(&self, action: &str, kind: &str, placeholder: &str, request_id: &str) {
+        let request_id = self.scoped_request_id(request_id);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

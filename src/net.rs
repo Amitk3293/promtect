@@ -48,6 +48,10 @@ pub fn parse_read_timeout_secs(value: Option<&str>) -> u64 {
 ///   Promtect forwards the client's auth (e.g. `x-api-key`) to the configured
 ///   upstream only; following a 3xx could replay that secret to an
 ///   attacker-chosen target, so we hand the 3xx back to the client untouched.
+/// - **No implicit system proxy:** reqwest honors `HTTP_PROXY`/`HTTPS_PROXY` by
+///   default. A stale or hostile inherited proxy could silently receive the
+///   auth-bearing upstream request. Promtect requires proxies/gateways to be
+///   selected explicitly as the configured upstream instead.
 ///
 /// Falls back to a minimal client if the builder fails (only possible on TLS
 /// backend init, at startup — never on the request path), so construction is
@@ -57,12 +61,14 @@ pub fn http_client() -> reqwest::Client {
     let read_timeout =
         parse_read_timeout_secs(std::env::var("PROMTECT_READ_TIMEOUT").ok().as_deref());
     reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(Duration::from_secs(30))
         .read_timeout(Duration::from_secs(read_timeout))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_else(|_| {
             reqwest::Client::builder()
+                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("minimal reqwest client with redirects disabled is infallible")

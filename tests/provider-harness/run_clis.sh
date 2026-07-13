@@ -117,6 +117,9 @@ assert match.get("sentinel_seen") is True, match
 assert match.get("promtect_notice_seen") is False, (
     f"Promtect notice entered Claude model context: {match!r}"
 )
+assert match.get("absolute_form_seen") is False, (
+    f"Promtect used an inherited HTTP proxy for its configured upstream: {match!r}"
+)
 assert "body" not in match, "real Claude body must not be retained"
 PY
 }
@@ -570,6 +573,12 @@ printf '%s\n' \
 claude_before=$(observer_count)
 if ! HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
   ANTHROPIC_API_KEY=fixed-dummy-key \
+  HTTP_PROXY=http://mock-provider:9000/claude-bypass \
+  HTTPS_PROXY=http://mock-provider:9000/claude-bypass \
+  ALL_PROXY=http://mock-provider:9000/claude-bypass \
+  http_proxy=http://mock-provider:9000/claude-bypass \
+  https_proxy=http://mock-provider:9000/claude-bypass \
+  all_proxy=http://mock-provider:9000/claude-bypass NO_PROXY= no_proxy= \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_UPDATES=1 \
   PROMTECT_AUDIT=/tmp/claude-guard-audit.jsonl PROMTECT_DASHBOARD_PORT=18999 \
   promtect guard claude --upstream http://mock-provider:9000/guard-claude -- \
@@ -592,6 +601,7 @@ if ! grep -Fq 'this session masked 1 secret (aws_key)' /tmp/claude-guard.stderr;
 fi
 assert_guard_listener_teardown "Claude guard" /tmp/claude-guard.stderr
 printf 'PASS Claude guard: exactly one value-free Stop-hook notice stayed out of model output and context\n'
+printf 'PASS Claude guard: inherited proxy variables could not bypass the loopback proxy\n'
 printf 'PASS Claude guard: persisted base URL and Bedrock selector could not bypass Promtect\n'
 
 if ! HOME=/tmp/ollama OLLAMA_HOST="$PROXY" \

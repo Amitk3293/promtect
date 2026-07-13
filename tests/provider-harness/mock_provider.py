@@ -260,6 +260,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        absolute_form = bool(parsed.scheme and parsed.netloc)
         if parsed.path.startswith("/cli/"):
             source = "real-cli"
             logical_path = parsed.path.removeprefix("/cli")
@@ -329,6 +330,7 @@ class Handler(BaseHTTPRequestHandler):
             "accept_encoding_seen": self.headers.get("accept-encoding"),
             "content_encoding_seen": self.headers.get("content-encoding"),
             "hostile_header_seen": self.headers.get("x-promtect-hostile") is not None,
+            "absolute_form_seen": absolute_form,
             "plaintext_canary_seen": leaked,
             "promtect_notice_seen": PROMTECT_NOTICE_MARKER in text,
             "sentinel_seen": sentinel_match is not None,
