@@ -65,6 +65,17 @@ const CLAUDE_PROVIDER_SELECTORS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_GATEWAY",
 ];
+const CLAUDE_AUTH_OVERRIDE_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_BEDROCK_MANTLE_API_KEY",
+    "ANTHROPIC_FOUNDRY_API_KEY",
+    "ANTHROPIC_FOUNDRY_AUTH_TOKEN",
+    "CLAUDE_CODE_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+];
 const CLAUDE_NOTICE_ROUTE: &str = "/_promtect/hooks/{token}";
 const CLAUDE_NOTICE_MAX_DELTA_BYTES: u64 = 1024 * 1024;
 const CLAUDE_NOTICE_MAX_RECORD_BYTES: u64 = 16 * 1024;
@@ -637,7 +648,7 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> ClaudeNoticeRead {
                     }
                 }
             }
-            "request_blocked" | "request_rejected" | "request_failed" => {
+            "request_blocked" | "request_rejected" | "request_failed" | "stream_interrupted" => {
                 unsuccessful.insert(request_id.to_string());
             }
             _ => {}
@@ -909,7 +920,21 @@ fn validate_claude_auth_status(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+fn first_claude_auth_override(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
+    CLAUDE_AUTH_OVERRIDE_VARS
+        .iter()
+        .copied()
+        .find(|variable| is_set(variable))
+}
+
 async fn verify_claude_unmanaged_profile(bin: &str) -> Result<(), String> {
+    if let Some(variable) =
+        first_claude_auth_override(|variable| std::env::var_os(variable).is_some())
+    {
+        return Err(format!(
+            "Claude authentication override {variable} is set; guard claude requires the verified stored individual Max credential"
+        ));
+    }
     tokio::task::spawn_blocking(|| {
         if let Some(root) = claude_managed_settings_root() {
             let paths = claude_managed_settings_paths(&root)?;
@@ -997,8 +1022,11 @@ async fn claude_notice_hook(
     if state
         .audit
         .as_ref()
-        .is_some_and(|audit| !audit.is_healthy())
+        .is_some_and(|audit| !audit.is_healthy() || !audit.path_matches_handle())
     {
+        if let Some(audit) = state.audit.as_ref() {
+            audit.mark_unhealthy();
+        }
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1035,8 +1063,11 @@ async fn claude_notice_hook(
     let read = if state
         .audit
         .as_ref()
-        .is_some_and(|audit| !audit.is_healthy())
+        .is_some_and(|audit| !audit.is_healthy() || !audit.path_matches_handle())
     {
+        if let Some(audit) = state.audit.as_ref() {
+            audit.mark_unhealthy();
+        }
         ClaudeNoticeRead::Degraded
     } else {
         read
@@ -1704,7 +1735,19 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // append-only log.
     let baseline = crate::metrics::aggregate(std::path::Path::new(&audit_path_for_dash));
 
-    let status = cmd.status().await;
+    let status = match cmd.spawn() {
+        Ok(mut child) => {
+            tokio::select! {
+                status = child.wait() => status,
+                _ = crate::proxy::shutdown_signal() => {
+                    eprintln!("promtect guard: shutdown requested; stopping the guarded tool");
+                    child.kill().await.ok();
+                    child.wait().await
+                }
+            }
+        }
+        Err(error) => Err(error),
+    };
     proxy_task.abort();
     if let Some(task) = dashboard_task {
         task.abort();
@@ -1737,7 +1780,8 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         } else {
             // Value-free end-of-session summary, now that the TUI has released the
             // terminal: the useful Promtect signal without disturbing the session.
-            if plan.claude_fail_closed && !audit.is_healthy() {
+            if plan.claude_fail_closed && (!audit.is_healthy() || !audit.path_matches_handle()) {
+                audit.mark_unhealthy();
                 eprintln!(
                     "promtect guard: this session's protection metadata is incomplete because the audit log became unavailable; masking continued, but no zero-event claim is possible"
                 );
@@ -2050,6 +2094,13 @@ mod tests {
             "upstream",
             "«upstream-request-failed»",
             "request-failed",
+        );
+        audit.record_request("request-interrupted", 1, &["stripe_key"], 100, 120);
+        audit.record(
+            "stream_interrupted",
+            "upstream",
+            "«upstream-stream-interrupted»",
+            "request-interrupted",
         );
 
         assert_eq!(
@@ -2364,6 +2415,17 @@ mod tests {
             super::validate_claude_auth_status(unsupported)
                 .expect_err("unsupported Claude profile must fail closed");
         }
+    }
+
+    #[test]
+    fn claude_auth_environment_overrides_fail_closed() {
+        for expected in super::CLAUDE_AUTH_OVERRIDE_VARS {
+            assert_eq!(
+                super::first_claude_auth_override(|variable| variable == *expected),
+                Some(*expected)
+            );
+        }
+        assert_eq!(super::first_claude_auth_override(|_| false), None);
     }
 
     #[test]

@@ -49,12 +49,10 @@ promtect selftest        # → promtect selftest: PASS — no leak
   can still use the manual proxy method above, without the automatic in-session
   notice. Other unmanaged individual tiers will be added only after their exact
   machine-readable auth contract is verified.
-- Pass your real Anthropic API key as usual (`ANTHROPIC_API_KEY` / `x-api-key`).
-  The manual proxy forwards the auth header untouched — it only ever masks the body.
-- `guard claude` owns routing for the guarded session, but intentionally inherits
-  authentication. If your Claude settings contain a gateway-specific
-  `ANTHROPIC_AUTH_TOKEN`, use the matching `--upstream` or remove that credential
-  before targeting a different upstream; Promtect cannot identify token ownership.
+- The manual proxy supports API-key authentication as usual (`ANTHROPIC_API_KEY` /
+  `x-api-key`) and forwards the auth header untouched. `guard claude` is narrower:
+  it refuses environment authentication overrides and uses only the verified stored
+  individual Max credential, so the launched session cannot silently switch tiers.
 - `guard claude` removes inherited HTTP proxy variables from the Claude child so
   its loopback Promtect URL cannot be routed through another proxy first. Known
   endpoint- or server-managed settings are rejected before Claude starts;

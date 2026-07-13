@@ -6,4 +6,40 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
   exit 0
 fi
 
+if [ "${PROMTECT_CLAUDE_HOLD_ONLY:-}" = "1" ]; then
+  if [ "${1:-}" != "--settings" ] || [ -z "${2:-}" ]; then
+    printf 'Claude observer expected guard-owned --settings path\n' >&2
+    exit 1
+  fi
+  printf '%s\n' "$$" > "${PROMTECT_CLAUDE_HOLD_PID:?missing hold PID path}"
+  printf '%s\n' "$2" > "${PROMTECT_CLAUDE_SETTINGS_PATH:?missing settings path capture}"
+  : > "${PROMTECT_CLAUDE_HOLD_READY:?missing hold-ready path}"
+  while :; do
+    sleep 1
+  done
+fi
+
+if [ "${PROMTECT_CLAUDE_TWO_TURN:-}" = "1" ]; then
+  /opt/provider-clis/node_modules/.bin/claude "$@"
+  first_status=$?
+  if [ "$first_status" -ne 0 ]; then
+    exit "$first_status"
+  fi
+  if [ "${1:-}" != "--settings" ] || [ -z "${2:-}" ]; then
+    printf 'Claude observer expected guard-owned --settings path\n' >&2
+    exit 1
+  fi
+  /opt/provider-clis/node_modules/.bin/claude \
+    --settings "$2" \
+    --debug-file /tmp/claude-guard-second.debug.log \
+    --continue --print --output-format text \
+    "${PROMTECT_CLAUDE_SECOND_PROMPT:?missing second prompt}"
+  second_status=$?
+  : > "${PROMTECT_CLAUDE_HOLD_READY:?missing hold-ready path}"
+  while [ ! -e "${PROMTECT_CLAUDE_HOLD_RELEASE:?missing hold-release path}" ]; do
+    sleep 0.05
+  done
+  exit "$second_status"
+fi
+
 exec /opt/provider-clis/node_modules/.bin/claude "$@"

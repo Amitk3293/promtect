@@ -153,12 +153,13 @@ settings outrank command-line routing and hooks. API-key users can use the
 [manual Claude proxy setup](docs/integrations/claude-code.md#start-promtect-manual),
 which does not include the automatic in-session notice.
 
-Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OLLAMA_API_KEY`) flow
-through untouched, Promtect only masks the request body. The base URL each tool
-needs is set for you (`ANTHROPIC_BASE_URL` for Claude, `OPENAI_BASE_URL` for Codex,
-`OLLAMA_HOST` for Ollama). Local Ollama runs on your own machine, so there is little
-to protect; `--cloud` points it at `ollama.com`, where your prompt leaves the box and
-masking earns its keep. Combine with
+Manual proxy sessions and supported non-Claude guards forward their provider API
+keys untouched; Promtect only masks the request body. `guard claude` instead
+refuses environment auth overrides and uses the verified stored individual Max
+credential. The base URL each tool needs is set for you (`ANTHROPIC_BASE_URL` for
+Claude, `OPENAI_BASE_URL` for Codex, `OLLAMA_HOST` for Ollama). Local Ollama runs on
+your own machine, so there is little to protect; `--cloud` points it at `ollama.com`,
+where your prompt leaves the box and masking earns its keep. Combine with
 [Headroom](https://github.com/chopratejas/headroom) for secrets-safe **and** ~90%
 cheaper sessions.
 

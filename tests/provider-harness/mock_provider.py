@@ -14,6 +14,12 @@ from threading import Lock
 from urllib.parse import parse_qs, urlparse
 
 SYNTHETIC_SECRET = "AKIAIOSFODNN7EXAMPLE"
+SYNTHETIC_SECRETS = (
+    SYNTHETIC_SECRET,
+    "sk-ant-demo0000000000000000000000000000",
+    "ghp_000000000000000000000000000000000000",
+    "sk_test_000000000000000000000000",
+)
 PROMTECT_NOTICE_MARKER = "Promtect prevented an exposure"
 SENTINEL_RE = re.compile(r"«promtect:[a-z_]+:[0-9a-f]+»")
 PROMPT_PATHS = {
@@ -283,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         text = raw.decode("utf-8", errors="replace")
         sentinel_match = SENTINEL_RE.search(text)
-        leaked = SYNTHETIC_SECRET.encode() in raw
+        leaked = any(secret.encode() in raw for secret in SYNTHETIC_SECRETS)
 
         if logical_path not in PROMPT_PATHS | METADATA_PATHS:
             with observations_lock:

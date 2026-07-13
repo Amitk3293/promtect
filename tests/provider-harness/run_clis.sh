@@ -7,6 +7,11 @@ OLLAMA_VERSION=0.31.2
 AIDER_VERSION=0.86.2
 SECRET=AKIAIOSFODNN7EXAMPLE
 PROMPT="Return this fixed synthetic canary exactly once: ${SECRET}"
+CLAUDE_FOUR_PROMPT='Treat these as fixed synthetic canaries and return only a short acknowledgement:
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+ANTHROPIC_API_KEY=sk-ant-demo0000000000000000000000000000
+GITHUB_TOKEN=ghp_000000000000000000000000000000000000
+STRIPE_SECRET_KEY=sk_test_000000000000000000000000'
 PROXY=http://promtect-cli:8790
 
 observer_count() {
@@ -106,21 +111,21 @@ protected = [
     if item.get("source") == "guard-claude" and item.get("path") == "/v1/messages"
 ]
 bypasses = [item for item in window if item.get("source") == "claude-bypass"]
-assert len(protected) == 1, (
-    f"expected exactly one protected Claude observation, got {protected!r}; window={window!r}"
+assert len(protected) == 2, (
+    f"expected exactly two protected Claude observations, got {protected!r}; window={window!r}"
 )
 assert not bypasses, f"persisted Claude routing bypassed Promtect: {bypasses!r}"
-assert len(window) == 1, f"Claude guard made unexpected upstream requests: {window!r}"
-match = protected[0]
-assert match.get("plaintext_canary_seen") is False, match
-assert match.get("sentinel_seen") is True, match
-assert match.get("promtect_notice_seen") is False, (
-    f"Promtect notice entered Claude model context: {match!r}"
-)
-assert match.get("absolute_form_seen") is False, (
-    f"Promtect used an inherited HTTP proxy for its configured upstream: {match!r}"
-)
-assert "body" not in match, "real Claude body must not be retained"
+assert len(window) == 2, f"Claude guard made unexpected upstream requests: {window!r}"
+for match in protected:
+    assert match.get("plaintext_canary_seen") is False, match
+    assert match.get("sentinel_seen") is True, match
+    assert match.get("promtect_notice_seen") is False, (
+        f"Promtect notice entered Claude model context: {match!r}"
+    )
+    assert match.get("absolute_form_seen") is False, (
+        f"Promtect used an inherited HTTP proxy for its configured upstream: {match!r}"
+    )
+    assert "body" not in match, "real Claude body must not be retained"
 PY
 }
 
@@ -130,6 +135,8 @@ assert_claude_notice() {
   debug_file=$3
   python3 - "$stdout_file" "$stderr_file" "$debug_file" "$SECRET" <<'PY'
 import pathlib
+import json
+import re
 import sys
 
 stdout_path, stderr_path, debug_path, secret = sys.argv[1:]
@@ -137,10 +144,6 @@ stdout = pathlib.Path(stdout_path).read_text()
 stderr = pathlib.Path(stderr_path).read_text()
 debug = pathlib.Path(debug_path).read_text()
 marker = "Promtect prevented an exposure"
-expected = (
-    "🛡 Promtect prevented an exposure — masked 1 sensitive value before it left "
-    "your machine. Detector: AWS access key (`aws_key`)."
-)
 assert marker not in stdout, (
     "the Promtect-owned notice entered Claude's model-result channel: "
     f"{stdout!r}"
@@ -160,9 +163,18 @@ assert len(notice_lines) == 1, (
     "expected exactly one Promtect-owned notice in Claude's validated hook response; "
     f"notice_lines={notice_lines!r}"
 )
-assert expected in notice_lines[0], f"unexpected hook notice: {notice_lines!r}"
-assert secret not in notice_lines[0], "the hook notice must remain value-free"
-assert "«promtect:" not in notice_lines[0], "the hook notice exposed a sentinel"
+message = json.loads(notice_lines[0])["systemMessage"]
+count = re.search(r"masked (\d+) sensitive values", message)
+assert count and int(count.group(1)) >= 4, f"unexpected hook notice count: {message!r}"
+for detector in (
+    "Anthropic API key (`anthropic_key`)",
+    "AWS access key (`aws_key`)",
+    "GitHub token (`github_token`)",
+    "Stripe API key (`stripe_key`)",
+):
+    assert detector in message, f"missing detector in hook notice: {message!r}"
+assert secret not in message, "the hook notice must remain value-free"
+assert "«promtect:" not in message, "the hook notice exposed a sentinel"
 PY
 }
 
@@ -606,9 +618,13 @@ printf '%s\n' \
   '  }' \
   '}' \
   > /tmp/claude-guard/settings.json
+printf '%s\n' \
+  '{"claudeAiOauth":{"accessToken":"fixed-dummy-oauth-token","refreshToken":"fixed-dummy-refresh-token","expiresAt":4102444800000,"scopes":["user:inference"]}}' \
+  > /tmp/claude-guard/.credentials.json
 claude_before=$(observer_count)
-if ! HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
-  ANTHROPIC_API_KEY=fixed-dummy-key \
+rm -f /tmp/claude-guard-hold.ready /tmp/claude-guard-hold.release \
+  /tmp/claude-guard-second.debug.log
+HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
   HTTP_PROXY=http://mock-provider:9000/claude-bypass \
   HTTPS_PROXY=http://mock-provider:9000/claude-bypass \
   ALL_PROXY=http://mock-provider:9000/claude-bypass \
@@ -616,13 +632,51 @@ if ! HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
   https_proxy=http://mock-provider:9000/claude-bypass \
   all_proxy=http://mock-provider:9000/claude-bypass NO_PROXY= no_proxy= \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_UPDATES=1 \
+  PROMTECT_CLAUDE_TWO_TURN=1 \
+  PROMTECT_CLAUDE_SECOND_PROMPT="$CLAUDE_FOUR_PROMPT" \
+  PROMTECT_CLAUDE_HOLD_READY=/tmp/claude-guard-hold.ready \
+  PROMTECT_CLAUDE_HOLD_RELEASE=/tmp/claude-guard-hold.release \
   PROMTECT_AUDIT=/tmp/claude-guard-audit.jsonl PROMTECT_DASHBOARD_PORT=18999 \
   promtect guard claude --upstream http://mock-provider:9000/guard-claude -- \
     --debug-file /tmp/claude-guard.debug.log \
-    --print --output-format text "$PROMPT" \
-    > /tmp/claude-guard.stdout 2> /tmp/claude-guard.stderr; then
+    --print --output-format text "$CLAUDE_FOUR_PROMPT" \
+    > /tmp/claude-guard.stdout 2> /tmp/claude-guard.stderr &
+claude_guard_pid=$!
+for _ in $(seq 1 400); do
+  if [ -e /tmp/claude-guard-hold.ready ]; then
+    break
+  fi
+  if ! kill -0 "$claude_guard_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if [ ! -e /tmp/claude-guard-hold.ready ]; then
   printf 'FAIL Claude guard: hostile persisted settings prevented protected execution\n' >&2
   sed -n '1,120p' /tmp/claude-guard.stderr >&2
+  wait "$claude_guard_pid" 2>/dev/null || true
+  exit 1
+fi
+
+dashboard_port=$(sed -n 's/.*dashboard: http:\/\/127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p' \
+  /tmp/claude-guard.stderr | head -n 1)
+python3 - "$dashboard_port" <<'PY'
+import json
+import sys
+import urllib.request
+
+port = int(sys.argv[1])
+with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/metrics", timeout=5) as response:
+    metrics = json.load(response)
+expected = {"aws_key", "anthropic_key", "github_token", "stripe_key"}
+assert metrics["secrets_masked_total"] == 8, metrics
+assert metrics["restore_enabled"] is True, metrics
+assert {kind for kind in expected if metrics["by_detector"].get(kind) == 2} == expected, metrics
+PY
+touch /tmp/claude-guard-hold.release
+if ! wait "$claude_guard_pid"; then
+  printf 'FAIL Claude guard: two-turn protected execution exited nonzero\n' >&2
+  sed -n '1,160p' /tmp/claude-guard.stderr >&2
   exit 1
 fi
 claude_after=$(observer_count)
@@ -630,15 +684,71 @@ assert_claude_guard_observation_window "$claude_before" "$claude_after"
 assert_output_restored "Claude guard with hostile persisted settings" /tmp/claude-guard.stdout
 assert_claude_notice \
   /tmp/claude-guard.stdout /tmp/claude-guard.stderr /tmp/claude-guard.debug.log
-if ! grep -Fq 'this session masked 1 secret (aws_key)' /tmp/claude-guard.stderr; then
+assert_claude_notice \
+  /tmp/claude-guard.stdout /tmp/claude-guard.stderr /tmp/claude-guard-second.debug.log
+if ! grep -Fq 'this session masked 8 secrets' /tmp/claude-guard.stderr; then
   printf 'FAIL Claude guard: value-free masking summary was absent\n' >&2
   sed -n '1,120p' /tmp/claude-guard.stderr >&2
   exit 1
 fi
 assert_guard_listener_teardown "Claude guard" /tmp/claude-guard.stderr
-printf 'PASS Claude guard: exactly one value-free Stop-hook notice stayed out of model output and context\n'
+printf 'PASS Claude guard: two value-free Stop-hook notices stayed out of both model turns\n'
+printf 'PASS Claude guard: live dashboard reported all four detector kinds and eight masks\n'
 printf 'PASS Claude guard: inherited proxy variables could not bypass the loopback proxy\n'
 printf 'PASS Claude guard: persisted base URL, socket, and provider selectors could not bypass Promtect\n'
+
+rm -f /tmp/claude-sigterm.ready /tmp/claude-sigterm.child.pid \
+  /tmp/claude-sigterm.settings /tmp/claude-sigterm.stdout /tmp/claude-sigterm.stderr
+HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_UPDATES=1 \
+  PROMTECT_CLAUDE_HOLD_ONLY=1 \
+  PROMTECT_CLAUDE_HOLD_PID=/tmp/claude-sigterm.child.pid \
+  PROMTECT_CLAUDE_SETTINGS_PATH=/tmp/claude-sigterm.settings \
+  PROMTECT_CLAUDE_HOLD_READY=/tmp/claude-sigterm.ready \
+  PROMTECT_AUDIT=/tmp/claude-sigterm-audit.jsonl PROMTECT_DASHBOARD_PORT=18999 \
+  promtect guard claude --upstream http://mock-provider:9000/guard-claude -- --version \
+    > /tmp/claude-sigterm.stdout 2> /tmp/claude-sigterm.stderr &
+claude_sigterm_guard_pid=$!
+for _ in $(seq 1 200); do
+  if [ -e /tmp/claude-sigterm.ready ]; then
+    break
+  fi
+  if ! kill -0 "$claude_sigterm_guard_pid" 2>/dev/null; then
+    break
+  fi
+  sleep 0.05
+done
+if [ ! -e /tmp/claude-sigterm.ready ]; then
+  printf 'FAIL Claude guard: SIGTERM fixture did not start\n' >&2
+  sed -n '1,120p' /tmp/claude-sigterm.stderr >&2
+  wait "$claude_sigterm_guard_pid" 2>/dev/null || true
+  exit 1
+fi
+claude_sigterm_child_pid=$(cat /tmp/claude-sigterm.child.pid)
+claude_sigterm_settings=$(cat /tmp/claude-sigterm.settings)
+kill -TERM "$claude_sigterm_guard_pid"
+claude_sigterm_status=0
+wait "$claude_sigterm_guard_pid" || claude_sigterm_status=$?
+if [ "$claude_sigterm_status" -ne 137 ]; then
+  printf 'FAIL Claude guard: SIGTERM returned %s instead of child termination status 137\n' \
+    "$claude_sigterm_status" >&2
+  sed -n '1,120p' /tmp/claude-sigterm.stderr >&2
+  exit 1
+fi
+if kill -0 "$claude_sigterm_child_pid" 2>/dev/null; then
+  printf 'FAIL Claude guard: guarded Claude child survived Promtect SIGTERM\n' >&2
+  exit 1
+fi
+if [ -e "$claude_sigterm_settings" ] || [ -d "$(dirname "$claude_sigterm_settings")" ]; then
+  printf 'FAIL Claude guard: owner-only temporary settings survived Promtect SIGTERM\n' >&2
+  exit 1
+fi
+if ! grep -Fq 'shutdown requested; stopping the guarded tool' /tmp/claude-sigterm.stderr; then
+  printf 'FAIL Claude guard: SIGTERM shutdown was not reported\n' >&2
+  exit 1
+fi
+assert_guard_listener_teardown "Claude guard SIGTERM" /tmp/claude-sigterm.stderr
+printf 'PASS Claude guard: SIGTERM stopped the child, listeners, and temporary settings\n'
 
 if ! HOME=/tmp/ollama OLLAMA_HOST="$PROXY" \
   ollama run synthetic-model "$PROMPT" > /tmp/ollama.out 2>&1; then

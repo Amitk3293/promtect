@@ -73,6 +73,24 @@ impl Audit {
         !self.warned.load(Ordering::Relaxed)
     }
 
+    /// Verify that the cached append descriptor still refers to the current
+    /// audit pathname. A rotation/unlink makes session-level dashboard deltas
+    /// incomplete even when writes to the old descriptor still succeed.
+    pub(crate) fn path_matches_handle(&self) -> bool {
+        let guard = self.sink_lock();
+        let Some(sink) = guard.as_ref() else {
+            return true;
+        };
+        let Some(handle) = sink.handle.as_ref() else {
+            return false;
+        };
+        same_audit_file(handle, &sink.path).unwrap_or(false)
+    }
+
+    pub(crate) fn mark_unhealthy(&self) {
+        self.warn_once();
+    }
+
     fn scoped_request_id(&self, request_id: &str) -> String {
         self.request_scope.as_ref().map_or_else(
             || request_id.to_string(),
@@ -240,6 +258,15 @@ impl Audit {
             return; // null sink: discard.
         };
 
+        if sink
+            .handle
+            .as_ref()
+            .is_some_and(|handle| !same_audit_file(handle, &sink.path).unwrap_or(false))
+        {
+            sink.handle = None;
+            self.warn_once();
+        }
+
         // Open lazily; a cached handle is reused across events.
         if sink.handle.is_none() {
             match Self::open_append(&sink.path) {
@@ -278,7 +305,7 @@ impl Audit {
     fn warn_once(&self) {
         if !self.warned.swap(true, Ordering::Relaxed) {
             eprintln!(
-                "promtect: warning: audit log write failed; masking continues but \
+                "promtect: warning: audit log became unavailable or changed; masking continues but \
                  the audit trail is incomplete (this warning is shown once)"
             );
         }
@@ -413,9 +440,29 @@ fn validate_audit_file(file: &std::fs::File) -> std::io::Result<std::fs::Metadat
     Ok(metadata)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
+fn same_audit_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current = file.metadata()?;
+    let path_file = Audit::open_read(path)?;
+    let path_metadata = path_file.metadata()?;
+    Ok(current.dev() == path_metadata.dev() && current.ino() == path_metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn same_audit_file(_file: &std::fs::File, path: &std::path::Path) -> std::io::Result<bool> {
+    Audit::open_read(path).map(|_| true)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const fn unix_no_follow_flag() -> i32 {
     0o400_000
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const fn unix_no_follow_flag() -> i32 {
+    0o100_000
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -426,7 +473,8 @@ const fn unix_no_follow_flag() -> i32 {
 #[cfg(all(
     unix,
     not(any(
-        target_os = "linux",
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "aarch64"),
         target_os = "macos",
         target_os = "ios"
     ))
@@ -436,16 +484,23 @@ compile_error!("audit log O_NOFOLLOW is not defined for this Unix target");
 #[cfg(unix)]
 fn effective_user_id() -> std::io::Result<u32> {
     use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
 
     static UID: OnceLock<u32> = OnceLock::new();
     if let Some(uid) = UID.get() {
         return Ok(*uid);
     }
 
-    #[cfg(target_os = "linux")]
-    let uid = std::fs::metadata("/proc/self")?.uid();
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
-    let uid = std::fs::metadata(std::env::temp_dir())?.uid();
+    let probe_path =
+        std::env::temp_dir().join(format!(".promtect-owner-{}", uuid::Uuid::new_v4().simple()));
+    let probe = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&probe_path)?;
+    let uid = probe.metadata()?.uid();
+    drop(probe);
+    std::fs::remove_file(probe_path).ok();
 
     Ok(*UID.get_or_init(|| uid))
 }
@@ -621,6 +676,31 @@ mod tests {
     }
 
     #[test]
+    fn rotation_marks_audit_unhealthy_and_reopens_current_path() {
+        let suffix = uuid::Uuid::new_v4();
+        let path = std::env::temp_dir().join(format!("promtect-rotation-{suffix}.jsonl"));
+        let rotated = std::env::temp_dir().join(format!("promtect-rotation-{suffix}.old"));
+        let audit = Audit::to_file(path.clone());
+        audit.record("mask", "aws_key", "opaque-first", "request-first");
+        std::fs::rename(&path, &rotated).expect("rotate audit fixture");
+        std::fs::write(&path, b"").expect("create replacement audit path");
+
+        audit.record("mask", "github_token", "opaque-second", "request-second");
+
+        let old_contents = std::fs::read_to_string(&rotated).expect("read rotated audit");
+        let new_contents = std::fs::read_to_string(&path).expect("read replacement audit");
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(rotated).ok();
+        assert!(
+            !audit.is_healthy(),
+            "rotation must invalidate session totals"
+        );
+        assert!(old_contents.contains("request-first"));
+        assert!(!old_contents.contains("request-second"));
+        assert!(new_contents.contains("request-second"));
+    }
+
+    #[test]
     fn truncated_tail_is_removed_before_next_valid_event() {
         let path = std::env::temp_dir().join(format!(
             "promtect-tail-repair-{}.jsonl",
@@ -698,6 +778,30 @@ mod tests {
         let repaired_len = std::fs::metadata(&path).expect("stat repaired audit").len();
         std::fs::remove_file(&path).ok();
         assert_eq!(repaired_len, 0, "oversized malformed tail must reset");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_user_id_matches_a_file_created_in_shared_tmp() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = std::path::Path::new("/tmp").join(format!(
+            "promtect-owner-check-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .expect("create current-user ownership fixture");
+        let uid = file.metadata().expect("ownership fixture metadata").uid();
+        drop(file);
+        std::fs::remove_file(path).ok();
+
+        assert_eq!(
+            effective_user_id().expect("derive effective uid without unsafe code"),
+            uid
+        );
     }
 
     /// #47: the one-shot write-failure warning is gated by the `warned` flag —
