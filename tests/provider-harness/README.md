@@ -133,7 +133,13 @@ The A/B control documents the automatic `guard` gap fixed by
   cannot satisfy the control assertion. It then runs the pinned real Codex CLI
   through `promtect guard codex` and requires one protected Responses request,
   no request `content-encoding`, a masked upstream canary, and exact restored
-  output. Guard rejects user routing and compression overrides before launch.
+  stdout. The guard path runs separately with `OPENAI_API_KEY`, `CODEX_API_KEY`,
+  and a key stored by `codex login --with-api-key`. A non-sensitive forwarding
+  wrapper verifies that every Codex child sees all external proxy variables
+  removed, both `NO_PROXY` spellings pinned to loopback, and is reaped after
+  exit; the ephemeral Promtect listener must also be immediately reusable.
+  Guard rejects user config, feature, remote, and cloud overrides before launch,
+  and a failed stored-auth probe must fail before binding or provider traffic.
 
 The harness also adversarially sets a stale `AIDER_OPENAI_API_BASE` while
 providing the two variables current `guard aider` injects. Aider 0.86.2's

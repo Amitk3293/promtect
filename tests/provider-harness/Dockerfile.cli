@@ -21,7 +21,7 @@ ARG OLLAMA_ARM64_SHA256=07a0adfcf3ed48ff110e2a3bcec897ca4d3f77d6f817d6ff63e83deb
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
-    PATH=/opt/provider-clis/node_modules/.bin:${PATH}
+    PATH=/usr/local/bin:/opt/provider-clis/node_modules/.bin:${PATH}
 
 COPY tests/provider-harness/package.json tests/provider-harness/package-lock.json /opt/provider-clis/
 COPY tests/provider-harness/requirements.lock /tmp/requirements.lock
@@ -49,7 +49,9 @@ RUN apt-get update \
 
 WORKDIR /harness
 COPY --from=promtect-builder /build/target/release/promtect /usr/local/bin/promtect
+COPY tests/provider-harness/codex_observer.sh /usr/local/bin/codex
 COPY tests/provider-harness/mock_provider.py tests/provider-harness/run_protocols.py tests/provider-harness/verify_cli_observations.py tests/provider-harness/run_clis.sh ./
+RUN chmod 0755 /usr/local/bin/codex
 
 USER harness
 WORKDIR /synthetic

@@ -305,59 +305,66 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
     })
 }
 
-/// Return the first Codex argument that could override the routing or request
-/// compression settings injected by guard.
+/// Return the first Codex argument that can select a transport outside the
+/// guard-owned provider.
 fn conflicting_codex_override(args: &[String]) -> Option<&str> {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = args[i].as_str();
-        let config = if matches!(arg, "-c" | "--config") {
-            i += 1;
-            args.get(i).map(String::as_str)
-        } else {
-            arg.strip_prefix("--config=")
-                .or_else(|| arg.strip_prefix("-c="))
-        };
-        if let Some(value) = config {
-            let key = value.split('=').next().unwrap_or_default().trim();
-            if matches!(
-                key,
-                "openai_base_url"
-                    | "model_provider"
-                    | "features"
-                    | "features.enable_request_compression"
-                    | "enable_request_compression"
-            ) || key.starts_with("model_providers.")
-            {
-                return Some(arg);
-            }
+    let mut before_safe_subcommand = true;
+    for arg in args {
+        let arg = arg.as_str();
+        // Codex/Clap accepts separated, equals, and attached short forms. Reject
+        // every runtime TOML override instead of trying to keep a denylist in
+        // sync with Codex's evolving configuration schema.
+        if matches!(arg, "-c" | "--config")
+            || arg.starts_with("--config=")
+            || (arg.starts_with("-c") && arg.len() > 2)
+        {
+            return Some(arg);
         }
         if matches!(arg, "--oss" | "--local-provider") || arg.starts_with("--local-provider=") {
             return Some(arg);
         }
         if matches!(arg, "--enable" | "--disable")
-            && args
-                .get(i + 1)
-                .is_some_and(|v| v == "enable_request_compression")
+            || arg.starts_with("--enable=")
+            || arg.starts_with("--disable=")
         {
             return Some(arg);
         }
-        if arg == "--enable=enable_request_compression"
-            || arg == "--disable=enable_request_compression"
+        if matches!(
+            arg,
+            "--remote" | "--remote-auth-token-env" | "--remote-control"
+        ) || arg.starts_with("--remote=")
+            || arg.starts_with("--remote-auth-token-env=")
         {
             return Some(arg);
         }
-        i += 1;
+        if before_safe_subcommand
+            && matches!(
+                arg,
+                "remote-control" | "cloud" | "app-server" | "mcp-server" | "exec-server"
+            )
+        {
+            return Some(arg);
+        }
+        if arg == "exec" {
+            before_safe_subcommand = false;
+        }
     }
     None
 }
 
-fn codex_config_args(base_url: &str) -> Vec<String> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexAuthSource {
+    OpenAiEnvironment,
+    CodexEnvironment,
+    StoredApiKey,
+}
+
+fn codex_config_args(base_url: &str, auth: CodexAuthSource) -> Vec<String> {
     // Keep the documented built-in override for current Codex compatibility,
     // but select a guard-owned provider whose complete definition cannot inherit
-    // user routing. WebSockets and retries are disabled so one prompt produces
+    // user routing. WebSockets and retries are disabled so one model call produces
     // one observable HTTP request through Promtect.
-    vec![
+    let mut args = vec![
         "-c".to_string(),
         "model_provider=\"promtect_guard\"".to_string(),
         "-c".to_string(),
@@ -368,10 +375,20 @@ fn codex_config_args(base_url: &str) -> Vec<String> {
         format!("model_providers.promtect_guard.base_url=\"{base_url}\""),
         "-c".to_string(),
         "model_providers.promtect_guard.wire_api=\"responses\"".to_string(),
-        "-c".to_string(),
-        "model_providers.promtect_guard.env_key=\"OPENAI_API_KEY\"".to_string(),
-        "-c".to_string(),
-        "model_providers.promtect_guard.requires_openai_auth=true".to_string(),
+    ];
+    args.extend(match auth {
+        CodexAuthSource::StoredApiKey => vec![
+            "-c".to_string(),
+            "model_providers.promtect_guard.requires_openai_auth=true".to_string(),
+        ],
+        CodexAuthSource::OpenAiEnvironment | CodexAuthSource::CodexEnvironment => vec![
+            "-c".to_string(),
+            "model_providers.promtect_guard.env_key=\"OPENAI_API_KEY\"".to_string(),
+            "-c".to_string(),
+            "model_providers.promtect_guard.requires_openai_auth=false".to_string(),
+        ],
+    });
+    args.extend([
         "-c".to_string(),
         "model_providers.promtect_guard.supports_websockets=false".to_string(),
         "-c".to_string(),
@@ -380,48 +397,93 @@ fn codex_config_args(base_url: &str) -> Vec<String> {
         "model_providers.promtect_guard.stream_max_retries=0".to_string(),
         "--disable".to_string(),
         "enable_request_compression".to_string(),
-    ]
+    ]);
+    args
 }
 
-fn has_codex_api_key_env() -> bool {
-    ["OPENAI_API_KEY", "CODEX_API_KEY"]
-        .iter()
-        .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+fn has_nonblank_env(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|value| !value.trim().is_empty())
 }
 
-fn classify_codex_auth(status: &str, has_api_key_env: bool) -> Result<(), &'static str> {
+fn classify_stored_codex_auth(status: &str) -> Result<CodexAuthSource, &'static str> {
     if status.contains("Logged in using ChatGPT") {
         return Err(
             "ChatGPT subscription authentication is unsupported because Codex can bypass the OpenAI API routing contract",
         );
     }
-    if status.contains("Logged in using an API key")
-        || (status.contains("Not logged in") && has_api_key_env)
-    {
-        return Ok(());
+    if status.contains("Logged in using an API key") {
+        return Ok(CodexAuthSource::StoredApiKey);
     }
     Err("Codex guard requires API-key authentication")
 }
 
-async fn verify_codex_auth(bin: &str) -> Result<(), String> {
+async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, String> {
+    // An explicit environment key selects the guard-owned environment-auth
+    // provider. A separate stored ChatGPT session cannot power or reroute it.
+    if has_nonblank_env("OPENAI_API_KEY") {
+        return Ok(CodexAuthSource::OpenAiEnvironment);
+    }
+    if has_nonblank_env("CODEX_API_KEY") {
+        return Ok(CodexAuthSource::CodexEnvironment);
+    }
+
     let mut cmd = tokio::process::Command::new(bin);
+    configure_codex_network_env(&mut cmd);
     cmd.args(["login", "status"]).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
         .await
         .map_err(|_| "Codex login status timed out".to_string())?
         .map_err(|e| format!("cannot check Codex login status ({e})"))?;
+    if !output.status.success() {
+        return Err("Codex login status check failed".to_string());
+    }
     // Codex versions have emitted this value-free status on both stdout and
     // stderr. Inspect both, but never relay either stream: future versions may
     // add authentication details that must not reach Promtect's own logs.
     let mut status = String::from_utf8_lossy(&output.stdout).into_owned();
     status.push_str(&String::from_utf8_lossy(&output.stderr));
-    classify_codex_auth(&status, has_codex_api_key_env()).map_err(str::to_string)
+    classify_stored_codex_auth(&status).map_err(str::to_string)
 }
 
-async fn verify_codex_config(bin: &str, base_url: &str) -> Result<(), String> {
-    let mut args = codex_config_args(base_url);
+fn configure_codex_network_env(cmd: &mut tokio::process::Command) {
+    for key in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "WS_PROXY",
+        "WSS_PROXY",
+        "ws_proxy",
+        "wss_proxy",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd.env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost");
+}
+
+fn configure_codex_command(cmd: &mut tokio::process::Command, auth: CodexAuthSource) {
+    configure_codex_network_env(cmd);
+    if auth == CodexAuthSource::CodexEnvironment
+        && let Some(api_key) = std::env::var_os("CODEX_API_KEY")
+    {
+        // Codex custom providers consume their configured env_key. Alias the
+        // documented CODEX_API_KEY only inside the child process; never log it.
+        cmd.env("OPENAI_API_KEY", api_key);
+    }
+}
+
+async fn verify_codex_config(
+    bin: &str,
+    base_url: &str,
+    auth: CodexAuthSource,
+) -> Result<(), String> {
+    let mut args = codex_config_args(base_url, auth);
     args.extend(["debug".to_string(), "models".to_string()]);
     let mut cmd = tokio::process::Command::new(bin);
+    configure_codex_command(&mut cmd, auth);
     cmd.args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -441,15 +503,20 @@ async fn verify_codex_config(bin: &str, base_url: &str) -> Result<(), String> {
 /// base-URL env var, run the tool, and return its exit code. The proxy task is
 /// dropped when the process exits.
 pub async fn guard(plan: GuardPlan) -> i32 {
-    if plan.codex_fail_closed
-        && let Err(error) = verify_codex_auth(&plan.bin).await
-    {
-        eprintln!(
-            "promtect guard: refusing to start Codex: {error}.\n  \
-             Use an OpenAI API key or choose another supported guard; no provider request was sent."
-        );
-        return 1;
-    }
+    let codex_auth = if plan.codex_fail_closed {
+        match verify_codex_auth(&plan.bin).await {
+            Ok(source) => Some(source),
+            Err(error) => {
+                eprintln!(
+                    "promtect guard: refusing to start Codex: {error}.\n  \
+                     Use an OpenAI API key or choose another supported guard; no provider request was sent."
+                );
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
 
     // Classify the upstream for the banner, and fail closed on a high-risk one when
     // PROMTECT_BLOCK_RISKY is set — before binding or spawning the tool.
@@ -544,8 +611,8 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         }
     });
 
-    if plan.codex_fail_closed {
-        if let Err(error) = verify_codex_config(&plan.bin, &base_url).await {
+    if let Some(auth) = codex_auth {
+        if let Err(error) = verify_codex_config(&plan.bin, &base_url, auth).await {
             proxy_task.abort();
             eprintln!(
                 "promtect guard: refusing to start Codex: {error}.\n  \
@@ -591,8 +658,9 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // untouched), then override the tool's base-URL var to point at the proxy.
     // kill_on_drop ensures the child can't be orphaned if this future is dropped.
     let mut cmd = tokio::process::Command::new(&plan.bin);
-    if plan.codex_fail_closed {
-        cmd.args(codex_config_args(&base_url));
+    if let Some(auth) = codex_auth {
+        configure_codex_command(&mut cmd, auth);
+        cmd.args(codex_config_args(&base_url, auth));
     }
     cmd.args(&plan.tool_args)
         .env(&plan.base_var, &base_url)
@@ -800,7 +868,10 @@ mod tests {
     #[test]
     fn codex_config_args_force_routing_and_disable_compression() {
         assert_eq!(
-            codex_config_args("http://127.0.0.1:12345/v1"),
+            codex_config_args(
+                "http://127.0.0.1:12345/v1",
+                CodexAuthSource::OpenAiEnvironment,
+            ),
             vec![
                 "-c",
                 "model_provider=\"promtect_guard\"",
@@ -815,7 +886,7 @@ mod tests {
                 "-c",
                 "model_providers.promtect_guard.env_key=\"OPENAI_API_KEY\"",
                 "-c",
-                "model_providers.promtect_guard.requires_openai_auth=true",
+                "model_providers.promtect_guard.requires_openai_auth=false",
                 "-c",
                 "model_providers.promtect_guard.supports_websockets=false",
                 "-c",
@@ -829,18 +900,40 @@ mod tests {
     }
 
     #[test]
+    fn codex_stored_auth_uses_managed_auth_without_env_key() {
+        let args = codex_config_args("http://127.0.0.1:12345/v1", CodexAuthSource::StoredApiKey);
+
+        assert!(
+            args.iter()
+                .any(|arg| arg.ends_with("requires_openai_auth=true"))
+        );
+        assert!(!args.iter().any(|arg| arg.contains("env_key")));
+    }
+
+    #[test]
     fn codex_rejects_routing_and_compression_overrides() {
         for args in [
             vec!["codex", "-c", "openai_base_url=\"https://example.test\""],
+            vec!["codex", "-cmodel_provider=\"other\""],
+            vec!["codex", "-c=model_provider=\"other\""],
+            vec!["codex", "--config", "model=\"other\""],
             vec!["codex", "--config=model_provider=\"other\""],
             vec![
                 "codex",
                 "-c",
-                "model_providers.other.base_url=\"https://example.test\"",
+                "model_providers={promtect_guard={base_url=\"https://example.test\"}}",
             ],
             vec!["codex", "--enable", "enable_request_compression"],
+            vec!["codex", "--disable=responses_websockets"],
             vec!["codex", "--oss"],
             vec!["codex", "--local-provider=ollama"],
+            vec!["codex", "--remote", "environment-id"],
+            vec!["codex", "--remote-auth-token-env=TOKEN"],
+            vec!["codex", "remote-control"],
+            vec!["codex", "cloud"],
+            vec!["codex", "app-server"],
+            vec!["codex", "mcp-server"],
+            vec!["codex", "exec-server"],
         ] {
             let error = plan(&args).unwrap_err();
             assert!(
@@ -851,17 +944,60 @@ mod tests {
     }
 
     #[test]
-    fn codex_auth_rejects_chatgpt_even_when_api_key_env_exists() {
-        let error = classify_codex_auth("Logged in using ChatGPT", true).unwrap_err();
+    fn codex_stored_auth_rejects_chatgpt() {
+        let error = classify_stored_codex_auth("Logged in using ChatGPT").unwrap_err();
         assert!(error.contains("ChatGPT subscription"), "{error}");
     }
 
     #[test]
-    fn codex_auth_accepts_stored_or_environment_api_key() {
-        assert!(classify_codex_auth("Logged in using an API key - sk-...", false).is_ok());
-        assert!(classify_codex_auth("Not logged in", true).is_ok());
-        assert!(classify_codex_auth("Not logged in", false).is_err());
-        assert!(classify_codex_auth("unexpected authentication error", true).is_err());
+    fn codex_stored_auth_accepts_only_api_key_login() {
+        assert_eq!(
+            classify_stored_codex_auth("Logged in using an API key"),
+            Ok(CodexAuthSource::StoredApiKey)
+        );
+        assert!(classify_stored_codex_auth("Not logged in").is_err());
+        assert!(classify_stored_codex_auth("unexpected authentication error").is_err());
+    }
+
+    #[test]
+    fn codex_normal_model_flag_remains_supported() {
+        let plan = plan(&["codex", "--model", "synthetic-model", "exec", "safe prompt"]).unwrap();
+
+        assert_eq!(
+            plan.tool_args,
+            ["--model", "synthetic-model", "exec", "safe prompt"]
+        );
+    }
+
+    #[test]
+    fn codex_child_clears_parent_proxies_and_forces_loopback_no_proxy() {
+        let mut command = tokio::process::Command::new("codex");
+        configure_codex_command(&mut command, CodexAuthSource::OpenAiEnvironment);
+        let env = command.as_std().get_envs().collect::<Vec<_>>();
+
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "WS_PROXY",
+            "WSS_PROXY",
+            "ws_proxy",
+            "wss_proxy",
+        ] {
+            assert!(
+                env.iter()
+                    .any(|(name, value)| *name == key && value.is_none()),
+                "expected {key} to be removed from the Codex child"
+            );
+        }
+        for key in ["NO_PROXY", "no_proxy"] {
+            assert!(env.iter().any(|(name, value)| {
+                *name == key && value.is_some_and(|value| value == "127.0.0.1,localhost")
+            }));
+        }
     }
 
     #[test]

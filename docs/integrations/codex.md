@@ -9,12 +9,15 @@ URL to Promtect.
 promtect guard codex                       # starts the proxy, runs Codex, masks + restores
 ```
 
-`guard codex` requires OpenAI API-key authentication. It rejects ChatGPT
-subscription authentication, custom provider/routing overrides, OpenRouter, and
-request-compression overrides before starting the protected session. Those modes
-cannot currently satisfy the fail-closed routing contract. The protected route
-uses HTTP Responses transport with WebSockets and automatic provider retries
-disabled, so each model call has one observable upstream attempt.
+`guard codex` requires API-key authentication through `OPENAI_API_KEY`,
+`CODEX_API_KEY`, or a key stored by `codex login --with-api-key`. It rejects
+ChatGPT subscription authentication, all runtime `-c`/`--config` and feature
+overrides, remote/cloud/server modes, OpenRouter, and local-provider selection
+before starting the protected session. Those modes cannot currently satisfy the
+fail-closed routing contract. Use normal flags such as `--model` for supported
+options. The protected route uses HTTP Responses transport with WebSockets,
+automatic provider retries, request compression, and child-side external proxy
+variables disabled, so each model call has one observable upstream attempt.
 
 The rest of this guide is the manual method.
 
