@@ -255,6 +255,97 @@ async fn active_extra_detector_blocks_a_residual_before_upstream() {
     assert!(!body.contains("CUSTOMSECRET"));
 }
 
+#[derive(Clone, Copy)]
+enum MalformedResidualSpan {
+    Empty,
+    Reversed,
+    OutOfRange,
+    NonCharBoundary,
+    ValueMismatch,
+}
+
+async fn assert_malformed_residual_blocks_before_upstream(case: MalformedResidualSpan) {
+    let (upstream_url, connections) = spawn_socket_counter().await;
+    let mut c = ctx(&upstream_url);
+    c.extra_detect = Some(Arc::new(move |candidate: &str| {
+        if let Some(start) = candidate.find("CUSTOMSECRET") {
+            return vec![promtect::detect::Match::new(
+                "custom_rulebook",
+                "CUSTOMSECRET".to_owned(),
+                start,
+                start + "CUSTOMSECRET".len(),
+            )];
+        }
+
+        let sentinel_start = candidate
+            .find("«promtect:custom_rulebook:")
+            .expect("the first detector pass must mint a custom sentinel");
+        let inside = sentinel_start + "«".len();
+        let (value, start, end) = match case {
+            MalformedResidualSpan::Empty => ("", inside, inside),
+            MalformedResidualSpan::Reversed => ("x", inside + 2, inside + 1),
+            MalformedResidualSpan::OutOfRange => {
+                ("CUSTOMSECRET", candidate.len(), candidate.len() + 1)
+            }
+            MalformedResidualSpan::NonCharBoundary => ("x", sentinel_start + 1, inside),
+            MalformedResidualSpan::ValueMismatch => {
+                let start = candidate
+                    .find("promtect")
+                    .expect("minted sentinel must contain its marker");
+                ("CUSTOMSECRET", start, start + "promtect".len())
+            }
+        };
+
+        vec![promtect::detect::Match::new(
+            "custom_rulebook",
+            value.to_owned(),
+            start,
+            end,
+        )]
+    }));
+    let promtect_url = spawn(promtect::proxy::app(c)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(r#"{"prompt":"CUSTOMSECRET"}"#)
+        .send()
+        .await
+        .expect("post through malformed residual detector");
+    let status = response.status();
+    let body = response.text().await.expect("read value-free rejection");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+    assert!(body.contains("custom_rulebook"));
+    assert!(!body.contains("CUSTOMSECRET"));
+}
+
+#[tokio::test]
+async fn empty_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::Empty).await;
+}
+
+#[tokio::test]
+async fn reversed_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::Reversed).await;
+}
+
+#[tokio::test]
+async fn out_of_range_residual_span_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::OutOfRange).await;
+}
+
+#[tokio::test]
+async fn non_char_boundary_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::NonCharBoundary).await;
+}
+
+#[tokio::test]
+async fn value_mismatched_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::ValueMismatch).await;
+}
+
 /// Three distinct secrets in one body are each masked before reaching the upstream
 /// and all three are restored in the response returned to the client.
 #[tokio::test]

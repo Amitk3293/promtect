@@ -118,10 +118,11 @@ fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Mat
 /// Re-run the exact active request detector chain over a masked body.
 ///
 /// The detector receives the complete masked body, preserving anchored and
-/// context-sensitive rule semantics plus original byte offsets. Matches wholly
-/// contained inside an exact sentinel minted by this request's vault are
-/// discarded; unknown sentinel-shaped input and matches extending outside a
-/// minted sentinel remain residual leaks and fail closed. Reusing
+/// context-sensitive rule semantics plus original byte offsets. Structurally
+/// valid matches wholly contained inside an exact sentinel minted by this
+/// request's vault are discarded; malformed matches, unknown sentinel-shaped
+/// input, and matches extending outside a minted sentinel remain residual leaks
+/// and fail closed. Reusing
 /// [`compose_matches`] is the security invariant: a downstream paid or custom
 /// detector cannot participate in masking while being omitted from the final
 /// residual check.
@@ -134,9 +135,15 @@ fn scan_for_residual_leaks(
     compose_matches(masked, extra)
         .into_iter()
         .filter(|hit| {
-            !sentinel_spans
-                .iter()
-                .any(|span| span.start <= hit.start && hit.end <= span.end)
+            let has_exact_span = hit.start < hit.end
+                && masked
+                    .get(hit.start..hit.end)
+                    .is_some_and(|value| value == hit.value.as_str());
+            let is_minted_sentinel_content = has_exact_span
+                && sentinel_spans
+                    .iter()
+                    .any(|span| span.start <= hit.start && hit.end <= span.end);
+            !is_minted_sentinel_content
         })
         .collect()
 }
