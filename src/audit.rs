@@ -228,6 +228,27 @@ impl Audit {
         bytes_in: usize,
         bytes_out: usize,
     ) {
+        self.record_request_outcome(request_id, masked, detectors, bytes_in, bytes_out, false);
+    }
+
+    /// Record a request rejected before its body could be safely summarized.
+    ///
+    /// Early 413/415 paths still need a first-class request row in metrics, but
+    /// they must not be counted as clean traffic. Body sizes and detector kinds
+    /// are deliberately zero/empty because those paths stop before safe parsing.
+    pub(crate) fn record_blocked_request(&self, request_id: &str) {
+        self.record_request_outcome(request_id, 0, &[], 0, 0, true);
+    }
+
+    fn record_request_outcome(
+        &self,
+        request_id: &str,
+        masked: usize,
+        detectors: &[&str],
+        bytes_in: usize,
+        bytes_out: usize,
+        blocked: bool,
+    ) {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -240,6 +261,7 @@ impl Audit {
             "detectors": detectors,
             "bytes_in": bytes_in,
             "bytes_out": bytes_out,
+            "blocked": blocked,
         });
         self.append_line(&line.to_string());
     }
@@ -278,12 +300,30 @@ mod tests {
         assert!(contents.contains("\"action\":\"request\""));
         assert!(contents.contains("\"request_id\":\"req-abc\""));
         assert!(contents.contains("\"masked\":2"));
+        assert!(contents.contains("\"blocked\":false"));
         assert!(contents.contains("\"bytes_in\":512"));
         assert!(contents.contains("\"bytes_out\":498"));
         assert!(contents.contains("aws_key"));
         assert!(contents.contains("anthropic_key"));
         // Invariant: body text and secret values are never written to the log.
         assert!(!contents.contains("AKIA"));
+    }
+
+    #[test]
+    fn blocked_request_summary_is_explicit_and_value_free() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-blocked-request-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Audit::to_file(path.clone());
+        audit.record_blocked_request("req-blocked");
+
+        let contents = std::fs::read_to_string(&path).expect("read blocked request audit");
+        std::fs::remove_file(&path).ok();
+
+        assert!(contents.contains("\"request_id\":\"req-blocked\""));
+        assert!(contents.contains("\"blocked\":true"));
+        assert!(contents.contains("\"masked\":0"));
     }
 
     #[test]

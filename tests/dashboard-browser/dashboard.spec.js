@@ -2,6 +2,8 @@ const { test, expect } = require("@playwright/test");
 
 const restoreUrl = "http://dashboard-restore:8799";
 const strictUrl = "http://dashboard-strict:8799";
+const liveProxyUrl = "http://proxy-live:8790";
+const liveDashboardUrl = "http://proxy-live:8799";
 
 function cssTimeToMilliseconds(value) {
   if (value.endsWith("ms")) return Number.parseFloat(value);
@@ -51,6 +53,38 @@ test("strict mode never renders restore on", async ({ page }) => {
   await expect(page.getByText("strict mode", { exact: true })).toBeVisible();
   await expect(page.getByText("Restore off", { exact: true })).toBeVisible();
   await expect(page.getByText("restore on", { exact: true })).toHaveCount(0);
+});
+
+test("real 413 and 415 outcomes reach metrics and rendered request history", async ({ page, request }) => {
+  await openWhenReady(page, liveDashboardUrl);
+
+  const encoded = await request.post(liveProxyUrl, {
+    headers: { "content-type": "application/json", "content-encoding": "gzip" },
+    data: { content: "AKIAIOSFODNN7EXAMPLE" },
+  });
+  expect(encoded.status()).toBe(415);
+
+  const oversized = await request.post(liveProxyUrl, {
+    headers: { "content-type": "text/plain" },
+    data: "x".repeat(256),
+  });
+  expect(oversized.status()).toBe(413);
+
+  const metricsResponse = await request.get(`${liveDashboardUrl}/api/metrics`);
+  expect(metricsResponse.ok()).toBe(true);
+  const metrics = await metricsResponse.json();
+  expect(metrics.requests_total).toBe(2);
+  expect(metrics.requests_clean).toBe(0);
+  expect(metrics.requests_blocked_total).toBe(2);
+  expect(metrics.recent).toHaveLength(2);
+  expect(metrics.recent.every(entry => entry.blocked === true)).toBe(true);
+
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await expect(page.getByText("live", { exact: true })).toBeVisible();
+  const blockedMetric = page.getByText("Requests blocked", { exact: true }).locator("..");
+  await expect(blockedMetric.getByText("2", { exact: true })).toBeVisible();
+  await expect(page.getByText("blocked", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("No traffic yet", { exact: true })).toHaveCount(0);
 });
 
 test("tabs support keyboard navigation and preserve focus", async ({ page }) => {

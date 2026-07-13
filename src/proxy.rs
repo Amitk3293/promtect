@@ -4,7 +4,7 @@
 use crate::audit::Audit;
 use crate::detect;
 use crate::mask::mask_with_matches;
-use crate::stream::{StreamRestorer, recover_stream_errors, restore_stream};
+use crate::stream::{StreamRestorer, observe_stream_errors, restore_stream};
 use crate::vault::Vault;
 use axum::{
     Router,
@@ -258,6 +258,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // before reading the body or constructing any upstream request. Promtect cannot
     // safely scan encoded bytes, and forwarding them unscanned would leak secrets.
     if !request_content_encoding_is_supported(&headers) {
+        ctx.audit.record_blocked_request(&request_id);
         ctx.audit.record(
             "request_rejected",
             "content_encoding",
@@ -281,6 +282,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     let body_bytes = match axum::body::to_bytes(req.into_body(), ctx.max_body_bytes).await {
         Ok(b) => b,
         Err(_) => {
+            ctx.audit.record_blocked_request(&request_id);
             ctx.audit.record(
                 "request_blocked",
                 "body_limit",
@@ -572,8 +574,8 @@ async fn restore_response(
 
     let audit = Arc::clone(&ctx.audit);
     let outcome_request_id = request_id.clone();
-    let (recovered, outcome) = recover_stream_errors(source, audit, outcome_request_id);
-    let body = Body::from_stream(recovered).with_trailers(async move {
+    let (observed, outcome) = observe_stream_errors(source, audit, outcome_request_id);
+    let body = Body::from_stream(observed).with_trailers(async move {
         let mut trailers = HeaderMap::new();
         trailers.insert(
             STREAM_OUTCOME_HEADER,

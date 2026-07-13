@@ -56,7 +56,11 @@ They verify behavior that spans the full request/response pipeline.
 **Dashboard browser matrix** (`tests/dashboard-browser/`): runs the real embedded
 dashboard in Docker and verifies desktop rendering, strict/restore mode truth,
 mobile overflow, keyboard tab focus, and reduced-motion behavior with Chromium.
-The Playwright package and browser image are pinned to the same version.
+It also drives real 413/415 requests through a live Docker proxy and verifies
+their value-free audit outcomes through `/api/metrics` and the rendered request
+history. The tracked synthetic fixture makes the suite reproducible from a clean
+checkout. The Playwright package and browser image are pinned to the same version,
+and the Linux CI gate runs this target on every pull request.
 **Run:** `make dashboard-browser-test`.
 
 **Dashboard server** (`tests/dashboard.rs`): starts the observability server on an

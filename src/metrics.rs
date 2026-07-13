@@ -22,7 +22,8 @@ pub struct Metrics {
     pub requests_total: u64,
     /// Requests where at least one secret was masked.
     pub requests_with_secrets: u64,
-    /// Requests that contained no detectable secrets.
+    /// Forwarded requests that contained no detectable secrets. Requests
+    /// rejected before forwarding are counted separately and never as clean.
     pub requests_clean: u64,
     /// Total count of individual secret spans masked (summed over all requests).
     pub secrets_masked_total: u64,
@@ -162,7 +163,13 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                 m.requests_total += 1;
 
                 let masked = val.get("masked").and_then(|v| v.as_u64()).unwrap_or(0);
-                if masked > 0 {
+                let blocked = val
+                    .get("blocked")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if blocked {
+                    // Counted by the paired request_blocked/request_rejected event.
+                } else if masked > 0 {
                     m.requests_with_secrets += 1;
                 } else {
                     m.requests_clean += 1;
@@ -195,7 +202,7 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                     request_id,
                     masked,
                     detectors,
-                    blocked: false,
+                    blocked,
                     restored: 0,
                     output_secrets: 0,
                     failures: 0,
@@ -533,6 +540,35 @@ mod tests {
         assert!(req_2.blocked);
         assert!(req_2.interrupted);
         assert_eq!(req_2.output_secrets, 1);
+    }
+
+    #[test]
+    fn aggregate_keeps_early_blocked_requests_out_of_clean_counts() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-metrics-early-block-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).expect("create early-block audit");
+        writeln!(
+            f,
+            r#"{{"ts_ms":1000,"action":"request","request_id":"req-blocked","masked":0,"detectors":[],"bytes_in":0,"bytes_out":0,"blocked":true}}"#
+        )
+        .expect("write blocked request summary");
+        writeln!(
+            f,
+            r#"{{"ts_ms":1001,"action":"request_rejected","detector":"content_encoding","placeholder":"«unsupported-content-encoding»","request_id":"req-blocked"}}"#
+        )
+        .expect("write blocked request outcome");
+
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(m.requests_total, 1);
+        assert_eq!(m.requests_clean, 0);
+        assert_eq!(m.requests_with_secrets, 0);
+        assert_eq!(m.requests_blocked_total, 1);
+        assert_eq!(m.recent.len(), 1);
+        assert!(m.recent[0].blocked);
     }
 
     #[test]

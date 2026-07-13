@@ -497,9 +497,13 @@ async fn vault_does_not_bleed_secrets_across_requests() {
 #[tokio::test]
 async fn oversized_body_is_rejected_with_413() {
     let (mock_url, seen) = spawn_mock().await;
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-oversized-body-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
     let small_cap = promtect::proxy::Ctx {
         upstream: mock_url.clone(),
-        audit: Arc::new(promtect::audit::Audit::null()),
+        audit: Arc::new(promtect::audit::Audit::to_file(audit_path.clone())),
         client: reqwest::Client::new(),
         max_body_bytes: 64,
         restore: true,
@@ -511,6 +515,8 @@ async fn oversized_body_is_rejected_with_413() {
 
     let body = "x".repeat(4096); // far over the 64-byte cap, still tiny
     let (status, _text) = post_through(&promtect_url, &body).await;
+    let metrics = promtect::metrics::aggregate(&audit_path);
+    std::fs::remove_file(&audit_path).ok();
 
     assert_eq!(status, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     // Rejected before forwarding: the upstream must never have seen the body.
@@ -518,6 +524,11 @@ async fn oversized_body_is_rejected_with_413() {
         seen.body.lock().unwrap().is_empty(),
         "upstream must not receive a body that exceeded the cap"
     );
+    assert_eq!(metrics.requests_total, 1);
+    assert_eq!(metrics.requests_clean, 0);
+    assert_eq!(metrics.requests_blocked_total, 1);
+    assert_eq!(metrics.recent.len(), 1);
+    assert!(metrics.recent[0].blocked);
 }
 
 /// A body within the cap passes straight through (masked, then forwarded). The
@@ -664,6 +675,7 @@ async fn non_utf8_content_encoding_is_value_free_and_opens_no_upstream_socket() 
     );
 
     let audit = std::fs::read_to_string(&audit_path).unwrap();
+    let metrics = promtect::metrics::aggregate(&audit_path);
     assert!(audit.contains(r#""action":"request_rejected""#));
     assert!(audit.contains(r#""detector":"content_encoding""#));
     assert!(audit.contains("«unsupported-content-encoding»"));
@@ -675,6 +687,11 @@ async fn non_utf8_content_encoding_is_value_free_and_opens_no_upstream_socket() 
         !audit.contains(body_marker),
         "audit reflects request-body content"
     );
+    assert_eq!(metrics.requests_total, 1);
+    assert_eq!(metrics.requests_clean, 0);
+    assert_eq!(metrics.requests_blocked_total, 1);
+    assert_eq!(metrics.recent.len(), 1);
+    assert!(metrics.recent[0].blocked);
 
     let _ = std::fs::remove_file(audit_path);
 }
@@ -841,7 +858,7 @@ async fn mock_timed_out_stream(State(seen): State<Seen>, body: String) -> axum::
         .unwrap()
 }
 
-async fn assert_recovered_stream_failure(
+async fn assert_interrupted_stream_is_client_visible(
     upstream_handler: axum::routing::MethodRouter<Seen>,
     read_timeout: Option<std::time::Duration>,
 ) {
@@ -882,30 +899,32 @@ async fn assert_recovered_stream_failure(
             .and_then(|v| v.to_str().ok()),
         Some("promtect-stream-outcome")
     );
-    let received = response.bytes().await.expect("recovered response body");
+    let body_result = response.bytes().await;
     let masked = seen.body.lock().unwrap().clone();
-    let expected = truncate_before_sentinel_close(&masked);
     let audit = std::fs::read_to_string(&audit_path).expect("stream recovery audit");
     std::fs::remove_file(&audit_path).ok();
 
-    assert_eq!(received, expected.as_bytes());
+    assert!(
+        body_result.is_err(),
+        "ordinary clients must not accept a truncated upstream body as complete"
+    );
     assert!(!masked.contains(aws));
     assert!(audit.contains("\"action\":\"stream_interrupted\""));
     assert!(!audit.contains(aws));
 }
 
 #[tokio::test]
-async fn interrupted_stream_preserves_every_upstream_byte_and_audits_outcome() {
-    assert_recovered_stream_failure(post(mock_interrupted_stream), None).await;
+async fn interrupted_stream_is_client_visible_and_audited() {
+    assert_interrupted_stream_is_client_visible(post(mock_interrupted_stream), None).await;
 }
 
 #[tokio::test]
-async fn interrupted_stream_sends_terminal_http1_outcome_trailer() {
+async fn interrupted_stream_emits_safe_prefix_then_aborts_http1_body() {
     let seen = Seen::default();
     let upstream = spawn(
         Router::new()
             .route("/", post(mock_interrupted_stream))
-            .with_state(seen),
+            .with_state(seen.clone()),
     )
     .await;
     let proxy = spawn(promtect::proxy::app(ctx(&upstream))).await;
@@ -933,18 +952,29 @@ async fn interrupted_stream_sends_terminal_http1_outcome_trailer() {
     .await
     .expect("proxy closes Connection: close response")
     .expect("read raw HTTP/1.1 response");
-    let wire = String::from_utf8_lossy(&wire).to_ascii_lowercase();
+    let masked = seen.body.lock().unwrap().clone();
+    let partial = truncate_before_sentinel_close(&masked);
+    let expected = partial
+        .split_once('«')
+        .map_or(partial.as_str(), |(prefix, _)| prefix);
+    let wire_text = String::from_utf8_lossy(&wire).to_ascii_lowercase();
 
-    assert!(wire.contains("trailer: promtect-stream-outcome\r\n"));
+    assert!(wire_text.contains("trailer: promtect-stream-outcome\r\n"));
     assert!(
-        wire.ends_with("0\r\npromtect-stream-outcome: interrupted\r\n\r\n"),
-        "terminal outcome trailer missing from HTTP/1.1 wire response: {wire:?}"
+        wire.windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "bytes emitted before the held sentinel carry were not delivered before the body error"
+    );
+    assert!(
+        !wire_text.ends_with("0\r\npromtect-stream-outcome: complete\r\n\r\n")
+            && !wire_text.ends_with("0\r\npromtect-stream-outcome: interrupted\r\n\r\n"),
+        "an interrupted response must not carry a successful terminal chunk: {wire_text:?}"
     );
 }
 
 #[tokio::test]
-async fn timed_out_stream_preserves_every_received_byte_and_audits_outcome() {
-    assert_recovered_stream_failure(
+async fn timed_out_stream_is_client_visible_and_audited() {
+    assert_interrupted_stream_is_client_visible(
         post(mock_timed_out_stream),
         Some(std::time::Duration::from_millis(50)),
     )

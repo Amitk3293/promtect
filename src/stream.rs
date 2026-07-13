@@ -25,7 +25,6 @@ use crate::vault::Vault;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -325,22 +324,17 @@ impl StreamOutcome {
     }
 }
 
-/// Convert a fallible response stream into a byte-preserving downstream stream.
+/// Observe failures in a byte-preserving downstream response stream.
 ///
-/// Every successful upstream byte is emitted unchanged. If the source fails,
-/// the error itself is converted into one value-free audit event and an HTTP
-/// trailer by the caller; it is not re-yielded after the final bytes because
-/// Hyper may abort the connection before a preceding carry-flush frame reaches
-/// the client. The returned outcome handle distinguishes that recovered
-/// interruption from an ordinary end-of-stream without changing payload bytes.
-pub(crate) fn recover_stream_errors<E, S>(
+/// Every successful upstream byte and every source error is forwarded unchanged.
+/// The error also produces one value-free audit event. Keeping the error in the
+/// stream makes ordinary clients fail on truncated SSE, NDJSON, JSON, or binary
+/// bodies instead of accepting a clean EOF merely because they ignore trailers.
+pub(crate) fn observe_stream_errors<E, S>(
     stream: S,
     audit: Arc<Audit>,
     request_id: String,
-) -> (
-    impl Stream<Item = Result<Bytes, Infallible>> + Send,
-    StreamOutcome,
-)
+) -> (impl Stream<Item = Result<Bytes, E>> + Send, StreamOutcome)
 where
     E: Send + 'static,
     S: Stream<Item = Result<Bytes, E>> + Send + 'static,
@@ -349,27 +343,22 @@ where
         interrupted: Arc::new(AtomicBool::new(false)),
     };
     let outcome_for_stream = outcome.clone();
-    let recovered = stream.filter_map(move |item| {
-        let audit = Arc::clone(&audit);
-        let request_id = request_id.clone();
-        let outcome = outcome_for_stream.clone();
-        async move {
-            match item {
-                Ok(bytes) => Some(Ok(bytes)),
-                Err(_) => {
-                    outcome.interrupted.store(true, Ordering::Release);
-                    audit.record(
-                        "stream_interrupted",
-                        "upstream",
-                        "«stream-interrupted»",
-                        &request_id,
-                    );
-                    None
-                }
-            }
+    let observed = stream.map(move |item| match item {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => {
+            outcome_for_stream
+                .interrupted
+                .store(true, Ordering::Release);
+            audit.record(
+                "stream_interrupted",
+                "upstream",
+                "«stream-interrupted»",
+                &request_id,
+            );
+            Err(error)
         }
     });
-    (recovered, outcome)
+    (observed, outcome)
 }
 
 #[cfg(test)]
@@ -621,7 +610,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_interruption_preserves_bytes_and_writes_value_free_outcome() {
+    async fn observed_interruption_preserves_bytes_propagates_error_and_audits() {
         #[derive(Debug)]
         struct TestErr;
 
@@ -640,13 +629,18 @@ mod tests {
         .boxed();
 
         let restored = restore_stream(upstream, sr);
-        let (recovered, outcome) =
-            recover_stream_errors(restored, Arc::clone(&audit), "request-1".into());
-        let emitted: Vec<u8> = recovered
-            .map(|item| item.expect("recovered stream is infallible"))
-            .flat_map(futures_util::stream::iter)
-            .collect()
-            .await;
+        let (observed, outcome) =
+            observe_stream_errors(restored, Arc::clone(&audit), "request-1".into());
+        let items: Vec<Result<Bytes, TestErr>> = observed.collect().await;
+        assert!(
+            matches!(items.last(), Some(Err(_))),
+            "successful bytes must be followed by the source error"
+        );
+        let emitted: Vec<u8> = items
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .flat_map(|bytes| bytes.iter().copied())
+            .collect();
         drop(audit);
 
         let log = std::fs::read_to_string(&path).expect("read stream outcome audit");
