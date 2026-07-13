@@ -795,11 +795,12 @@ dependencies = [
 
 [[package]]
 name = "promtect"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "http-body-util",
  "proptest",
  "rand",
  "regex",

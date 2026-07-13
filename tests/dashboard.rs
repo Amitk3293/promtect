@@ -55,8 +55,16 @@ fn write_fixture_audit() -> std::path::PathBuf {
 /// Because tests use ephemeral ports there is no teardown step — the OS
 /// reclaims the port once the test process exits.
 async fn spawn_dashboard(audit_path: std::path::PathBuf) -> String {
+    spawn_dashboard_with_restore(audit_path, true).await
+}
+
+async fn spawn_dashboard_with_restore(
+    audit_path: std::path::PathBuf,
+    restore_enabled: bool,
+) -> String {
     let ctx = DashCtx {
         audit_path: Arc::new(audit_path),
+        restore_enabled,
     };
     let router = app(ctx);
 
@@ -197,6 +205,9 @@ async fn index_endpoint_returns_200_with_html_page() {
         body.contains("/api/metrics"),
         "dashboard HTML must reference /api/metrics for client-side data fetching"
     );
+    assert!(body.contains("m.restore_enabled === true"));
+    assert!(body.contains("Secrets masked"));
+    assert!(!body.contains("Secrets blocked"));
 
     std::fs::remove_file(&audit_path).ok();
 }
@@ -233,4 +244,21 @@ async fn api_metrics_returns_zeros_when_audit_file_is_missing() {
         Some(0),
         "secrets_masked_total must be 0 with no audit file"
     );
+}
+
+#[tokio::test]
+async fn api_metrics_reports_strict_restore_mode_truthfully() {
+    let audit_path = write_fixture_audit();
+    let base = spawn_dashboard_with_restore(audit_path.clone(), false).await;
+
+    let body = reqwest::get(format!("{base}/api/metrics"))
+        .await
+        .expect("GET strict-mode metrics")
+        .text()
+        .await
+        .expect("read strict-mode metrics");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("parse strict-mode metrics");
+    std::fs::remove_file(&audit_path).ok();
+
+    assert_eq!(json["restore_enabled"].as_bool(), Some(false));
 }

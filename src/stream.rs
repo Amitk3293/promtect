@@ -26,6 +26,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A response-side detection pass, injected by `promtect-pro` (license-gated):
 /// it scans the restored response text for secrets the model echoed back or
@@ -305,6 +306,61 @@ where
     })
 }
 
+/// Shared completion state for a downstream response stream.
+///
+/// The response body exposes this as the value-free
+/// `promtect-stream-outcome` HTTP trailer after all payload bytes. A trailer is
+/// used because an interruption is not knowable when the response headers are
+/// first sent, and adding a marker to an SSE/NDJSON payload would corrupt the
+/// provider protocol.
+#[derive(Clone)]
+pub(crate) struct StreamOutcome {
+    interrupted: Arc<AtomicBool>,
+}
+
+impl StreamOutcome {
+    pub(crate) fn was_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+}
+
+/// Observe failures in a byte-preserving downstream response stream.
+///
+/// Every successful upstream byte and every source error is forwarded unchanged.
+/// The error also produces one value-free audit event. Keeping the error in the
+/// stream makes ordinary clients fail on truncated SSE, NDJSON, JSON, or binary
+/// bodies instead of accepting a clean EOF merely because they ignore trailers.
+pub(crate) fn observe_stream_errors<E, S>(
+    stream: S,
+    audit: Arc<Audit>,
+    request_id: String,
+) -> (impl Stream<Item = Result<Bytes, E>> + Send, StreamOutcome)
+where
+    E: Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    let outcome = StreamOutcome {
+        interrupted: Arc::new(AtomicBool::new(false)),
+    };
+    let outcome_for_stream = outcome.clone();
+    let observed = stream.map(move |item| match item {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => {
+            outcome_for_stream
+                .interrupted
+                .store(true, Ordering::Release);
+            audit.record(
+                "stream_interrupted",
+                "upstream",
+                "«stream-interrupted»",
+                &request_id,
+            );
+            Err(error)
+        }
+    });
+    (observed, outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +607,47 @@ mod tests {
             "x «promtect:aws_key:00",
             "held carry bytes must be flushed, not dropped, before the error"
         );
+    }
+
+    #[tokio::test]
+    async fn observed_interruption_preserves_bytes_propagates_error_and_audits() {
+        #[derive(Debug)]
+        struct TestErr;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-stream-outcome-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(Audit::to_file(path.clone()));
+        let (vault, _sentinel) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
+        let sr = StreamRestorer::new(vault, Arc::clone(&audit), "request-1".into());
+        let partial = "data: «promtect:aws_key:00";
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, TestErr>(Bytes::from(partial)),
+            Err(TestErr),
+        ])
+        .boxed();
+
+        let restored = restore_stream(upstream, sr);
+        let (observed, outcome) =
+            observe_stream_errors(restored, Arc::clone(&audit), "request-1".into());
+        let items: Vec<Result<Bytes, TestErr>> = observed.collect().await;
+        assert!(
+            matches!(items.last(), Some(Err(_))),
+            "successful bytes must be followed by the source error"
+        );
+        let emitted: Vec<u8> = items
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .flat_map(|bytes| bytes.iter().copied())
+            .collect();
+        drop(audit);
+
+        let log = std::fs::read_to_string(&path).expect("read stream outcome audit");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(emitted, partial.as_bytes());
+        assert!(outcome.was_interrupted());
+        assert!(log.contains("\"action\":\"stream_interrupted\""));
+        assert!(!log.contains("AKIAIOSFODNN7EXAMPLE"));
     }
 }

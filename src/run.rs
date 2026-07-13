@@ -189,6 +189,7 @@ pub async fn run_proxy(
                     Ok(dash_listener) => {
                         let dash_app = dashboard::app(dashboard::DashCtx {
                             audit_path: Arc::new(audit_path_for_dash.as_str().into()),
+                            restore_enabled: restore,
                         });
                         tokio::task::spawn(async move {
                             // Graceful drain: stop accepting new dashboard

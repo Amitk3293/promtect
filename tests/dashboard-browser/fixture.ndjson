@@ -1,0 +1,10 @@
+{"ts_ms":1000,"action":"request","request_id":"request-masked","masked":1,"detectors":["aws_key"],"bytes_in":100,"bytes_out":110,"blocked":false}
+{"ts_ms":1001,"action":"mask","detector":"aws_key","placeholder":"«promtect:aws_key:0001»","request_id":"request-masked"}
+{"ts_ms":1002,"action":"unmask","detector":"aws_key","placeholder":"«promtect:aws_key:0001»","request_id":"request-masked"}
+{"ts_ms":2000,"action":"request","request_id":"request-blocked","masked":1,"detectors":["github_token"],"bytes_in":80,"bytes_out":90,"blocked":false}
+{"ts_ms":2001,"action":"mask","detector":"github_token","placeholder":"«promtect:github_token:0001»","request_id":"request-blocked"}
+{"ts_ms":2002,"action":"request_blocked","detector":"residual_secret","placeholder":"«residual-secret»","request_id":"request-blocked"}
+{"ts_ms":3000,"action":"request","request_id":"request-output","masked":0,"detectors":[],"bytes_in":50,"bytes_out":50,"blocked":false}
+{"ts_ms":3001,"action":"output_secret","detector":"email","placeholder":"«output-scan»","request_id":"request-output"}
+{"ts_ms":4000,"action":"request","request_id":"request-failed","masked":0,"detectors":[],"bytes_in":40,"bytes_out":40,"blocked":false}
+{"ts_ms":4001,"action":"stream_interrupted","detector":"upstream","placeholder":"«stream-interrupted»","request_id":"request-failed"}

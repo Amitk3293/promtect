@@ -48,6 +48,13 @@ jobs:
       - name: Audit dependencies
         run: cargo audit --deny warnings
 
+  dashboard-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Docker dashboard browser suite
+        run: make dashboard-browser-test
+
   coverage:
     runs-on: ubuntu-latest
     # Report-only: prints the coverage summary on every run; never fails the build.

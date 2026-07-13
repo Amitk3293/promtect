@@ -1,6 +1,6 @@
 PORT ?= 8790
 
-.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test provider-harness up down clean
+.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test dashboard-browser-test provider-harness up down clean
 
 build:
 	cargo build --release
@@ -45,6 +45,9 @@ docker-test:
 # mock providers, and assertions) runs inside an internal Docker network.
 provider-harness:
 	sh tests/provider-harness/run.sh
+
+dashboard-browser-test:
+	bash tests/dashboard-browser/run.sh
 
 up:
 	docker-compose up -d || docker compose up -d

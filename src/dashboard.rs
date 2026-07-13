@@ -22,6 +22,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,6 +38,16 @@ pub struct DashCtx {
     /// (all-zero metrics), so the dashboard starts cleanly even before the proxy
     /// has handled any requests.
     pub audit_path: Arc<PathBuf>,
+    /// Actual response restoration mode of the proxy this dashboard describes.
+    /// `false` is strict mode and must never be rendered as restore-on.
+    pub restore_enabled: bool,
+}
+
+#[derive(Serialize)]
+struct DashboardMetrics {
+    #[serde(flatten)]
+    metrics: metrics::Metrics,
+    restore_enabled: bool,
 }
 
 /// Build the dashboard router.
@@ -73,7 +84,10 @@ async fn index() -> Html<&'static str> {
 /// task. The [`metrics::Metrics`] type derives `Serialize`, so axum's `Json`
 /// extractor handles content-type negotiation automatically.
 async fn api_metrics(State(ctx): State<DashCtx>) -> impl IntoResponse {
-    axum::Json(metrics::aggregate(&ctx.audit_path))
+    axum::Json(DashboardMetrics {
+        metrics: metrics::aggregate(&ctx.audit_path),
+        restore_enabled: ctx.restore_enabled,
+    })
 }
 
 /// Return current metrics in Prometheus text-exposition format (version 0.0.4).
