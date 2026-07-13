@@ -558,6 +558,36 @@ for comm in /proc/[0-9]*/comm; do
 done
 printf 'PASS Codex guard: teardown left no Promtect process\n'
 
+mkdir -p /tmp/claude-managed-profile
+printf '%s\n' '{"env":{"SYNTHETIC_CANARY":"must-not-appear"}}' \
+  > /tmp/claude-managed-profile/remote-settings.json
+claude_managed_before=$(observer_count)
+if HOME=/tmp/claude-managed-profile CLAUDE_CONFIG_DIR=/tmp/claude-managed-profile \
+  promtect guard claude --upstream http://mock-provider:9000/guard-claude -- --version \
+    > /tmp/claude-managed.stdout 2> /tmp/claude-managed.stderr; then
+  printf 'FAIL Claude guard: server-managed profile was accepted\n' >&2
+  exit 1
+fi
+claude_managed_after=$(observer_count)
+if [ "$claude_managed_before" != "$claude_managed_after" ]; then
+  printf 'FAIL Claude guard: managed-profile rejection reached the provider\n' >&2
+  exit 1
+fi
+if ! grep -Fq 'server-managed Claude settings are active' /tmp/claude-managed.stderr; then
+  printf 'FAIL Claude guard: managed-profile rejection lacked the bounded error\n' >&2
+  sed -n '1,80p' /tmp/claude-managed.stderr >&2
+  exit 1
+fi
+if grep -Fq 'must-not-appear' /tmp/claude-managed.stderr; then
+  printf 'FAIL Claude guard: managed-profile error exposed a settings value\n' >&2
+  exit 1
+fi
+if grep -Fq 'proxy 127.0.0.1:' /tmp/claude-managed.stderr; then
+  printf 'FAIL Claude guard: managed-profile rejection occurred after bind\n' >&2
+  exit 1
+fi
+printf 'PASS Claude guard: managed profile rejected before bind or provider traffic\n'
+
 printf '%s\n' \
   '{' \
   '  "env": {' \

@@ -19,7 +19,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, Seek};
+use std::io::{BufRead, Read, Seek};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,8 +48,8 @@ pub struct GuardPlan {
     /// Whether this is the named Codex preset, which requires additional
     /// authentication, routing, and compression checks before launch.
     pub codex_fail_closed: bool,
-    /// Whether this is the named Claude preset, which must override persistent
-    /// Claude settings with guard-owned inline routing for this session.
+    /// Whether this is the named Claude preset, which supports only a verified
+    /// unmanaged profile and owns routing plus the user-only notice for the session.
     pub claude_fail_closed: bool,
 }
 
@@ -65,6 +65,12 @@ const CLAUDE_PROVIDER_SELECTORS: &[&str] = &[
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
 const CLAUDE_NOTICE_ROUTE: &str = "/_promtect/hooks/{token}";
+const CLAUDE_NOTICE_MAX_DELTA_BYTES: u64 = 1024 * 1024;
+const CLAUDE_NOTICE_MAX_RECORD_BYTES: u64 = 16 * 1024;
+const CLAUDE_NOTICE_MAX_RECORDS: usize = 4096;
+const CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES: usize = 256;
+const CLAUDE_NOTICE_MAX_DETECTOR_BYTES: usize = 64;
+const CLAUDE_NOTICE_MAX_DETECTORS: usize = 128;
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
     args.get(i + 1)
@@ -400,6 +406,13 @@ struct ClaudeNotice {
     detectors: BTreeSet<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClaudeNoticeRead {
+    Empty,
+    Notice(ClaudeNotice),
+    Degraded,
+}
+
 #[derive(Debug, Default)]
 struct RequestNotice {
     masked: u64,
@@ -408,6 +421,7 @@ struct RequestNotice {
 
 fn valid_detector_name(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= CLAUDE_NOTICE_MAX_DETECTOR_BYTES
         && name
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
@@ -415,40 +429,81 @@ fn valid_detector_name(name: &str) -> bool {
 
 /// Read only complete audit records written since the previous Claude Stop hook.
 /// The result contains counts and detector kinds, never request bodies or values.
-fn take_claude_notice(state: &ClaudeNoticeState) -> Option<ClaudeNotice> {
+fn take_claude_notice(state: &ClaudeNoticeState) -> ClaudeNoticeRead {
     let mut cursor = state
         .cursor
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut file = std::fs::File::open(state.audit_path.as_path()).ok()?;
-    let len = file.metadata().ok()?.len();
+    let mut file = match std::fs::File::open(state.audit_path.as_path()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ClaudeNoticeRead::Empty;
+        }
+        Err(_) => return ClaudeNoticeRead::Degraded,
+    };
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return ClaudeNoticeRead::Degraded,
+    };
     if *cursor > len {
         // A rotated/truncated audit must not replay an earlier session's events.
         *cursor = len;
-        return None;
+        return ClaudeNoticeRead::Empty;
     }
-    file.seek(std::io::SeekFrom::Start(*cursor)).ok()?;
+    let delta = len - *cursor;
+    if delta == 0 {
+        return ClaudeNoticeRead::Empty;
+    }
+    if delta > CLAUDE_NOTICE_MAX_DELTA_BYTES {
+        *cursor = len;
+        return ClaudeNoticeRead::Degraded;
+    }
+    if file.seek(std::io::SeekFrom::Start(*cursor)).is_err() {
+        return ClaudeNoticeRead::Degraded;
+    }
 
-    let mut reader = std::io::BufReader::new(file);
-    let mut line = String::new();
+    // Read only the snapshotted delta. Concurrent appends belong to the next hook,
+    // so a busy audit can never make this invocation chase a moving EOF.
+    let mut reader = std::io::BufReader::new(file.take(delta));
+    let mut line = Vec::new();
     let mut requests: BTreeMap<String, RequestNotice> = BTreeMap::new();
     let mut unsuccessful = BTreeSet::new();
     let mut next_cursor = *cursor;
+    let mut records = 0usize;
 
     loop {
         line.clear();
-        let bytes = reader.read_line(&mut line).ok()?;
+        let bytes = match reader
+            .by_ref()
+            .take(CLAUDE_NOTICE_MAX_RECORD_BYTES + 1)
+            .read_until(b'\n', &mut line)
+        {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                *cursor = len;
+                return ClaudeNoticeRead::Degraded;
+            }
+        };
         if bytes == 0 {
             break;
         }
-        if !line.ends_with('\n') {
+        if bytes as u64 > CLAUDE_NOTICE_MAX_RECORD_BYTES {
+            *cursor = len;
+            return ClaudeNoticeRead::Degraded;
+        }
+        if !line.ends_with(b"\n") {
             // A writer may still be completing this record. Leave it pending for
             // the next hook instead of accepting a partial JSON object.
             break;
         }
+        records += 1;
+        if records > CLAUDE_NOTICE_MAX_RECORDS {
+            *cursor = len;
+            return ClaudeNoticeRead::Degraded;
+        }
         next_cursor = next_cursor.saturating_add(bytes as u64);
 
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
             continue;
         };
         let Some(action) = value.get("action").and_then(|field| field.as_str()) else {
@@ -463,6 +518,10 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> Option<ClaudeNotice> {
         };
         if !request_id.starts_with(state.request_prefix.as_ref()) {
             continue;
+        }
+        if request_id.len() > CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES {
+            *cursor = len;
+            return ClaudeNoticeRead::Degraded;
         }
 
         match action {
@@ -485,13 +544,21 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> Option<ClaudeNotice> {
                 let entry = requests.entry(request_id.to_string()).or_default();
                 entry.masked = entry.masked.saturating_add(masked);
                 if let Some(detectors) = value.get("detectors").and_then(|field| field.as_array()) {
-                    entry.detectors.extend(
-                        detectors
-                            .iter()
-                            .filter_map(|detector| detector.as_str())
-                            .filter(|detector| valid_detector_name(detector))
-                            .map(str::to_string),
-                    );
+                    for detector in detectors {
+                        let Some(detector) = detector.as_str() else {
+                            *cursor = len;
+                            return ClaudeNoticeRead::Degraded;
+                        };
+                        if !valid_detector_name(detector) {
+                            *cursor = len;
+                            return ClaudeNoticeRead::Degraded;
+                        }
+                        entry.detectors.insert(detector.to_string());
+                        if entry.detectors.len() > CLAUDE_NOTICE_MAX_DETECTORS {
+                            *cursor = len;
+                            return ClaudeNoticeRead::Degraded;
+                        }
+                    }
                 }
             }
             "request_blocked" | "request_rejected" | "request_failed" => {
@@ -509,8 +576,16 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> Option<ClaudeNotice> {
         }
         notice.masked = notice.masked.saturating_add(request.masked);
         notice.detectors.extend(request.detectors);
+        if notice.detectors.len() > CLAUDE_NOTICE_MAX_DETECTORS {
+            *cursor = len;
+            return ClaudeNoticeRead::Degraded;
+        }
     }
-    (notice.masked > 0).then_some(notice)
+    if notice.masked > 0 {
+        ClaudeNoticeRead::Notice(notice)
+    } else {
+        ClaudeNoticeRead::Empty
+    }
 }
 
 fn detector_display_name(kind: &str) -> String {
@@ -523,36 +598,23 @@ fn detector_display_name(kind: &str) -> String {
     }
 }
 
-const CLAUDE_MANAGED_ROUTING_KEYS: &[&str] = &[
-    CLAUDE_BASE_VAR,
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_VERTEX_BASE_URL",
-];
-
-fn claude_managed_settings_paths() -> Vec<std::path::PathBuf> {
+fn claude_managed_settings_root() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        vec![std::path::PathBuf::from(
-            "/Library/Application Support/ClaudeCode/managed-settings.json",
-        )]
+        Some(std::path::PathBuf::from(
+            "/Library/Application Support/ClaudeCode",
+        ))
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        vec![std::path::PathBuf::from(
-            "/etc/claude-code/managed-settings.json",
-        )]
+        Some(std::path::PathBuf::from("/etc/claude-code"))
     }
     #[cfg(target_os = "windows")]
     {
         let root = std::env::var_os("ProgramFiles")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Program Files"));
-        vec![root.join("ClaudeCode").join("managed-settings.json")]
+        Some(root.join("ClaudeCode"))
     }
     #[cfg(not(any(
         target_os = "macos",
@@ -561,60 +623,272 @@ fn claude_managed_settings_paths() -> Vec<std::path::PathBuf> {
         target_os = "windows"
     )))]
     {
-        Vec::new()
+        None
     }
 }
 
-fn validate_claude_managed_settings(paths: &[std::path::PathBuf]) -> Result<(), String> {
-    for path in paths {
-        let contents = match std::fs::read_to_string(path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "cannot verify Claude managed settings at {} ({error})",
-                    path.display()
-                ));
-            }
+fn claude_managed_settings_paths(
+    root: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let mut paths = vec![root.join("managed-settings.json")];
+    let drop_ins = root.join("managed-settings.d");
+    let entries = match std::fs::read_dir(&drop_ins) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(paths),
+        Err(error) => {
+            return Err(format!(
+                "cannot verify Claude managed-settings drop-ins at {} ({error})",
+                drop_ins.display()
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "cannot verify Claude managed-settings drop-ins at {} ({error})",
+                drop_ins.display()
+            )
+        })?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
         };
-        let settings: serde_json::Value = serde_json::from_str(&contents).map_err(|error| {
+        if !name.starts_with('.')
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn json_has_settings(contents: &str) -> Result<bool, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(contents)?;
+    Ok(match value {
+        serde_json::Value::Object(object) => !object.is_empty(),
+        serde_json::Value::Null => false,
+        _ => true,
+    })
+}
+
+fn read_claude_settings_file(
+    path: &std::path::Path,
+    source: &str,
+) -> Result<Option<String>, String> {
+    const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot verify Claude {source} at {} ({error})",
+                path.display()
+            ));
+        }
+    };
+    let mut contents = String::new();
+    file.take(MAX_SETTINGS_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|error| {
+            format!(
+                "cannot verify Claude {source} at {} ({error})",
+                path.display()
+            )
+        })?;
+    if contents.len() as u64 > MAX_SETTINGS_BYTES {
+        return Err(format!(
+            "cannot verify Claude {source} at {} because it exceeds the safety limit",
+            path.display()
+        ));
+    }
+    Ok(Some(contents))
+}
+
+fn validate_claude_unmanaged_files(paths: &[std::path::PathBuf]) -> Result<(), String> {
+    for path in paths {
+        let Some(contents) = read_claude_settings_file(path, "managed settings")? else {
+            continue;
+        };
+        let has_settings = json_has_settings(&contents).map_err(|error| {
             format!(
                 "cannot verify malformed Claude managed settings at {} ({error})",
                 path.display()
             )
         })?;
-        let routing_conflicts = settings
-            .get("env")
-            .and_then(|env| env.as_object())
-            .map(|env| {
-                CLAUDE_MANAGED_ROUTING_KEYS
-                    .iter()
-                    .copied()
-                    .filter(|key| env.contains_key(*key))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let stop_hook_conflict = settings.pointer("/hooks/Stop").is_some();
-        let hooks_locked = settings
-            .get("strictPluginOnlyCustomization")
-            .and_then(|value| value.as_array())
-            .is_some_and(|surfaces| surfaces.iter().any(|surface| surface == "hooks"));
-        if !routing_conflicts.is_empty() || stop_hook_conflict || hooks_locked {
-            let mut conflicts = routing_conflicts;
-            if stop_hook_conflict {
-                conflicts.push("hooks.Stop");
-            }
-            if hooks_locked {
-                conflicts.push("strictPluginOnlyCustomization:hooks");
-            }
+        if has_settings {
             return Err(format!(
-                "managed settings at {} override protected routing or the automatic notice ({})",
-                path.display(),
-                conflicts.join(", ")
+                "endpoint-managed Claude settings are active at {}; managed profiles can override protected routing and the automatic notice",
+                path.display()
             ));
         }
     }
     Ok(())
+}
+
+fn claude_config_dir() -> Result<std::path::PathBuf, String> {
+    if let Some(path) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+        return Ok(path.into());
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| "cannot locate Claude's configuration directory".to_string())?;
+    Ok(std::path::PathBuf::from(home).join(".claude"))
+}
+
+fn validate_claude_remote_settings(config_dir: &std::path::Path) -> Result<(), String> {
+    let path = config_dir.join("remote-settings.json");
+    let Some(contents) = read_claude_settings_file(&path, "remote settings")? else {
+        return Ok(());
+    };
+    let has_settings = json_has_settings(&contents).map_err(|error| {
+        format!(
+            "cannot verify malformed Claude remote settings at {} ({error})",
+            path.display()
+        )
+    })?;
+    if has_settings {
+        return Err(
+            "server-managed Claude settings are active; Team, Enterprise, and gateway-managed profiles are not supported by guard claude"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_claude_os_policy() -> Result<(), String> {
+    let status = std::process::Command::new("/usr/bin/defaults")
+        .args(["read", "com.anthropic.claudecode"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("cannot verify Claude macOS managed preferences ({error})"))?;
+    if status.success() {
+        return Err(
+            "macOS-managed Claude settings are active; managed profiles are not supported by guard claude"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn validate_claude_os_policy() -> Result<(), String> {
+    for key in [
+        r"HKLM\SOFTWARE\Policies\ClaudeCode",
+        r"HKCU\SOFTWARE\Policies\ClaudeCode",
+    ] {
+        let status = std::process::Command::new("reg")
+            .args(["query", key, "/v", "Settings"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|error| format!("cannot verify Claude Windows policy at {key} ({error})"))?;
+        if status.success() {
+            return Err(format!(
+                "Windows-managed Claude settings are active at {key}; managed profiles are not supported by guard claude"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn validate_claude_os_policy() -> Result<(), String> {
+    Ok(())
+}
+
+fn validate_claude_auth_status(bytes: &[u8]) -> Result<(), String> {
+    let status: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|_| "Claude auth status did not return valid JSON".to_string())?;
+    if status.get("loggedIn").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err("Claude is not authenticated".to_string());
+    }
+    if status
+        .get("apiProvider")
+        .and_then(serde_json::Value::as_str)
+        != Some("firstParty")
+    {
+        return Err(
+            "gateway and third-party Claude authentication profiles are not supported".to_string(),
+        );
+    }
+    match status.get("authMethod").and_then(serde_json::Value::as_str) {
+        Some("claude.ai") => match status
+            .get("subscriptionType")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("max")
+                if status
+                    .get("organizationType")
+                    .is_none_or(serde_json::Value::is_null) =>
+            {
+                Ok(())
+            }
+            _ => Err(
+                "Team, Enterprise, and unknown Claude subscription profiles are not supported"
+                    .to_string(),
+            ),
+        },
+        _ => Err("unknown Claude authentication profile is not supported".to_string()),
+    }
+}
+
+async fn verify_claude_unmanaged_profile(bin: &str) -> Result<(), String> {
+    tokio::task::spawn_blocking(|| {
+        if let Some(root) = claude_managed_settings_root() {
+            let paths = claude_managed_settings_paths(&root)?;
+            validate_claude_unmanaged_files(&paths)?;
+        }
+        validate_claude_os_policy()?;
+        validate_claude_remote_settings(&claude_config_dir()?)
+    })
+    .await
+    .map_err(|_| "Claude managed-profile preflight failed".to_string())??;
+
+    let mut command = tokio::process::Command::new(bin);
+    configure_guard_child_network_env(&mut command);
+    command
+        .args(["auth", "status", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not run Claude auth preflight ({error})"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not read Claude auth preflight".to_string())?;
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        use tokio::io::AsyncReadExt;
+
+        const MAX_AUTH_STATUS_BYTES: u64 = 64 * 1024;
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_AUTH_STATUS_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "could not read Claude auth preflight".to_string())?;
+        if bytes.len() as u64 > MAX_AUTH_STATUS_BYTES {
+            child.kill().await.ok();
+            return Err("Claude auth preflight output exceeded its safety limit".to_string());
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|_| "Claude auth preflight failed".to_string())?;
+        Ok((status, bytes))
+    })
+    .await
+    .map_err(|_| "Claude auth preflight timed out".to_string())??;
+    if !output.0.success() {
+        return Err("Claude auth preflight failed".to_string());
+    }
+    validate_claude_auth_status(&output.1)
 }
 
 fn format_claude_notice(notice: &ClaudeNotice, strict: bool) -> String {
@@ -648,14 +922,21 @@ async fn claude_notice_hook(
     if token != state.token.as_ref() {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({})));
     }
-    let body = take_claude_notice(&state).map_or_else(
-        || serde_json::json!({}),
-        |notice| {
+    let strict = state.strict;
+    let read = tokio::task::spawn_blocking(move || take_claude_notice(&state))
+        .await
+        .unwrap_or(ClaudeNoticeRead::Degraded);
+    let body = match read {
+        ClaudeNoticeRead::Empty => serde_json::json!({}),
+        ClaudeNoticeRead::Notice(notice) => {
             serde_json::json!({
-                "systemMessage": format_claude_notice(&notice, state.strict)
+                "systemMessage": format_claude_notice(&notice, strict)
             })
-        },
-    );
+        }
+        ClaudeNoticeRead::Degraded => serde_json::json!({
+            "systemMessage": "🛡 Promtect could not safely summarize this turn’s protection metadata. No sensitive values are included; check the local dashboard and guard summary."
+        }),
+    };
     (StatusCode::OK, Json(body))
 }
 
@@ -1021,14 +1302,15 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         return run_codex_dry_run(&plan).await;
     }
 
-    if plan.claude_fail_closed
-        && let Err(error) = validate_claude_managed_settings(&claude_managed_settings_paths())
-    {
-        eprintln!(
-            "promtect guard: refusing to start Claude: {error}.\n  \
-             Remove the conflict or use an unmanaged Claude profile; no provider request was sent."
-        );
-        return 1;
+    if plan.claude_fail_closed {
+        if let Err(error) = verify_claude_unmanaged_profile(&plan.bin).await {
+            eprintln!(
+                "promtect guard: refusing to start Claude: {error}.\n  \
+                 Use an unmanaged individual Claude Max profile; no provider request was sent."
+            );
+            return 1;
+        }
+        eprintln!("  Claude profile check: unmanaged individual Max profile verified");
     }
 
     let codex_auth = if plan.codex_fail_closed {
@@ -1238,8 +1520,8 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         // different proxy before reaching Promtect.
         configure_guard_child_network_env(&mut cmd);
         // Claude settings.json `env` values override the child process
-        // environment. Use Claude's documented highest-precedence inline
-        // settings so a persistent gateway cannot bypass this proxy.
+        // environment. Inline settings win over user/project settings. The
+        // preflight above separately rejects higher-precedence managed profiles.
         if let Some(notice_url) = claude_notice_url.as_deref() {
             cmd.args(claude_settings_args(&base_url, notice_url));
         }
@@ -1518,7 +1800,9 @@ mod tests {
             120,
         );
 
-        let notice = super::take_claude_notice(&state).expect("pending notice");
+        let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
+            panic!("expected pending notice");
+        };
         assert_eq!(notice.masked, 4);
         assert_eq!(
             notice.detectors,
@@ -1535,7 +1819,7 @@ mod tests {
         assert!(message.contains("Strict mode: plaintext restoration off."));
         assert!(!message.contains("AKIA"));
         assert!(
-            super::take_claude_notice(&state).is_none(),
+            super::take_claude_notice(&state) == super::ClaudeNoticeRead::Empty,
             "a Stop hook must consume each notice exactly once"
         );
         std::fs::remove_file(path).ok();
@@ -1564,7 +1848,10 @@ mod tests {
             "request-failed",
         );
 
-        assert!(super::take_claude_notice(&state).is_none());
+        assert_eq!(
+            super::take_claude_notice(&state),
+            super::ClaudeNoticeRead::Empty
+        );
         std::fs::remove_file(path).ok();
     }
 
@@ -1580,38 +1867,229 @@ mod tests {
         let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
         audit.record_request("request-new", 1, &["aws_key"], 100, 120);
 
-        let notice = super::take_claude_notice(&state).expect("new repaired-session notice");
+        let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
+            panic!("expected new repaired-session notice");
+        };
         assert_eq!(notice.masked, 1);
         assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
         std::fs::remove_file(path).ok();
     }
 
     #[test]
-    fn claude_rejects_managed_routing_or_hook_conflicts() {
+    fn claude_notice_large_delta_degrades_then_recovers() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-large-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let mut oversized = vec![b'x'; (super::CLAUDE_NOTICE_MAX_DELTA_BYTES + 1) as usize];
+        *oversized.last_mut().expect("non-empty oversized delta") = b'\n';
+        std::fs::write(&path, oversized).expect("write oversized audit delta");
+
+        assert_eq!(
+            super::take_claude_notice(&state),
+            super::ClaudeNoticeRead::Degraded
+        );
+        assert_eq!(
+            *state.cursor.lock().expect("notice cursor"),
+            super::CLAUDE_NOTICE_MAX_DELTA_BYTES + 1
+        );
+
+        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
+        audit.record_request("request-recovery", 1, &["aws_key"], 100, 120);
+        let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
+            panic!("expected notice recovery after capped delta");
+        };
+        assert_eq!(notice.masked, 1);
+        assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_notice_oversized_record_degrades_then_recovers() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-record-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let mut record = vec![b'x'; (super::CLAUDE_NOTICE_MAX_RECORD_BYTES + 1) as usize];
+        record.push(b'\n');
+        std::fs::write(&path, record).expect("write oversized audit record");
+
+        assert_eq!(
+            super::take_claude_notice(&state),
+            super::ClaudeNoticeRead::Degraded
+        );
+        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
+        audit.record_request("request-recovery", 1, &["github_token"], 100, 120);
+        assert!(matches!(
+            super::take_claude_notice(&state),
+            super::ClaudeNoticeRead::Notice(_)
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_notice_record_limit_degrades_then_recovers() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-records-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let records = "{}\n".repeat(super::CLAUDE_NOTICE_MAX_RECORDS + 1);
+        std::fs::write(&path, records).expect("write excessive audit records");
+
+        assert_eq!(
+            super::take_claude_notice(&state),
+            super::ClaudeNoticeRead::Degraded
+        );
+        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
+        audit.record_request("request-recovery", 1, &["stripe_key"], 100, 120);
+        assert!(matches!(
+            super::take_claude_notice(&state),
+            super::ClaudeNoticeRead::Notice(_)
+        ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_notice_hook_does_not_block_the_async_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-responsive-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let cursor = state.cursor.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _guard = cursor.lock().expect("hold notice cursor");
+            locked_tx.send(()).expect("signal held cursor");
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        locked_rx.recv().expect("wait for held cursor");
+
+        let hook = tokio::spawn(super::claude_notice_hook(
+            State(state),
+            Path("test-token".to_string()),
+        ));
+        let started = std::time::Instant::now();
+        let probe = tokio::spawn(async { tokio::task::yield_now().await });
+        probe.await.expect("concurrent runtime probe");
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "the Stop hook must not block unrelated async work"
+        );
+
+        holder.join().expect("release notice cursor");
+        let (status, _) = hook.await.expect("notice hook task");
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn claude_rejects_any_nonempty_managed_settings_source() {
         let path = std::env::temp_dir().join(format!(
             "promtect-claude-managed-settings-{}.json",
             uuid::Uuid::new_v4()
         ));
-        std::fs::write(
-            &path,
-            r#"{"env":{"ANTHROPIC_BASE_URL":"https://managed.invalid"}}"#,
-        )
-        .expect("write managed settings fixture");
-        let error = super::validate_claude_managed_settings(std::slice::from_ref(&path))
-            .expect_err("managed route must fail closed");
-        assert!(error.contains("ANTHROPIC_BASE_URL"));
-
-        std::fs::write(&path, r#"{"hooks":{"Stop":[{"hooks":[]}]}}"#)
-            .expect("replace managed settings fixture");
-        let error = super::validate_claude_managed_settings(std::slice::from_ref(&path))
-            .expect_err("managed Stop hook must fail closed");
-        assert!(error.contains("hooks.Stop"));
-
         std::fs::write(&path, r#"{"env":{"EDITOR":"vim"}}"#)
-            .expect("replace safe managed settings fixture");
-        super::validate_claude_managed_settings(std::slice::from_ref(&path))
-            .expect("unrelated managed settings must remain usable");
+            .expect("write unrelated managed settings fixture");
+        let error = super::validate_claude_unmanaged_files(std::slice::from_ref(&path))
+            .expect_err("any active managed tier must fail closed");
+        assert!(error.contains("endpoint-managed Claude settings are active"));
+        assert!(!error.contains("EDITOR") && !error.contains("vim"));
+
+        std::fs::write(&path, "{}").expect("replace empty managed settings fixture");
+        super::validate_claude_unmanaged_files(std::slice::from_ref(&path))
+            .expect("an empty managed file does not activate the managed tier");
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_discovers_managed_settings_drop_ins() {
+        let root = std::env::temp_dir().join(format!(
+            "promtect-claude-managed-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let drop_ins = root.join("managed-settings.d");
+        std::fs::create_dir_all(&drop_ins).expect("create managed drop-in fixture");
+        std::fs::write(
+            drop_ins.join("10-policy.json"),
+            r#"{"env":{"EDITOR":"vim"}}"#,
+        )
+        .expect("write managed drop-in fixture");
+        std::fs::write(
+            drop_ins.join(".ignored.json"),
+            r#"{"env":{"EDITOR":"vim"}}"#,
+        )
+        .expect("write hidden managed fixture");
+
+        let paths = super::claude_managed_settings_paths(&root).expect("discover drop-ins");
+        assert!(paths.iter().any(|path| path.ends_with("10-policy.json")));
+        assert!(!paths.iter().any(|path| path.ends_with(".ignored.json")));
+        super::validate_claude_unmanaged_files(&paths)
+            .expect_err("drop-in-only managed policy must fail closed");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_rejects_nonempty_remote_settings_without_exposing_them() {
+        let root = std::env::temp_dir().join(format!(
+            "promtect-claude-remote-settings-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create remote-settings fixture");
+        let canary = "synthetic-user@example.invalid";
+        std::fs::write(
+            root.join("remote-settings.json"),
+            format!(r#"{{"env":{{"SYNTHETIC_EMAIL":"{canary}"}}}}"#),
+        )
+        .expect("write remote-settings fixture");
+
+        let error = super::validate_claude_remote_settings(&root)
+            .expect_err("remote managed settings must fail closed");
+        assert!(error.contains("server-managed Claude settings are active"));
+        assert!(!error.contains(canary));
+
+        std::fs::write(root.join("remote-settings.json"), "{}")
+            .expect("replace empty remote-settings fixture");
+        super::validate_claude_remote_settings(&root)
+            .expect("empty remote settings must not activate managed policy");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_auth_gate_allows_only_unmanaged_first_party_max() {
+        let max = br#"{
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "subscriptionType": "max",
+            "apiProvider": "firstParty",
+            "organizationType": null
+        }"#;
+        super::validate_claude_auth_status(max).expect("individual Max must be supported");
+
+        for unsupported in [
+            br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"team","apiProvider":"firstParty"}"#.as_slice(),
+            br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"enterprise","apiProvider":"firstParty"}"#.as_slice(),
+            br#"{"loggedIn":true,"authMethod":"api_key","subscriptionType":null,"apiProvider":"firstParty"}"#.as_slice(),
+            br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"gateway"}"#.as_slice(),
+            br#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#.as_slice(),
+            b"not-json".as_slice(),
+        ] {
+            super::validate_claude_auth_status(unsupported)
+                .expect_err("unsupported Claude profile must fail closed");
+        }
+    }
+
+    #[test]
+    fn claude_auth_errors_are_value_free() {
+        let canary = "synthetic-user@example.invalid";
+        let status = format!(
+            r#"{{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"team","apiProvider":"firstParty","email":"{canary}"}}"#
+        );
+        let error = super::validate_claude_auth_status(status.as_bytes())
+            .expect_err("Team profile must fail closed");
+        assert!(!error.contains(canary));
     }
 
     #[tokio::test]

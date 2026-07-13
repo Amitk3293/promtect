@@ -5,7 +5,7 @@ Promtect's default mode. Claude Code talks the Anthropic API.
 ## Quickest: one command
 
 ```sh
-promtect guard claude              # starts the proxy, runs Claude Code, masks + restores
+promtect guard claude              # first-party individual Max; masks + restores
 promtect guard claude --headroom   # also chain Headroom for token compression
 ```
 
@@ -42,16 +42,23 @@ promtect selftest        # → promtect selftest: PASS — no leak
 
 ## Notes
 
+- `guard claude` currently supports a verified first-party, individual Claude
+  Max profile only. It refuses API-key, Pro, Team, Enterprise, gateway, remote,
+  MDM, registry, file-based, drop-in, or unknown profiles before binding because
+  Claude's managed settings outrank command-line routing and hooks. API-key users
+  can still use the manual proxy method above, without the automatic in-session
+  notice. Other unmanaged individual tiers will be added only after their exact
+  machine-readable auth contract is verified.
 - Pass your real Anthropic API key as usual (`ANTHROPIC_API_KEY` / `x-api-key`).
-  Promtect forwards the auth header untouched — it only ever masks the body.
+  The manual proxy forwards the auth header untouched — it only ever masks the body.
 - `guard claude` owns routing for the guarded session, but intentionally inherits
   authentication. If your Claude settings contain a gateway-specific
   `ANTHROPIC_AUTH_TOKEN`, use the matching `--upstream` or remove that credential
   before targeting a different upstream; Promtect cannot identify token ownership.
 - `guard claude` removes inherited HTTP proxy variables from the Claude child so
   its loopback Promtect URL cannot be routed through another proxy first. Known
-  endpoint-managed settings that override routing or Stop hooks are rejected
-  before Claude starts; remove the conflict or use an unmanaged Claude profile.
+  detected endpoint- or server-managed settings are rejected before Claude starts;
+  use the manual proxy or an unmanaged individual Max profile.
 - Promtect itself ignores implicit system proxy variables. Chain a trusted
   gateway explicitly with `--upstream` or `--headroom` so the destination is
   visible in the guard banner and risk classification.

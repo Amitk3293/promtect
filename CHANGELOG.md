@@ -45,8 +45,10 @@ and auto-generated notes also live on the
 - Guard dashboards now fall back to a free loopback port when the preferred port
   is occupied and print the exact URL, instead of silently leaving users on a
   stale dashboard from another process.
-- Claude guard removes inherited HTTP proxy routes, rejects conflicting
-  endpoint-managed routing/hooks, and scopes notices to the current guard session.
+- Claude guard removes inherited HTTP proxy routes, rejects detected managed or
+  unsupported authentication profiles before bind, and scopes notices to the
+  current guard session. Notice audit reads now run off the async runtime with
+  strict byte, record, and field limits plus a value-free degraded response.
 - Promtect no longer honors implicit system proxy variables for upstream traffic;
   gateways remain available through the explicit upstream/chaining configuration.
 

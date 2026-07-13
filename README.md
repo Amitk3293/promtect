@@ -127,7 +127,7 @@ and does not install a root certificate or change the system trust store.
 and tears it down on exit, no manual env-var wiring:
 
 ```sh
-promtect guard claude                     # Claude Code, secrets masked → Anthropic
+promtect guard claude                     # unmanaged individual Claude Max → Anthropic
 promtect guard codex                      # Codex → OpenAI
 promtect guard ollama run deepseek-r1     # local Ollama, nothing leaves your box
 promtect guard ollama --cloud run gpt-oss:120b-cloud   # Ollama Cloud → masked → ollama.com
@@ -145,6 +145,13 @@ guarantee interception. Supported model-calling roots are the interactive CLI,
 cannot be mistaken for a new root command. Unknown root commands fail closed.
 It also disables Codex WebSockets and provider retries, keeping each protected
 model call on one observable HTTP Responses request.
+
+`guard claude` currently supports a verified first-party, unmanaged individual
+Claude Max profile. It fails before binding for API-key, Pro, Team, Enterprise,
+gateway, remote/endpoint-managed, or unknown profiles because Claude managed
+settings outrank command-line routing and hooks. API-key users can use the
+[manual Claude proxy setup](docs/integrations/claude-code.md#start-promtect-manual),
+which does not include the automatic in-session notice.
 
 Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OLLAMA_API_KEY`) flow
 through untouched, Promtect only masks the request body. The base URL each tool
