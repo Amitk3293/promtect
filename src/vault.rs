@@ -87,6 +87,15 @@ impl Vault {
         self.lock().by_sentinel.get(sentinel).cloned()
     }
 
+    /// Whether `sentinel` was minted by this request-scoped vault.
+    ///
+    /// Residual scanning uses this membership check without cloning the mapped
+    /// secret, so user-supplied sentinel-shaped text cannot be trusted or hidden
+    /// merely because it matches the public sentinel grammar.
+    pub(crate) fn knows_sentinel(&self, sentinel: &str) -> bool {
+        self.lock().by_sentinel.contains_key(sentinel)
+    }
+
     /// Whether `secret` was registered during request masking (one of the user's
     /// own secrets, which the restorer puts back into the response). The output
     /// scan uses this to ignore restored request secrets and flag only secrets the

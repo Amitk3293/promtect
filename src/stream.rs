@@ -38,11 +38,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// stays byte-for-byte identical to a build without it.
 pub type ResponseScanner = Arc<dyn Fn(&str) -> Vec<crate::detect::Match> + Send + Sync>;
 
-/// Overlap window (bytes) carried between restored chunks so a generated secret
-/// split across a chunk boundary is still seen whole by the output scan.
-/// ponytail: fixed 256-byte window — a secret longer than this split exactly on a
-/// boundary can be missed; acceptable for a warn-only backstop, widen if needed.
-const OUTPUT_SCAN_OVERLAP: usize = 256;
+/// Maximum match width (bytes) that the incremental response scanner can prove
+/// across arbitrary upstream chunk boundaries. Downstream configurable-pattern
+/// features claiming full streamed equivalence must reject larger or unbounded
+/// matches and look-around semantics that depend on artificial window edges.
+pub const OUTPUT_SCAN_MAX_MATCH_BYTES: usize = 256;
 
 /// First byte of the two-byte UTF-8 encoding of `«` (U+00AB) and `»` (U+00BB).
 const GUILLEMET_LEAD: u8 = 0xC2;
@@ -215,7 +215,7 @@ impl StreamRestorer {
             }
         }
         // Roll the overlap window forward over the just-scanned text.
-        self.scan_tail = tail_of(&hay, OUTPUT_SCAN_OVERLAP);
+        self.scan_tail = tail_of(&hay, OUTPUT_SCAN_MAX_MATCH_BYTES);
     }
 }
 
