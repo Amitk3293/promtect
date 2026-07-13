@@ -24,7 +24,8 @@ use crate::mask::restore_scan;
 use crate::vault::Vault;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map::RandomState};
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,6 +44,15 @@ pub type ResponseScanner = Arc<dyn Fn(&str) -> Vec<crate::detect::Match> + Send 
 /// features claiming full streamed equivalence must reject larger or unbounded
 /// matches and look-around semantics that depend on artificial window edges.
 pub const OUTPUT_SCAN_MAX_MATCH_BYTES: usize = 256;
+
+/// Maximum distinct output findings retained and audited for one detector kind
+/// in one response. The scan is observe-only, so bounding repeated findings is
+/// preferable to letting a hostile response grow memory and audit output.
+pub const OUTPUT_SCAN_MAX_FINDINGS_PER_KIND: usize = 16;
+
+/// Maximum distinct output findings retained and audited across one response.
+/// This also bounds scanners that return an unexpected number of detector kinds.
+pub const OUTPUT_SCAN_MAX_FINDINGS_PER_REQUEST: usize = 64;
 
 /// First byte of the two-byte UTF-8 encoding of `«` (U+00AB) and `»` (U+00BB).
 const GUILLEMET_LEAD: u8 = 0xC2;
@@ -78,9 +88,16 @@ pub struct StreamRestorer {
     /// Trailing window of already-restored text, prepended to the next chunk so a
     /// generated secret split across a chunk boundary is still scanned whole.
     scan_tail: String,
-    /// Distinct (kind, value) secrets already reported by the output scan, so each
-    /// is warned about once across the stream, not once per chunk or overlap.
-    flagged: HashSet<(&'static str, String)>,
+    /// Distinct (kind, keyed fingerprint) findings already reported by the output
+    /// scan. Fixed-size fingerprints keep plaintext findings out of retained scan
+    /// state; the per-kind and per-request caps bound this set.
+    flagged: HashSet<(&'static str, u64)>,
+    /// Per-request randomized hasher used to fingerprint finding values before
+    /// deduplication. One instance is retained so overlapping windows hash alike.
+    finding_hasher: RandomState,
+    /// Whether the audit already records that additional findings were dropped
+    /// after reaching a cap. One value-free marker preserves operational truth.
+    finding_limit_audited: bool,
 }
 
 impl StreamRestorer {
@@ -99,6 +116,8 @@ impl StreamRestorer {
             scanner: None,
             scan_tail: String::new(),
             flagged: HashSet::new(),
+            finding_hasher: RandomState::new(),
+            finding_limit_audited: false,
         }
     }
 
@@ -199,7 +218,30 @@ impl StreamRestorer {
             if self.vault.knows_secret(m.value.as_str()) {
                 continue;
             }
-            if self.flagged.insert((m.kind, m.value.as_str().to_owned())) {
+            let fingerprint = self.finding_hasher.hash_one((m.kind, m.value.as_str()));
+            if self.flagged.contains(&(m.kind, fingerprint)) {
+                continue;
+            }
+            if self.flagged.len() >= OUTPUT_SCAN_MAX_FINDINGS_PER_REQUEST
+                || self
+                    .flagged
+                    .iter()
+                    .filter(|(kind, _)| *kind == m.kind)
+                    .count()
+                    >= OUTPUT_SCAN_MAX_FINDINGS_PER_KIND
+            {
+                if !self.finding_limit_audited {
+                    self.audit.record(
+                        "output_secret_limit",
+                        "output_scan",
+                        "«output-scan-limit»",
+                        &self.request_id,
+                    );
+                    self.finding_limit_audited = true;
+                }
+                continue;
+            }
+            if self.flagged.insert((m.kind, fingerprint)) {
                 // Value-free: only the detector kind is recorded, never the secret.
                 self.audit
                     .record("output_secret", m.kind, "«output-scan»", &self.request_id);
@@ -416,17 +458,12 @@ mod tests {
         }
         let _ = sr.finish();
 
-        assert!(
-            !sr.flagged.iter().any(|(_, v)| v == "AKIAIOSFODNN7EXAMPLE"),
-            "restored request secret must be ignored by the output scan"
+        assert_eq!(
+            sr.flagged.len(),
+            1,
+            "the restored request secret must not consume finding state"
         );
-        assert!(
-            sr.flagged
-                .iter()
-                .any(|(k, v)| *k == "aws_key" && v == model_key),
-            "model-generated key must be flagged, got {:?}",
-            sr.flagged
-        );
+        assert!(sr.flagged.iter().any(|(kind, _)| *kind == "aws_key"));
     }
 
     /// The output scan is observe-only: streamed bytes are identical with and
@@ -465,13 +502,120 @@ mod tests {
         }
         let _ = sr.finish();
 
-        assert!(
-            sr.flagged
-                .iter()
-                .any(|(k, v)| *k == "aws_key" && v == model_key),
-            "a key split across chunks must still be caught, got {:?}",
-            sr.flagged
-        );
+        assert_eq!(sr.flagged.len(), 1);
+        assert!(sr.flagged.iter().any(|(kind, _)| *kind == "aws_key"));
+    }
+
+    fn bounded_output_scan_oracle(body: &str, chunk_size: usize) -> (Vec<u8>, String) {
+        let entropy = regex::Regex::new(r"E[A-Za-z0-9]{32};").expect("entropy test regex");
+        let email = regex::Regex::new(r"Mperson[0-9]{3}@example\.com;").expect("email test regex");
+        let scanner: ResponseScanner = Arc::new(move |text: &str| {
+            entropy
+                .find_iter(text)
+                .map(|hit| {
+                    crate::detect::Match::new(
+                        "entropy",
+                        hit.as_str().to_owned(),
+                        hit.start(),
+                        hit.end(),
+                    )
+                })
+                .chain(email.find_iter(text).map(|hit| {
+                    crate::detect::Match::new(
+                        "email",
+                        hit.as_str().to_owned(),
+                        hit.start(),
+                        hit.end(),
+                    )
+                }))
+                .collect()
+        });
+        let audit_path = std::env::temp_dir().join(format!(
+            "promtect-output-cap-{}-{chunk_size}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(Audit::to_file(&audit_path));
+        let mut restorer = StreamRestorer::new(
+            Arc::new(Vault::new()),
+            Arc::clone(&audit),
+            format!("output-cap-{chunk_size}"),
+        )
+        .with_output_scanner(Some(scanner));
+        let mut streamed = Vec::new();
+        for chunk in body.as_bytes().chunks(chunk_size) {
+            streamed.extend_from_slice(&restorer.push(chunk));
+        }
+        streamed.extend_from_slice(&restorer.finish());
+        drop(restorer);
+        drop(audit);
+        let log = std::fs::read_to_string(&audit_path).expect("read value-free audit");
+        std::fs::remove_file(audit_path).ok();
+        (streamed, log)
+    }
+
+    #[test]
+    fn output_scan_findings_are_bounded_and_chunk_invariant() {
+        let body = (0..80)
+            .map(|index| format!("E{index:032}; Mperson{index:03}@example.com; ",))
+            .collect::<String>();
+
+        for chunk_size in [body.len(), 1, 31, 256, 257] {
+            let (streamed, log) = bounded_output_scan_oracle(&body, chunk_size);
+            assert_eq!(streamed, body.as_bytes(), "chunk size {chunk_size}");
+            assert_eq!(
+                log.lines()
+                    .filter(|line| {
+                        line.contains("\"action\":\"output_secret\"")
+                            && line.contains("\"detector\":\"entropy\"")
+                    })
+                    .count(),
+                OUTPUT_SCAN_MAX_FINDINGS_PER_KIND,
+                "entropy audit count at chunk size {chunk_size}: {log}"
+            );
+            assert_eq!(
+                log.lines()
+                    .filter(|line| {
+                        line.contains("\"action\":\"output_secret\"")
+                            && line.contains("\"detector\":\"email\"")
+                    })
+                    .count(),
+                OUTPUT_SCAN_MAX_FINDINGS_PER_KIND,
+                "email audit count at chunk size {chunk_size}: {log}"
+            );
+            assert!(!log.contains("E00000000000000000000000000000000;"));
+            assert!(!log.contains("Mperson000@example.com;"));
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.contains("\"action\":\"output_secret_limit\""))
+                    .count(),
+                1,
+                "one value-free saturation marker at chunk size {chunk_size}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_scan_total_cap_bounds_many_detector_kinds() {
+        let scanner: ResponseScanner = Arc::new(|_| {
+            ["kind_a", "kind_b", "kind_c", "kind_d", "kind_e"]
+                .into_iter()
+                .flat_map(|kind| {
+                    (0..OUTPUT_SCAN_MAX_FINDINGS_PER_KIND + 1).map(move |index| {
+                        crate::detect::Match::new(kind, format!("finding-{kind}-{index}"), 0, 1)
+                    })
+                })
+                .collect()
+        });
+        let mut restorer = StreamRestorer::new(
+            Arc::new(Vault::new()),
+            Audit::null().into(),
+            "total-cap".into(),
+        )
+        .with_output_scanner(Some(scanner));
+
+        let _ = restorer.push(b"x");
+
+        assert_eq!(restorer.flagged.len(), OUTPUT_SCAN_MAX_FINDINGS_PER_REQUEST);
     }
 
     #[test]
