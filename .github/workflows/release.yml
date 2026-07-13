@@ -87,6 +87,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
           PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
           PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
         run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
 
   readiness:
@@ -210,6 +211,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
           PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
           PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
         run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
       - name: Require exact publication confirmation
         env:

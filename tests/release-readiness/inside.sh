@@ -328,12 +328,39 @@ fi
 cat > "$root/core-release.json" <<'JSON'
 {
   "name": "core-release",
+  "updated_at": "2026-07-13T18:00:00Z",
   "protection_rules": [
-    {"type": "required_reviewers", "reviewers": [{"type": "User", "reviewer": {"id": 42}}]}
+    {
+      "type": "required_reviewers",
+      "prevent_self_review": true,
+      "reviewers": [{"type": "User", "reviewer": {"id": 42}}]
+    }
   ],
   "deployment_branch_policy": {
     "protected_branches": false,
     "custom_branch_policies": true
+  }
+}
+JSON
+cat > "$root/admin-bypass-evidence.json" <<'JSON'
+{
+  "schema_version": 1,
+  "repository": "Amitk3293/promtect",
+  "source": "github-environment-settings-ui",
+  "evidence_reference": "https://github.com/Amitk3293/promtect/issues/88#issuecomment-manual-gate",
+  "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "recorded_by_reviewer_id": 42,
+  "recorded_at": "2026-07-13T19:00:00Z",
+  "expires_at": "2026-07-13T20:00:00Z",
+  "environments": {
+    "core-release": {
+      "administrators_can_bypass": false,
+      "updated_at": "2026-07-13T18:00:00Z"
+    },
+    "core-container-release": {
+      "administrators_can_bypass": false,
+      "updated_at": "2026-07-13T18:00:00Z"
+    }
   }
 }
 JSON
@@ -361,8 +388,154 @@ controls_args=(
   --rulesets "$root/tag-rulesets.json"
   --expected-bypass-actor-ids 42
   --expected-reviewer-ids 42
+  --repository Amitk3293/promtect
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json"
+  --now 2026-07-13T19:30:00Z
 )
 python3 scripts/verify-github-release-controls.py "${controls_args[@]}"
+
+python3 - "$root/core-release.json" "$root" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    original = json.load(handle)
+variants = {
+    "false": False,
+    "null": None,
+    "string": "true",
+}
+for name, value in variants.items():
+    data = json.loads(json.dumps(original))
+    data["protection_rules"][0]["prevent_self_review"] = value
+    with open(os.path.join(sys.argv[2], f"self-review-{name}.json"), "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+data = json.loads(json.dumps(original))
+del data["protection_rules"][0]["prevent_self_review"]
+with open(os.path.join(sys.argv[2], "self-review-missing.json"), "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+for self_review_variant in false missing null string; do
+  if python3 scripts/verify-github-release-controls.py \
+    --core-release "$root/self-review-${self_review_variant}.json" \
+    --core-release-policies "$root/main-policy.json" \
+    --core-container-release "$root/core-container-release.json" \
+    --core-container-release-policies "$root/main-policy.json" \
+    --rulesets "$root/tag-rulesets.json" \
+    --expected-bypass-actor-ids 42 \
+    --expected-reviewer-ids 42 \
+    --repository Amitk3293/promtect \
+    --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+    --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
+    echo "prevent_self_review ${self_review_variant} passed verification" >&2
+    exit 1
+  fi
+done
+
+python3 - "$root/core-release.json" "$root/core-container-release.json" "$root" <<'PY'
+import json
+import os
+import sys
+
+for path, output_name in zip(sys.argv[1:3], ("programmatic-core.json", "programmatic-container.json")):
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    data["can_admins_bypass"] = False
+    with open(os.path.join(sys.argv[3], output_name), "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+PY
+python3 scripts/verify-github-release-controls.py \
+  --core-release "$root/programmatic-core.json" \
+  --core-release-policies "$root/main-policy.json" \
+  --core-container-release "$root/programmatic-container.json" \
+  --core-container-release-policies "$root/main-policy.json" \
+  --rulesets "$root/tag-rulesets.json" \
+  --expected-bypass-actor-ids 42 \
+  --expected-reviewer-ids 42 \
+  --repository Amitk3293/promtect
+
+for admin_bypass_variant in true null string; do
+  python3 - "$root/programmatic-core.json" \
+    "$root/admin-bypass-${admin_bypass_variant}.json" "$admin_bypass_variant" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+values = {"true": True, "null": None, "string": "false"}
+data["can_admins_bypass"] = values[sys.argv[3]]
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+  if python3 scripts/verify-github-release-controls.py \
+    --core-release "$root/admin-bypass-${admin_bypass_variant}.json" \
+    --core-release-policies "$root/main-policy.json" \
+    --core-container-release "$root/programmatic-container.json" \
+    --core-container-release-policies "$root/main-policy.json" \
+    --rulesets "$root/tag-rulesets.json" \
+    --expected-bypass-actor-ids 42 \
+    --expected-reviewer-ids 42 \
+    --repository Amitk3293/promtect >/dev/null 2>&1; then
+    echo "administrator bypass ${admin_bypass_variant} passed verification" >&2
+    exit 1
+  fi
+done
+
+if python3 scripts/verify-github-release-controls.py \
+  --core-release "$root/core-release.json" \
+  --core-release-policies "$root/main-policy.json" \
+  --core-container-release "$root/core-container-release.json" \
+  --core-container-release-policies "$root/main-policy.json" \
+  --rulesets "$root/tag-rulesets.json" \
+  --expected-bypass-actor-ids 42 \
+  --expected-reviewer-ids 42 \
+  --repository Amitk3293/promtect \
+  --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
+  echo "missing manual administrator-bypass evidence passed verification" >&2
+  exit 1
+fi
+
+python3 - "$root/admin-bypass-evidence.json" "$root" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    original = json.load(handle)
+
+data = json.loads(json.dumps(original))
+data["environments"]["core-release"]["administrators_can_bypass"] = True
+with open(os.path.join(sys.argv[2], "manual-bypass-enabled.json"), "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+
+data = json.loads(json.dumps(original))
+data["environments"]["core-release"]["updated_at"] = "2026-07-13T17:00:00Z"
+with open(os.path.join(sys.argv[2], "manual-bypass-stale-config.json"), "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+
+data = json.loads(json.dumps(original))
+data["recorded_at"] = "2026-07-12T18:00:00Z"
+data["expires_at"] = "2026-07-12T19:00:00Z"
+with open(os.path.join(sys.argv[2], "manual-bypass-expired.json"), "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+for evidence_variant in enabled stale-config expired; do
+  if python3 scripts/verify-github-release-controls.py \
+    --core-release "$root/core-release.json" \
+    --core-release-policies "$root/main-policy.json" \
+    --core-container-release "$root/core-container-release.json" \
+    --core-container-release-policies "$root/main-policy.json" \
+    --rulesets "$root/tag-rulesets.json" \
+    --expected-bypass-actor-ids 42 \
+    --expected-reviewer-ids 42 \
+    --repository Amitk3293/promtect \
+    --manual-admin-bypass-evidence "$root/manual-bypass-${evidence_variant}.json" \
+    --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
+    echo "invalid manual administrator-bypass evidence ${evidence_variant} passed" >&2
+    exit 1
+  fi
+done
 
 python3 - "$root/core-release.json" "$root/no-reviewers.json" <<'PY'
 import json
@@ -381,7 +554,10 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/tag-rulesets.json" \
   --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 >/dev/null 2>&1; then
+  --expected-reviewer-ids 42 \
+  --repository Amitk3293/promtect \
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+  --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
   echo "release environment without reviewers passed verification" >&2
   exit 1
 fi
@@ -395,7 +571,10 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/excluding-tag-ruleset.json" \
   --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 >/dev/null 2>&1; then
+  --expected-reviewer-ids 42 \
+  --repository Amitk3293/promtect \
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+  --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
   echo "tag ruleset with exclusions passed verification" >&2
   exit 1
 fi
@@ -409,7 +588,10 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/tag-rulesets.json" \
   --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 >/dev/null 2>&1; then
+  --expected-reviewer-ids 42 \
+  --repository Amitk3293/promtect \
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+  --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
   echo "non-main release deployment policy passed verification" >&2
   exit 1
 fi
@@ -423,7 +605,10 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/mutable-tag-ruleset.json" \
   --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 >/dev/null 2>&1; then
+  --expected-reviewer-ids 42 \
+  --repository Amitk3293/promtect \
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+  --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
   echo "mutable release tag ruleset passed verification" >&2
   exit 1
 fi
@@ -436,6 +621,9 @@ if python3 scripts/verify-github-release-controls.py \
   --rulesets "$root/tag-rulesets.json" \
   --expected-bypass-actor-ids 99 \
   --expected-reviewer-ids 42 \
+  --repository Amitk3293/promtect \
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+  --now 2026-07-13T19:30:00Z \
   >/dev/null 2>&1; then
   echo "unexpected release operator bypass passed verification" >&2
   exit 1
@@ -465,6 +653,7 @@ assert container.index("release-controls:") < container.index(
 for workflow in (release, container):
     assert '"refs/heads/main"' in workflow
     assert "Recheck controls after environment approval" in workflow
+    assert "RELEASE_ADMIN_BYPASS_EVIDENCE" in workflow
 assert "--normalization-candidate" in release
 assert "--assets-subset" in release
 assert "isDraft,isPrerelease,name,body,assets,tagName,targetCommitish" in release

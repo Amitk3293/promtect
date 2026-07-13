@@ -14,9 +14,10 @@ Before the first public release:
   remains private and must never be included in a Core artifact.
 - Configure the GitHub environments `core-release` and
   `core-container-release` with required reviewers and a single custom
-  deployment-branch policy for `main`. Self-review must be disabled. The
-  workflows also require exact typed confirmation; environment protection is
-  the human authorization boundary.
+  deployment-branch policy for `main`. `prevent_self_review` must be the exact
+  boolean `true`, and **Allow administrators to bypass configured protection
+  rules** must be disabled. The workflows also require exact typed confirmation;
+  environment protection is the human authorization boundary.
 - Configure an active repository ruleset for `refs/tags/v*` that restricts tag
   creation to release operators and prevents tag updates and deletion. The
   workflows re-fetch and compare both the annotated tag object ID and commit
@@ -32,12 +33,36 @@ Before the first public release:
   `RELEASE_BYPASS_ACTOR_IDS` containing exactly the approved GitHub reviewer and
   tag-ruleset bypass actor IDs. The workflows only issue GET requests with this
   token; control provisioning remains a manual administrator action.
+- Record a fresh `RELEASE_ADMIN_BYPASS_EVIDENCE` repository variable when the
+  GitHub environment API does not expose an administrator-bypass field. The
+  compact JSON record must be valid for no more than 24 hours, be recorded by an
+  approved reviewer, bind both environment `updated_at` values, state that
+  administrator bypass is disabled, and reference a private screenshot or
+  recording plus its SHA-256:
 
-Both publication workflows verify these controls before a protected environment
-is referenced, so a missing environment cannot be silently auto-created as the
-authorization boundary. They verify them again immediately after approval and
-before any release or package mutation. Missing credentials, controls, exact
-actors, or a main-only deployment policy fail closed.
+  ```json
+  {"schema_version":1,"repository":"Amitk3293/promtect","source":"github-environment-settings-ui","evidence_reference":"https://github.com/Amitk3293/promtect/issues/ISSUE#issuecomment-COMMENT","evidence_sha256":"64-lowercase-hex-characters","recorded_by_reviewer_id":123,"recorded_at":"2026-07-13T19:00:00Z","expires_at":"2026-07-13T20:00:00Z","environments":{"core-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"},"core-container-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"}}}
+  ```
+
+Both publication workflows verify every API-visible control before a protected
+environment is referenced, so a missing environment cannot be silently
+auto-created as the authorization boundary. They verify the same state again
+immediately after approval and before any release or package mutation. A future
+API administrator-bypass field must be the exact boolean `false`; any other
+value fails closed. When that field is absent, the workflow validates the fresh
+manual record above against the current API timestamps.
+
+This record is manual launch-gate evidence, not automatic proof of the UI
+setting. GitHub documents that administrators can bypass environment rules by
+default and that an environment can disable that bypass, but the REST OpenAPI
+schema retrieved on 2026-07-13 exposes `prevent_self_review` and does not expose
+the administrator-bypass setting. The evidence expiry and `updated_at` binding
+limit staleness; an approved human must still inspect the referenced capture.
+See [Deployments and environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
+[Reviewing deployments](https://docs.github.com/en/actions/managing-workflow-runs/reviewing-deployments),
+and the [official REST description](https://github.com/github/rest-api-description).
+Missing credentials, controls, exact actors, evidence, or a main-only deployment
+policy fails closed.
 
 Until those controls and anonymous-read checks are green, run candidate builds
 with `publish=false` only.

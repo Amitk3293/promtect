@@ -13,9 +13,16 @@ repository="${1:-${GITHUB_REPOSITORY:-}}"
   || fail "PROMTECT_RELEASE_BYPASS_ACTOR_IDS is required"
 [ -n "${PROMTECT_RELEASE_REVIEWER_IDS:-}" ] \
   || fail "PROMTECT_RELEASE_REVIEWER_IDS is required"
-
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
+evidence_args=()
+if [ -n "${PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON:-}" ]; then
+  printf '%s\n' "$PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON" \
+    > "$root/admin-bypass-evidence.json"
+  evidence_args=(
+    --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json"
+  )
+fi
 
 for environment in core-release core-container-release; do
   gh api "/repos/${repository}/environments/${environment}" \
@@ -70,4 +77,6 @@ python3 scripts/verify-github-release-controls.py \
   --core-container-release-policies "$root/core-container-release-policies.json" \
   --rulesets "$root/rulesets.json" \
   --expected-bypass-actor-ids "$PROMTECT_RELEASE_BYPASS_ACTOR_IDS" \
-  --expected-reviewer-ids "$PROMTECT_RELEASE_REVIEWER_IDS"
+  --expected-reviewer-ids "$PROMTECT_RELEASE_REVIEWER_IDS" \
+  --repository "$repository" \
+  "${evidence_args[@]}"
