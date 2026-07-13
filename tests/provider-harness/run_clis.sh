@@ -621,6 +621,59 @@ printf '%s\n' \
 printf '%s\n' \
   '{"claudeAiOauth":{"accessToken":"fixed-dummy-oauth-token","refreshToken":"fixed-dummy-refresh-token","expiresAt":4102444800000,"scopes":["user:inference"]}}' \
   > /tmp/claude-guard/.credentials.json
+
+assert_claude_env_auth_rejected() {
+  auth_var=$1
+  auth_value=$2
+  stderr_file=$3
+  rm -f /tmp/claude-auth-status.called "$stderr_file"
+  observations_before=$(observer_count)
+  status=0
+  env "$auth_var=$auth_value" \
+    HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
+    PROMTECT_CLAUDE_AUTH_STATUS_MARKER=/tmp/claude-auth-status.called \
+    PROMTECT_AUDIT=/tmp/claude-auth-reject-audit.jsonl \
+    PROMTECT_DASHBOARD_PORT=18998 \
+    promtect guard claude --upstream http://mock-provider:9000/guard-claude -- --version \
+    > /tmp/claude-auth-reject.stdout 2> "$stderr_file" || status=$?
+  if [ "$status" -ne 1 ]; then
+    printf 'FAIL Claude guard: %s override returned %s instead of 1\n' "$auth_var" "$status" >&2
+    exit 1
+  fi
+  if [ -e /tmp/claude-auth-status.called ]; then
+    printf 'FAIL Claude guard: %s override reached auth status preflight\n' "$auth_var" >&2
+    exit 1
+  fi
+  observations_after=$(observer_count)
+  if [ "$observations_before" -ne "$observations_after" ]; then
+    printf 'FAIL Claude guard: %s override reached the provider\n' "$auth_var" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$auth_var" "$stderr_file" \
+    || ! grep -Fq 'verified stored individual Max credential' "$stderr_file"; then
+    printf 'FAIL Claude guard: %s rejection was not actionable\n' "$auth_var" >&2
+    exit 1
+  fi
+  if { [ -n "$auth_value" ] && grep -Fq "$auth_value" "$stderr_file"; } \
+    || grep -Fq 'proxy 127.0.0.1:' "$stderr_file" \
+    || grep -Fq 'dashboard: http://127.0.0.1:' "$stderr_file"; then
+    printf 'FAIL Claude guard: %s rejection leaked a value or bound a listener\n' "$auth_var" >&2
+    exit 1
+  fi
+  if [ "$(wc -c < "$stderr_file")" -gt 4096 ]; then
+    printf 'FAIL Claude guard: %s rejection output was unbounded\n' "$auth_var" >&2
+    exit 1
+  fi
+  printf 'PASS Claude guard: %s environment auth rejected before bind and auth status\n' "$auth_var"
+}
+
+assert_claude_env_auth_rejected \
+  ANTHROPIC_API_KEY fixed-synthetic-api-key /tmp/claude-auth-api.stderr
+assert_claude_env_auth_rejected \
+  CLAUDE_CODE_OAUTH_TOKEN fixed-synthetic-oauth-token /tmp/claude-auth-oauth.stderr
+assert_claude_env_auth_rejected \
+  ANTHROPIC_API_KEY '' /tmp/claude-auth-empty.stderr
+
 claude_before=$(observer_count)
 rm -f /tmp/claude-guard-hold.ready /tmp/claude-guard-hold.release \
   /tmp/claude-guard-second.debug.log
@@ -698,11 +751,13 @@ printf 'PASS Claude guard: inherited proxy variables could not bypass the loopba
 printf 'PASS Claude guard: persisted base URL, socket, and provider selectors could not bypass Promtect\n'
 
 rm -f /tmp/claude-sigterm.ready /tmp/claude-sigterm.child.pid \
+  /tmp/claude-sigterm.grandchild.pid \
   /tmp/claude-sigterm.settings /tmp/claude-sigterm.stdout /tmp/claude-sigterm.stderr
 HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_UPDATES=1 \
   PROMTECT_CLAUDE_HOLD_ONLY=1 \
   PROMTECT_CLAUDE_HOLD_PID=/tmp/claude-sigterm.child.pid \
+  PROMTECT_CLAUDE_HOLD_GRANDCHILD_PID=/tmp/claude-sigterm.grandchild.pid \
   PROMTECT_CLAUDE_SETTINGS_PATH=/tmp/claude-sigterm.settings \
   PROMTECT_CLAUDE_HOLD_READY=/tmp/claude-sigterm.ready \
   PROMTECT_AUDIT=/tmp/claude-sigterm-audit.jsonl PROMTECT_DASHBOARD_PORT=18999 \
@@ -725,6 +780,7 @@ if [ ! -e /tmp/claude-sigterm.ready ]; then
   exit 1
 fi
 claude_sigterm_child_pid=$(cat /tmp/claude-sigterm.child.pid)
+claude_sigterm_grandchild_pid=$(cat /tmp/claude-sigterm.grandchild.pid)
 claude_sigterm_settings=$(cat /tmp/claude-sigterm.settings)
 kill -TERM "$claude_sigterm_guard_pid"
 claude_sigterm_status=0
@@ -735,10 +791,28 @@ if [ "$claude_sigterm_status" -ne 137 ]; then
   sed -n '1,120p' /tmp/claude-sigterm.stderr >&2
   exit 1
 fi
-if kill -0 "$claude_sigterm_child_pid" 2>/dev/null; then
-  printf 'FAIL Claude guard: guarded Claude child survived Promtect SIGTERM\n' >&2
-  exit 1
-fi
+python3 - "$claude_sigterm_child_pid" "$claude_sigterm_grandchild_pid" <<'PY'
+import pathlib
+import sys
+import time
+
+def live(pid):
+    path = pathlib.Path(f"/proc/{pid}/stat")
+    try:
+        stat = path.read_text()
+    except FileNotFoundError:
+        return False
+    close = stat.rfind(")")
+    return close < 0 or stat[close + 2 :].split()[0] != "Z"
+
+pids = [int(value) for value in sys.argv[1:]]
+for _ in range(50):
+    if not any(live(pid) for pid in pids):
+        break
+    time.sleep(0.02)
+else:
+    raise AssertionError(f"guarded Claude process tree survived SIGTERM: {pids!r}")
+PY
 if [ -e "$claude_sigterm_settings" ] || [ -d "$(dirname "$claude_sigterm_settings")" ]; then
   printf 'FAIL Claude guard: owner-only temporary settings survived Promtect SIGTERM\n' >&2
   exit 1
@@ -748,7 +822,7 @@ if ! grep -Fq 'shutdown requested; stopping the guarded tool' /tmp/claude-sigter
   exit 1
 fi
 assert_guard_listener_teardown "Claude guard SIGTERM" /tmp/claude-sigterm.stderr
-printf 'PASS Claude guard: SIGTERM stopped the child, listeners, and temporary settings\n'
+printf 'PASS Claude guard: SIGTERM stopped child and grandchild, listeners, and temporary settings\n'
 
 if ! HOME=/tmp/ollama OLLAMA_HOST="$PROXY" \
   ollama run synthetic-model "$PROMPT" > /tmp/ollama.out 2>&1; then

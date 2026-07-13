@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-SUL-1.0
 // Copyright (c) 2026 AK DevOps Solutions SL
 
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Read, Seek, Write};
 use std::path::PathBuf;
@@ -21,6 +22,13 @@ struct FileSink {
     handle: Option<std::fs::File>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuditSessionStats {
+    pub(crate) masked: u64,
+    pub(crate) by_detector: BTreeMap<String, u64>,
+    pub(crate) output_secrets: u64,
+}
+
 /// Append-only JSONL audit log. Records mask/unmask events — never secret values.
 ///
 /// The log is FAIL-OPEN by contract: every open or write failure is swallowed so
@@ -33,6 +41,10 @@ pub struct Audit {
     /// This keeps concurrent guards sharing one append-only log attributable
     /// without changing the proxy's internal request identifier.
     request_scope: Option<Arc<str>>,
+    /// Process-local counters for this `Audit` instance. Guard summaries use
+    /// these instead of diffing a shared JSONL file, so concurrent guards cannot
+    /// inflate one another's session totals.
+    session_stats: Mutex<AuditSessionStats>,
     /// Set once, the first time a write fails, to gate a one-shot stderr warning.
     warned: AtomicBool,
 }
@@ -45,6 +57,7 @@ impl Audit {
                 handle: None,
             })),
             request_scope: None,
+            session_stats: Mutex::new(AuditSessionStats::default()),
             warned: AtomicBool::new(false),
         }
     }
@@ -56,6 +69,7 @@ impl Audit {
                 handle: None,
             })),
             request_scope: Some(request_scope.into()),
+            session_stats: Mutex::new(AuditSessionStats::default()),
             warned: AtomicBool::new(false),
         }
     }
@@ -65,6 +79,7 @@ impl Audit {
         Audit {
             sink: Mutex::new(None),
             request_scope: None,
+            session_stats: Mutex::new(AuditSessionStats::default()),
             warned: AtomicBool::new(false),
         }
     }
@@ -89,6 +104,13 @@ impl Audit {
 
     pub(crate) fn mark_unhealthy(&self) {
         self.warn_once();
+    }
+
+    pub(crate) fn session_stats(&self) -> AuditSessionStats {
+        self.session_stats
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn scoped_request_id(&self, request_id: &str) -> String {
@@ -221,10 +243,13 @@ impl Audit {
         };
 
         let Some(complete_prefix) = complete_prefix else {
-            // A record larger than the maximum emitted audit line is malformed.
-            // Reset instead of synchronously scanning an attacker-sized file.
-            file.set_len(0)?;
-            return Ok(());
+            // A tail larger than the bounded scan window is malformed. Refuse to
+            // mutate it: zeroing the file would destroy valid historical records
+            // before that tail. The caller can rotate/quarantine it explicitly.
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "audit log has an oversized unterminated tail",
+            ));
         };
 
         // Preserve a complete JSON object whose only defect is a missing final
@@ -252,16 +277,20 @@ impl Audit {
     /// write error is swallowed so masking is never blocked; the first failure
     /// triggers a single stderr warning so the operator knows the trail is
     /// incomplete. Callers MUST pass a value-free line (no secret values).
-    fn append_line(&self, line: &str) {
+    fn append_line(&self, line: &str, verify_identity: bool) {
         let mut guard = self.sink_lock();
         let Some(sink) = guard.as_mut() else {
             return; // null sink: discard.
         };
 
-        if sink
-            .handle
-            .as_ref()
-            .is_some_and(|handle| !same_audit_file(handle, &sink.path).unwrap_or(false))
+        // One identity check per request summary catches rotation before the
+        // terminal request/failure records without reopening the pathname for
+        // every mask/unmask event on the proxy hot path.
+        if verify_identity
+            && sink
+                .handle
+                .as_ref()
+                .is_some_and(|handle| !same_audit_file(handle, &sink.path).unwrap_or(false))
         {
             sink.handle = None;
             self.warn_once();
@@ -364,11 +393,28 @@ impl Audit {
             "bytes_out": bytes_out,
             "blocked": blocked,
         });
-        self.append_line(&line.to_string());
+        self.append_line(&line.to_string(), true);
     }
 
     /// Record one event. `placeholder` is a sentinel id, NOT a secret.
     pub fn record(&self, action: &str, kind: &str, placeholder: &str, request_id: &str) {
+        {
+            let mut stats = self
+                .session_stats
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match action {
+                "mask" => {
+                    stats.masked = stats.masked.saturating_add(1);
+                    let count = stats.by_detector.entry(kind.to_string()).or_default();
+                    *count = count.saturating_add(1);
+                }
+                "output_secret" => {
+                    stats.output_secrets = stats.output_secrets.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
         let request_id = self.scoped_request_id(request_id);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -381,7 +427,7 @@ impl Audit {
             "placeholder": placeholder,
             "request_id": request_id,
         });
-        self.append_line(&line.to_string());
+        self.append_line(&line.to_string(), false);
     }
 }
 
@@ -445,8 +491,10 @@ fn same_audit_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Res
     use std::os::unix::fs::MetadataExt;
 
     let current = file.metadata()?;
-    let path_file = Audit::open_read(path)?;
-    let path_metadata = path_file.metadata()?;
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.is_file() || path_metadata.uid() != effective_user_id()? {
+        return Ok(false);
+    }
     Ok(current.dev() == path_metadata.dev() && current.ino() == path_metadata.ino())
 }
 
@@ -508,6 +556,41 @@ fn effective_user_id() -> std::io::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_stats_are_process_local_and_count_only_summary_actions() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-session-stats-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let first = Audit::to_file_scoped(path.clone(), "first".to_string());
+        let second = Audit::to_file_scoped(path.clone(), "second".to_string());
+
+        first.record("mask", "aws_key", "opaque-one", "request-1");
+        first.record("mask", "aws_key", "opaque-two", "request-1");
+        first.record("output_secret", "github_token", "opaque-three", "request-1");
+        first.record("unmask", "aws_key", "opaque-one", "request-1");
+        first.record_request("request-1", 2, &["aws_key"], 100, 90);
+        second.record("mask", "stripe_key", "opaque-four", "request-2");
+
+        assert_eq!(
+            first.session_stats(),
+            AuditSessionStats {
+                masked: 2,
+                by_detector: BTreeMap::from([("aws_key".to_string(), 2)]),
+                output_secrets: 1,
+            }
+        );
+        assert_eq!(
+            second.session_stats(),
+            AuditSessionStats {
+                masked: 1,
+                by_detector: BTreeMap::from([("stripe_key".to_string(), 1)]),
+                output_secrets: 0,
+            }
+        );
+        std::fs::remove_file(path).ok();
+    }
 
     #[test]
     fn record_request_writes_value_free_summary_line() {
@@ -685,7 +768,7 @@ mod tests {
         std::fs::rename(&path, &rotated).expect("rotate audit fixture");
         std::fs::write(&path, b"").expect("create replacement audit path");
 
-        audit.record("mask", "github_token", "opaque-second", "request-second");
+        audit.record_request("request-second", 1, &["github_token"], 100, 90);
 
         let old_contents = std::fs::read_to_string(&rotated).expect("read rotated audit");
         let new_contents = std::fs::read_to_string(&path).expect("read replacement audit");
@@ -754,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_malformed_tail_resets_without_scanning_sparse_prefix() {
+    fn oversized_malformed_tail_is_rejected_without_destroying_history() {
         const SPARSE_LEN: u64 = 512 * 1024 * 1024;
 
         let path = std::env::temp_dir().join(format!(
@@ -773,11 +856,15 @@ mod tests {
         drop(file);
 
         let audit = Audit::to_file(path.clone());
-        audit.prepare().expect("repair sparse malformed audit");
+        let result = audit.prepare();
 
-        let repaired_len = std::fs::metadata(&path).expect("stat repaired audit").len();
+        let retained_len = std::fs::metadata(&path).expect("stat retained audit").len();
         std::fs::remove_file(&path).ok();
-        assert_eq!(repaired_len, 0, "oversized malformed tail must reset");
+        assert!(result.is_err(), "oversized malformed tail must fail closed");
+        assert_eq!(
+            retained_len, SPARSE_LEN,
+            "bounded repair must never destroy an existing audit prefix"
+        );
     }
 
     #[cfg(unix)]

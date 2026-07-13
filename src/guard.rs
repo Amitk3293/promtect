@@ -358,7 +358,16 @@ fn conflicting_claude_override(args: &[String]) -> Option<&str> {
     args.iter().map(String::as_str).find(|arg| {
         *arg == "--settings"
             || arg.starts_with("--settings=")
-            || matches!(*arg, "--safe-mode" | "--bare")
+            || matches!(
+                *arg,
+                "--safe-mode"
+                    | "--bare"
+                    | "--background"
+                    | "--bg"
+                    | "--remote-control"
+                    | "--tmux"
+                    | "--worktree"
+            )
     })
 }
 
@@ -591,62 +600,74 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> ClaudeNoticeRead {
         next_cursor = next_cursor.saturating_add(bytes as u64);
 
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
-            continue;
+            *cursor = len;
+            return ClaudeNoticeRead::Degraded;
         };
         let Some(action) = value.get("action").and_then(|field| field.as_str()) else {
-            continue;
+            *cursor = len;
+            return ClaudeNoticeRead::Degraded;
         };
         let Some(request_id) = value
             .get("request_id")
             .and_then(|field| field.as_str())
             .filter(|request_id| !request_id.is_empty())
         else {
-            continue;
+            *cursor = len;
+            return ClaudeNoticeRead::Degraded;
         };
-        if !request_id.starts_with(state.request_prefix.as_ref()) {
-            continue;
-        }
         if request_id.len() > CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES {
             *cursor = len;
             return ClaudeNoticeRead::Degraded;
         }
+        if !request_id.starts_with(state.request_prefix.as_ref()) {
+            continue;
+        }
 
         match action {
             "request" => {
-                let masked = value
-                    .get("masked")
-                    .and_then(|field| field.as_u64())
-                    .unwrap_or(0);
-                if masked == 0 {
+                let Some(masked) = value.get("masked").and_then(|field| field.as_u64()) else {
+                    *cursor = len;
+                    return ClaudeNoticeRead::Degraded;
+                };
+                let Some(blocked) = value.get("blocked").and_then(|field| field.as_bool()) else {
+                    *cursor = len;
+                    return ClaudeNoticeRead::Degraded;
+                };
+                let Some(detectors) = value.get("detectors").and_then(|field| field.as_array())
+                else {
+                    *cursor = len;
+                    return ClaudeNoticeRead::Degraded;
+                };
+                let mut validated_detectors = BTreeSet::new();
+                for detector in detectors {
+                    let Some(detector) = detector.as_str() else {
+                        *cursor = len;
+                        return ClaudeNoticeRead::Degraded;
+                    };
+                    if !valid_detector_name(detector) {
+                        *cursor = len;
+                        return ClaudeNoticeRead::Degraded;
+                    }
+                    validated_detectors.insert(detector.to_string());
+                    if validated_detectors.len() > CLAUDE_NOTICE_MAX_DETECTORS {
+                        *cursor = len;
+                        return ClaudeNoticeRead::Degraded;
+                    }
+                }
+                if masked > 0 && validated_detectors.is_empty() {
+                    *cursor = len;
+                    return ClaudeNoticeRead::Degraded;
+                }
+                if blocked {
+                    unsuccessful.insert(request_id.to_string());
                     continue;
                 }
-                if value
-                    .get("blocked")
-                    .and_then(|field| field.as_bool())
-                    .unwrap_or(false)
-                {
-                    unsuccessful.insert(request_id.to_string());
+                if masked == 0 {
                     continue;
                 }
                 let entry = requests.entry(request_id.to_string()).or_default();
                 entry.masked = entry.masked.saturating_add(masked);
-                if let Some(detectors) = value.get("detectors").and_then(|field| field.as_array()) {
-                    for detector in detectors {
-                        let Some(detector) = detector.as_str() else {
-                            *cursor = len;
-                            return ClaudeNoticeRead::Degraded;
-                        };
-                        if !valid_detector_name(detector) {
-                            *cursor = len;
-                            return ClaudeNoticeRead::Degraded;
-                        }
-                        entry.detectors.insert(detector.to_string());
-                        if entry.detectors.len() > CLAUDE_NOTICE_MAX_DETECTORS {
-                            *cursor = len;
-                            return ClaudeNoticeRead::Degraded;
-                        }
-                    }
-                }
+                entry.detectors.extend(validated_detectors);
             }
             "request_blocked" | "request_rejected" | "request_failed" | "stream_interrupted" => {
                 unsuccessful.insert(request_id.to_string());
@@ -1022,7 +1043,7 @@ async fn claude_notice_hook(
     if state
         .audit
         .as_ref()
-        .is_some_and(|audit| !audit.is_healthy() || !audit.path_matches_handle())
+        .is_some_and(|audit| !audit.is_healthy())
     {
         if let Some(audit) = state.audit.as_ref() {
             audit.mark_unhealthy();
@@ -1056,22 +1077,30 @@ async fn claude_notice_hook(
     let read_state = state.clone();
     let read = tokio::task::spawn_blocking(move || {
         let _permit = ClaudeNoticeReadPermit(reading);
-        take_claude_notice(&read_state)
+        let unhealthy = || {
+            read_state
+                .audit
+                .as_ref()
+                .is_some_and(|audit| !audit.is_healthy() || !audit.path_matches_handle())
+        };
+        if unhealthy() {
+            if let Some(audit) = read_state.audit.as_ref() {
+                audit.mark_unhealthy();
+            }
+            return ClaudeNoticeRead::Degraded;
+        }
+        let read = take_claude_notice(&read_state);
+        if unhealthy() {
+            if let Some(audit) = read_state.audit.as_ref() {
+                audit.mark_unhealthy();
+            }
+            ClaudeNoticeRead::Degraded
+        } else {
+            read
+        }
     })
     .await
     .unwrap_or(ClaudeNoticeRead::Degraded);
-    let read = if state
-        .audit
-        .as_ref()
-        .is_some_and(|audit| !audit.is_healthy() || !audit.path_matches_handle())
-    {
-        if let Some(audit) = state.audit.as_ref() {
-            audit.mark_unhealthy();
-        }
-        ClaudeNoticeRead::Degraded
-    } else {
-        read
-    };
     let body = match read {
         ClaudeNoticeRead::Empty => serde_json::json!({}),
         ClaudeNoticeRead::Notice(notice) => {
@@ -1435,6 +1464,156 @@ async fn run_codex_dry_run(plan: &GuardPlan) -> i32 {
     }
 }
 
+#[cfg(unix)]
+fn descendants_from_pairs(root: u32, pairs: &[(u32, u32)]) -> Vec<(u32, usize)> {
+    let mut descendants = Vec::new();
+    let mut frontier = vec![(root, 0usize)];
+    let mut seen = BTreeSet::from([root]);
+    while let Some((parent, depth)) = frontier.pop() {
+        for &(pid, ppid) in pairs {
+            if ppid == parent && seen.insert(pid) {
+                let child_depth = depth.saturating_add(1);
+                descendants.push((pid, child_depth));
+                frontier.push((pid, child_depth));
+            }
+        }
+    }
+    descendants.sort_by(|(left_pid, left_depth), (right_pid, right_depth)| {
+        right_depth
+            .cmp(left_depth)
+            .then_with(|| left_pid.cmp(right_pid))
+    });
+    descendants
+}
+
+#[cfg(target_os = "linux")]
+fn process_parent_pairs() -> std::io::Result<Vec<(u32, u32)>> {
+    let mut pairs = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let mut fields = stat[close + 1..].split_whitespace();
+        let _state = fields.next();
+        let Some(ppid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        pairs.push((pid, ppid));
+    }
+    Ok(pairs)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_parent_pairs() -> std::io::Result<Vec<(u32, u32)>> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid="])
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other("process tree snapshot failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .collect())
+}
+
+#[cfg(unix)]
+fn send_unix_signal(pid: u32, signal: &str) -> std::io::Result<()> {
+    // `kill` is a POSIX shell builtin even in slim runtime images that omit the
+    // standalone /bin/kill executable. The command text is fixed; signal and
+    // numeric PID are positional arguments, never interpolated into shell code.
+    let status = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "kill \"$1\" \"$2\"",
+            "promtect-signal",
+            signal,
+            &pid.to_string(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("process signal failed"))
+    }
+}
+
+#[cfg(unix)]
+fn terminate_descendant_tree(root: u32) -> std::io::Result<()> {
+    send_unix_signal(root, "-STOP")?;
+    let mut stopped = BTreeSet::new();
+    let mut descendants = Vec::new();
+    let mut snapshot_error = None;
+    for _ in 0..8 {
+        let pairs = match process_parent_pairs() {
+            Ok(pairs) => pairs,
+            Err(error) => {
+                snapshot_error = Some(error);
+                break;
+            }
+        };
+        descendants = descendants_from_pairs(root, &pairs);
+        let mut added = false;
+        for &(pid, _) in &descendants {
+            if stopped.insert(pid) {
+                // A descendant can exit between the snapshot and the signal.
+                // Keep cleaning the rest of the tree instead of abandoning a
+                // stopped root and any descendants already frozen.
+                let _ = send_unix_signal(pid, "-STOP");
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    for (pid, _) in descendants {
+        let _ = send_unix_signal(pid, "-KILL");
+    }
+    let root_result = send_unix_signal(root, "-KILL");
+    if let Some(error) = snapshot_error {
+        return Err(error);
+    }
+    root_result
+}
+
+async fn terminate_guarded_child(
+    child: &mut tokio::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        match tokio::task::spawn_blocking(move || terminate_descendant_tree(pid)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                eprintln!(
+                    "promtect guard: warning: descendant cleanup was incomplete; forcing the guarded tool to stop"
+                );
+                child.start_kill().ok();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    child.start_kill().ok();
+
+    child.wait().await
+}
+
 /// Run a [`GuardPlan`]: start an ephemeral proxy, point the tool at it via its
 /// base-URL env var, run the tool, and return its exit code. The proxy task is
 /// dropped when the process exits.
@@ -1670,9 +1849,10 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         eprintln!("  dashboard: http://127.0.0.1:{dash_port}");
     }
 
-    // Inherit the full parent env (so the user's API keys flow through, forwarded
-    // untouched), then override the tool's base-URL var to point at the proxy.
-    // kill_on_drop ensures the child can't be orphaned if this future is dropped.
+    // Inherit the parent environment, then override the tool's base-URL variable
+    // to point at the proxy. Named Claude guard has already rejected environment
+    // authentication overrides and uses the verified stored Max credential.
+    // kill_on_drop is a direct-child fallback; explicit shutdown owns descendants.
     let claude_settings_file = if plan.claude_fail_closed {
         let Some(notice_url) = claude_notice_url.as_deref() else {
             proxy_task.abort();
@@ -1731,18 +1911,13 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // session so per-request notifications do not corrupt the tool's terminal.
     // The audit log + dashboard still capture everything; the summary prints below.
     crate::proxy::set_quiet(true);
-    // Snapshot the audit so the exit summary reflects THIS session, not the whole
-    // append-only log.
-    let baseline = crate::metrics::aggregate(std::path::Path::new(&audit_path_for_dash));
-
     let status = match cmd.spawn() {
         Ok(mut child) => {
             tokio::select! {
                 status = child.wait() => status,
                 _ = crate::proxy::shutdown_signal() => {
                     eprintln!("promtect guard: shutdown requested; stopping the guarded tool");
-                    child.kill().await.ok();
-                    child.wait().await
+                    terminate_guarded_child(&mut child).await
                 }
             }
         }
@@ -1780,15 +1955,13 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         } else {
             // Value-free end-of-session summary, now that the TUI has released the
             // terminal: the useful Promtect signal without disturbing the session.
-            if plan.claude_fail_closed && (!audit.is_healthy() || !audit.path_matches_handle()) {
+            if plan.claude_fail_closed && !audit.is_healthy() {
                 audit.mark_unhealthy();
                 eprintln!(
                     "promtect guard: this session's protection metadata is incomplete because the audit log became unavailable; masking continued, but no zero-event claim is possible"
                 );
-            } else {
-                let after = crate::metrics::aggregate(std::path::Path::new(&audit_path_for_dash));
-                print_guard_summary(&baseline, &after);
             }
+            print_guard_summary(&audit.session_stats());
         }
     }
 
@@ -1825,20 +1998,16 @@ fn is_stale_stub(url: &str) -> bool {
 
 /// Print a value-free end-of-session summary for a guard run: how many secrets it
 /// masked outbound, and how many the Pro output scan caught in the model's replies.
-/// Counts are the difference between an audit snapshot taken before the tool
-/// launched and one taken now, so they reflect this session only.
-fn print_guard_summary(before: &crate::metrics::Metrics, after: &crate::metrics::Metrics) {
-    let masked = after
-        .secrets_masked_total
-        .saturating_sub(before.secrets_masked_total);
-    let echoed = after
-        .output_secrets_total
-        .saturating_sub(before.output_secrets_total);
+/// Counts come from this guard's process-local audit instance, so concurrent
+/// guards sharing a JSONL path cannot contaminate one another's summaries.
+fn print_guard_summary(stats: &crate::audit::AuditSessionStats) {
+    let masked = stats.masked;
+    let echoed = stats.output_secrets;
 
     if masked == 0 {
-        eprintln!("promtect guard: this session masked 0 secrets — nothing sensitive was sent.");
+        eprintln!("promtect guard: this session recorded 0 masked sensitive values.");
     } else {
-        let kinds = kinds_delta(&before.by_detector, &after.by_detector);
+        let kinds = stats.by_detector.keys().cloned().collect::<Vec<_>>();
         eprintln!(
             "promtect guard: this session masked {masked} secret{} ({}). Rotate anything \
              that already leaked; Promtect kept these from arriving.",
@@ -1852,20 +2021,6 @@ fn print_guard_summary(before: &crate::metrics::Metrics, after: &crate::metrics:
             if echoed == 1 { "" } else { "s" },
         );
     }
-}
-
-/// Detector kinds whose masked count increased between two audit snapshots, sorted.
-fn kinds_delta(
-    before: &std::collections::BTreeMap<String, u64>,
-    after: &std::collections::BTreeMap<String, u64>,
-) -> Vec<String> {
-    let mut kinds: Vec<String> = after
-        .iter()
-        .filter(|(k, c)| **c > before.get(k.as_str()).copied().unwrap_or(0))
-        .map(|(k, _)| k.clone())
-        .collect();
-    kinds.sort();
-    kinds
 }
 
 /// Map a child `ExitStatus` to a process exit code. A child killed by a signal has
@@ -1892,17 +2047,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kinds_delta_reports_only_increased_kinds() {
-        use std::collections::BTreeMap;
-        let before = BTreeMap::from([("aws_key".to_string(), 1u64), ("jwt".to_string(), 2)]);
-        let after = BTreeMap::from([
-            ("aws_key".to_string(), 3u64),   // increased
-            ("jwt".to_string(), 2),          // unchanged → excluded
-            ("github_token".to_string(), 1), // new → included
-        ]);
+    #[cfg(unix)]
+    fn descendant_selection_is_transitive_and_excludes_siblings() {
+        let pairs = [(10, 1), (11, 10), (12, 11), (13, 10), (20, 1), (21, 20)];
         assert_eq!(
-            kinds_delta(&before, &after),
-            vec!["aws_key".to_string(), "github_token".to_string()]
+            descendants_from_pairs(10, &pairs),
+            vec![(12, 2), (11, 1), (13, 1)]
         );
     }
 
@@ -2018,7 +2168,15 @@ mod tests {
 
     #[test]
     fn claude_rejects_modes_that_disable_the_automatic_notice() {
-        for arg in ["--safe-mode", "--bare"] {
+        for arg in [
+            "--safe-mode",
+            "--bare",
+            "--background",
+            "--bg",
+            "--remote-control",
+            "--tmux",
+            "--worktree",
+        ] {
             let error = plan(&["claude", arg]).unwrap_err();
             assert!(
                 error.contains("automatic notice"),
@@ -2107,6 +2265,75 @@ mod tests {
             super::take_claude_notice(&state),
             super::ClaudeNoticeRead::Empty
         );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_notice_degrades_on_malformed_or_invalid_current_records_then_recovers() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-corrupt-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
+        let invalid_lines = [
+            "{not-json}".to_string(),
+            serde_json::json!({"request_id":"test-token:missing-action"}).to_string(),
+            serde_json::json!({"action":"request","masked":1}).to_string(),
+            serde_json::json!({
+                "action":"request",
+                "request_id":"test-token:wrong-masked",
+                "masked":"1",
+                "blocked":false,
+                "detectors":["aws_key"]
+            })
+            .to_string(),
+            serde_json::json!({
+                "action":"request",
+                "request_id":"test-token:zero-invalid-detector",
+                "masked":0,
+                "blocked":false,
+                "detectors":[42]
+            })
+            .to_string(),
+            serde_json::json!({
+                "action":"request",
+                "request_id":"test-token:blocked-invalid-detector",
+                "masked":1,
+                "blocked":true,
+                "detectors":[42]
+            })
+            .to_string(),
+        ];
+
+        for (index, invalid) in invalid_lines.into_iter().enumerate() {
+            let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
+            audit.record_request(&format!("valid-before-{index}"), 1, &["aws_key"], 100, 90);
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open audit corruption fixture");
+            writeln!(file, "{invalid}").expect("append corrupt audit record");
+            drop(file);
+
+            assert_eq!(
+                super::take_claude_notice(&state),
+                super::ClaudeNoticeRead::Degraded
+            );
+            let recovery =
+                crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
+            recovery.record_request(&format!("recovery-{index}"), 1, &["github_token"], 100, 90);
+            let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
+                panic!("expected notice recovery after corruption case {index}");
+            };
+            assert_eq!(notice.masked, 1);
+            assert_eq!(
+                notice.detectors,
+                BTreeSet::from(["github_token".to_string()])
+            );
+        }
         std::fs::remove_file(path).ok();
     }
 
@@ -2232,31 +2459,36 @@ mod tests {
                     "a".repeat(super::CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES)
                 ),
                 "masked": 1,
-                "detectors": ["aws_key"]
+                "detectors": ["aws_key"],
+                "blocked": false
             }),
             serde_json::json!({
                 "action": "request",
                 "request_id": "test-token:invalid-character",
                 "masked": 1,
-                "detectors": ["aws-key"]
+                "detectors": ["aws-key"],
+                "blocked": false
             }),
             serde_json::json!({
                 "action": "request",
                 "request_id": "test-token:oversized-detector",
                 "masked": 1,
-                "detectors": ["a".repeat(super::CLAUDE_NOTICE_MAX_DETECTOR_BYTES + 1)]
+                "detectors": ["a".repeat(super::CLAUDE_NOTICE_MAX_DETECTOR_BYTES + 1)],
+                "blocked": false
             }),
             serde_json::json!({
                 "action": "request",
                 "request_id": "test-token:too-many-detectors",
                 "masked": 1,
-                "detectors": too_many_detectors
+                "detectors": too_many_detectors,
+                "blocked": false
             }),
             serde_json::json!({
                 "action": "request",
                 "request_id": "test-token:non-string-detector",
                 "masked": 1,
-                "detectors": [42]
+                "detectors": [42],
+                "blocked": false
             }),
         ];
 

@@ -40,8 +40,10 @@ and auto-generated notes also live on the
   and exit, instead of starting the proxy.
 - `promtect guard claude` now overrides persisted Claude base-URL settings and
   disables third-party provider selectors for the guarded session, preventing
-  those settings from routing requests around Promtect. Authentication remains
-  inherited and is never serialized into process arguments.
+  those settings from routing requests around Promtect. Authentication environment
+  overrides are rejected; Claude guard supports only a verified, stored, unmanaged
+  individual Claude Max credential. Credentials are never serialized into process
+  arguments or temporary settings.
 - Guard dashboards now fall back to a free loopback port when the preferred port
   is occupied and print the exact URL, instead of silently leaving users on a
   stale dashboard from another process.
