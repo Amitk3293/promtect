@@ -22,10 +22,21 @@ pub struct Metrics {
     pub requests_total: u64,
     /// Requests where at least one secret was masked.
     pub requests_with_secrets: u64,
-    /// Requests that contained no detectable secrets.
+    /// Forwarded requests that contained no detectable secrets. Requests
+    /// rejected before forwarding are counted separately and never as clean.
     pub requests_clean: u64,
     /// Total count of individual secret spans masked (summed over all requests).
     pub secrets_masked_total: u64,
+    /// Requests rejected before forwarding because Promtect could not safely
+    /// protect them (for example residual secrets, encoding, or body limits).
+    pub requests_blocked_total: u64,
+    /// Distinct request sentinels restored into response streams.
+    pub secrets_restored_total: u64,
+    /// Value-free failure events, including upstream failures, restoration
+    /// misses, and interrupted response streams.
+    pub failures_total: u64,
+    /// Response streams that ended with an upstream transport interruption.
+    pub stream_interruptions_total: u64,
     /// Per-detector secret counts (e.g. `"aws_key" -> 5`).
     pub by_detector: BTreeMap<String, u64>,
     /// Total inbound body bytes (before masking).
@@ -54,6 +65,25 @@ pub struct RecentRequest {
     pub masked: u64,
     /// Detector kinds that fired (de-duplicated, same order as logged).
     pub detectors: Vec<String>,
+    /// Whether Promtect blocked the request before it reached upstream.
+    pub blocked: bool,
+    /// Number of distinct sentinels restored in this response.
+    pub restored: u64,
+    /// Number of response-side secrets reported by the paid output scanner.
+    pub output_secrets: u64,
+    /// Number of value-free failure events associated with this request.
+    pub failures: u64,
+    /// Whether the upstream response stream was interrupted.
+    pub interrupted: bool,
+}
+
+#[derive(Debug, Default)]
+struct RequestEvents {
+    blocked: bool,
+    restored: u64,
+    output_secrets: u64,
+    failures: u64,
+    interrupted: bool,
 }
 
 /// How many recent-request summaries to keep in [`Metrics::recent`].
@@ -90,8 +120,8 @@ fn is_valid_detector_name(name: &str) -> bool {
 ///   the lines that are valid.
 /// - Detector names that are not `[a-z0-9_]+` are dropped (see
 ///   [`is_valid_detector_name`]) so an untrusted name cannot inject a label line.
-/// - Only `"request"` and `"mask"` actions contribute to counters; `"unmask"` and
-///   any unknown actions are silently ignored.
+/// - Known lifecycle actions contribute to separate mask, block, restore,
+///   output-secret, and failure counters; unknown actions are ignored.
 /// - `recent` is returned newest-first by `ts_ms` (the on-disk order is not
 ///   trusted because the proxy is concurrent), capped at [`RECENT_CAP`].
 ///
@@ -110,6 +140,7 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
     let reader = std::io::BufReader::new(file);
 
     let mut m = Metrics::default();
+    let mut request_events: BTreeMap<String, RequestEvents> = BTreeMap::new();
 
     for line in reader.lines() {
         // A mid-stream I/O error (e.g. concurrent truncation) ends iteration; the
@@ -132,7 +163,13 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                 m.requests_total += 1;
 
                 let masked = val.get("masked").and_then(|v| v.as_u64()).unwrap_or(0);
-                if masked > 0 {
+                let blocked = val
+                    .get("blocked")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if blocked {
+                    // Counted by the paired request_blocked/request_rejected event.
+                } else if masked > 0 {
                     m.requests_with_secrets += 1;
                 } else {
                     m.requests_clean += 1;
@@ -165,6 +202,11 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                     request_id,
                     masked,
                     detectors,
+                    blocked,
+                    restored: 0,
+                    output_secrets: 0,
+                    failures: 0,
+                    interrupted: false,
                 });
                 // No interim cap: the final sort+truncate at the end of this
                 // function handles ordering correctly without O(N²) interim sorts.
@@ -191,9 +233,60 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                 {
                     *m.output_by_detector.entry(det.to_string()).or_default() += 1;
                 }
+                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
+                    request_events
+                        .entry(request_id.to_string())
+                        .or_default()
+                        .output_secrets += 1;
+                }
             }
-            // "unmask" and unknown actions are intentionally ignored for counts.
+            "unmask" => {
+                m.secrets_restored_total += 1;
+                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
+                    request_events
+                        .entry(request_id.to_string())
+                        .or_default()
+                        .restored += 1;
+                }
+            }
+            "request_blocked" | "request_rejected" => {
+                m.requests_blocked_total += 1;
+                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
+                    request_events
+                        .entry(request_id.to_string())
+                        .or_default()
+                        .blocked = true;
+                }
+            }
+            "stream_interrupted" => {
+                m.stream_interruptions_total += 1;
+                m.failures_total += 1;
+                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
+                    let events = request_events.entry(request_id.to_string()).or_default();
+                    events.failures += 1;
+                    events.interrupted = true;
+                }
+            }
+            "request_failed" | "unmask_miss" | "mask_skip" => {
+                m.failures_total += 1;
+                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
+                    request_events
+                        .entry(request_id.to_string())
+                        .or_default()
+                        .failures += 1;
+                }
+            }
             _ => {}
+        }
+    }
+
+    for recent in &mut m.recent {
+        if let Some(events) = request_events.get(&recent.request_id) {
+            recent.blocked = events.blocked;
+            recent.restored = events.restored;
+            recent.output_secrets = events.output_secrets;
+            recent.failures = events.failures;
+            recent.interrupted = events.interrupted;
         }
     }
 
@@ -256,6 +349,35 @@ impl Metrics {
                 "promtect_secrets_masked_total{{detector=\"{detector}\"}} {count}\n"
             ));
         }
+
+        push_counter(
+            &mut out,
+            "promtect_requests_blocked_total",
+            "Requests Promtect blocked before forwarding.",
+            self.requests_blocked_total,
+            None,
+        );
+        push_counter(
+            &mut out,
+            "promtect_secrets_restored_total",
+            "Distinct request sentinels restored in responses.",
+            self.secrets_restored_total,
+            None,
+        );
+        push_counter(
+            &mut out,
+            "promtect_failures_total",
+            "Value-free request and response failure events.",
+            self.failures_total,
+            None,
+        );
+        push_counter(
+            &mut out,
+            "promtect_stream_interruptions_total",
+            "Upstream response streams that ended unexpectedly.",
+            self.stream_interruptions_total,
+            None,
+        );
 
         // Pro output scan: secrets found in the RESPONSE (model-echoed/generated).
         push_counter(
@@ -361,6 +483,16 @@ mod tests {
             r#"{{"ts_ms":5000,"action":"output_secret","detector":"aws_key","placeholder":"«output-scan»","request_id":"req-2"}}"#
         )
         .unwrap();
+        writeln!(
+            f,
+            r#"{{"ts_ms":5200,"action":"request_blocked","detector":"residual_secret","placeholder":"«residual-secret»","request_id":"req-2"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"ts_ms":5300,"action":"stream_interrupted","detector":"upstream","placeholder":"«stream-interrupted»","request_id":"req-2"}}"#
+        )
+        .unwrap();
         writeln!(f, "{{not valid json{{").unwrap();
 
         (aggregate(&path), path)
@@ -387,6 +519,56 @@ mod tests {
         assert_eq!(m.output_by_detector.get("aws_key"), Some(&1));
         assert!(prom.contains("promtect_output_secrets_total 1"));
         assert!(prom.contains("promtect_output_secrets_by_detector{detector=\"aws_key\"} 1"));
+    }
+
+    #[test]
+    fn aggregate_keeps_mask_restore_block_output_and_failure_outcomes_distinct() {
+        let (m, path) = fixture_metrics();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(m.secrets_masked_total, 3);
+        assert_eq!(m.secrets_restored_total, 1);
+        assert_eq!(m.requests_blocked_total, 1);
+        assert_eq!(m.output_secrets_total, 1);
+        assert_eq!(m.failures_total, 1);
+        assert_eq!(m.stream_interruptions_total, 1);
+        let req_2 = m
+            .recent
+            .iter()
+            .find(|request| request.request_id == "req-2")
+            .expect("req-2 recent entry");
+        assert!(req_2.blocked);
+        assert!(req_2.interrupted);
+        assert_eq!(req_2.output_secrets, 1);
+    }
+
+    #[test]
+    fn aggregate_keeps_early_blocked_requests_out_of_clean_counts() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-metrics-early-block-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).expect("create early-block audit");
+        writeln!(
+            f,
+            r#"{{"ts_ms":1000,"action":"request","request_id":"req-blocked","masked":0,"detectors":[],"bytes_in":0,"bytes_out":0,"blocked":true}}"#
+        )
+        .expect("write blocked request summary");
+        writeln!(
+            f,
+            r#"{{"ts_ms":1001,"action":"request_rejected","detector":"content_encoding","placeholder":"«unsupported-content-encoding»","request_id":"req-blocked"}}"#
+        )
+        .expect("write blocked request outcome");
+
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(m.requests_total, 1);
+        assert_eq!(m.requests_clean, 0);
+        assert_eq!(m.requests_with_secrets, 0);
+        assert_eq!(m.requests_blocked_total, 1);
+        assert_eq!(m.recent.len(), 1);
+        assert!(m.recent[0].blocked);
     }
 
     #[test]

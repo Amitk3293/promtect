@@ -1,6 +1,6 @@
 PORT ?= 8790
 
-.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test up down clean
+.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test dashboard-browser-test up down clean
 
 build:
 	cargo build --release
@@ -40,6 +40,9 @@ docker-run:
 # Docker-only test gate (fmt + clippy + cargo test). Used while GH Actions CI is capped.
 docker-test:
 	docker-compose -f docker-compose.test.yml run --rm test
+
+dashboard-browser-test:
+	bash tests/dashboard-browser/run.sh
 
 up:
 	docker-compose up -d || docker compose up -d

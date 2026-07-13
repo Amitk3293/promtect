@@ -497,9 +497,13 @@ async fn vault_does_not_bleed_secrets_across_requests() {
 #[tokio::test]
 async fn oversized_body_is_rejected_with_413() {
     let (mock_url, seen) = spawn_mock().await;
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-oversized-body-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
     let small_cap = promtect::proxy::Ctx {
         upstream: mock_url.clone(),
-        audit: Arc::new(promtect::audit::Audit::null()),
+        audit: Arc::new(promtect::audit::Audit::to_file(audit_path.clone())),
         client: reqwest::Client::new(),
         max_body_bytes: 64,
         restore: true,
@@ -511,6 +515,8 @@ async fn oversized_body_is_rejected_with_413() {
 
     let body = "x".repeat(4096); // far over the 64-byte cap, still tiny
     let (status, _text) = post_through(&promtect_url, &body).await;
+    let metrics = promtect::metrics::aggregate(&audit_path);
+    std::fs::remove_file(&audit_path).ok();
 
     assert_eq!(status, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     // Rejected before forwarding: the upstream must never have seen the body.
@@ -518,6 +524,11 @@ async fn oversized_body_is_rejected_with_413() {
         seen.body.lock().unwrap().is_empty(),
         "upstream must not receive a body that exceeded the cap"
     );
+    assert_eq!(metrics.requests_total, 1);
+    assert_eq!(metrics.requests_clean, 0);
+    assert_eq!(metrics.requests_blocked_total, 1);
+    assert_eq!(metrics.recent.len(), 1);
+    assert!(metrics.recent[0].blocked);
 }
 
 /// A body within the cap passes straight through (masked, then forwarded). The
@@ -664,6 +675,7 @@ async fn non_utf8_content_encoding_is_value_free_and_opens_no_upstream_socket() 
     );
 
     let audit = std::fs::read_to_string(&audit_path).unwrap();
+    let metrics = promtect::metrics::aggregate(&audit_path);
     assert!(audit.contains(r#""action":"request_rejected""#));
     assert!(audit.contains(r#""detector":"content_encoding""#));
     assert!(audit.contains("«unsupported-content-encoding»"));
@@ -675,6 +687,11 @@ async fn non_utf8_content_encoding_is_value_free_and_opens_no_upstream_socket() 
         !audit.contains(body_marker),
         "audit reflects request-body content"
     );
+    assert_eq!(metrics.requests_total, 1);
+    assert_eq!(metrics.requests_clean, 0);
+    assert_eq!(metrics.requests_blocked_total, 1);
+    assert_eq!(metrics.recent.len(), 1);
+    assert!(metrics.recent[0].blocked);
 
     let _ = std::fs::remove_file(audit_path);
 }
@@ -793,6 +810,175 @@ async fn spawn_stream_mock() -> (String, Seen) {
         .with_state(seen.clone());
     let url = spawn(app).await;
     (url, seen)
+}
+
+fn truncate_before_sentinel_close(masked: &str) -> String {
+    let close = masked
+        .find('»')
+        .expect("masked request contains a sentinel close");
+    masked[..close].to_string()
+}
+
+async fn mock_interrupted_stream(
+    State(seen): State<Seen>,
+    body: String,
+) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    let partial = truncate_before_sentinel_close(&body);
+    let first = futures_util::stream::once(async move {
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(partial))
+    });
+    let failure = futures_util::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("synthetic interrupted stream"))
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(futures_util::StreamExt::chain(
+            first, failure,
+        )))
+        .unwrap()
+}
+
+async fn mock_timed_out_stream(State(seen): State<Seen>, body: String) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    let partial = truncate_before_sentinel_close(&body);
+    let first = futures_util::stream::once(async move {
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(partial))
+    });
+    let stalled = futures_util::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(b"late"))
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(futures_util::StreamExt::chain(
+            first, stalled,
+        )))
+        .unwrap()
+}
+
+async fn assert_interrupted_stream_is_client_visible(
+    upstream_handler: axum::routing::MethodRouter<Seen>,
+    read_timeout: Option<std::time::Duration>,
+) {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let request_body = format!(r#"{{"content":"{aws}"}}"#);
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-stream-recovery-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let seen = Seen::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/", upstream_handler)
+            .with_state(seen.clone()),
+    )
+    .await;
+    let mut proxy_ctx = ctx(&upstream);
+    proxy_ctx.audit = Arc::new(promtect::audit::Audit::to_file(audit_path.clone()));
+    if let Some(timeout) = read_timeout {
+        proxy_ctx.client = reqwest::Client::builder()
+            .read_timeout(timeout)
+            .build()
+            .expect("timeout test client");
+    }
+    let proxy = spawn(promtect::proxy::app(proxy_ctx)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/"))
+        .header("content-type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("proxy response headers");
+    assert_eq!(
+        response
+            .headers()
+            .get("trailer")
+            .and_then(|v| v.to_str().ok()),
+        Some("promtect-stream-outcome")
+    );
+    let body_result = response.bytes().await;
+    let masked = seen.body.lock().unwrap().clone();
+    let audit = std::fs::read_to_string(&audit_path).expect("stream recovery audit");
+    std::fs::remove_file(&audit_path).ok();
+
+    assert!(
+        body_result.is_err(),
+        "ordinary clients must not accept a truncated upstream body as complete"
+    );
+    assert!(!masked.contains(aws));
+    assert!(audit.contains("\"action\":\"stream_interrupted\""));
+    assert!(!audit.contains(aws));
+}
+
+#[tokio::test]
+async fn interrupted_stream_is_client_visible_and_audited() {
+    assert_interrupted_stream_is_client_visible(post(mock_interrupted_stream), None).await;
+}
+
+#[tokio::test]
+async fn interrupted_stream_emits_safe_prefix_then_aborts_http1_body() {
+    let seen = Seen::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/", post(mock_interrupted_stream))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let proxy = spawn(promtect::proxy::app(ctx(&upstream))).await;
+    let authority = proxy
+        .strip_prefix("http://")
+        .expect("spawn returns an HTTP URL");
+    let body = r#"{"content":"AKIAIOSFODNN7EXAMPLE"}"#;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nTE: trailers\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    let mut socket = tokio::net::TcpStream::connect(authority)
+        .await
+        .expect("connect raw HTTP/1.1 client to proxy");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw HTTP/1.1 request");
+    let mut wire = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.read_to_end(&mut wire),
+    )
+    .await
+    .expect("proxy closes Connection: close response")
+    .expect("read raw HTTP/1.1 response");
+    let masked = seen.body.lock().unwrap().clone();
+    let partial = truncate_before_sentinel_close(&masked);
+    let expected = partial
+        .split_once('«')
+        .map_or(partial.as_str(), |(prefix, _)| prefix);
+    let wire_text = String::from_utf8_lossy(&wire).to_ascii_lowercase();
+
+    assert!(wire_text.contains("trailer: promtect-stream-outcome\r\n"));
+    assert!(
+        wire.windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "bytes emitted before the held sentinel carry were not delivered before the body error"
+    );
+    assert!(
+        !wire_text.ends_with("0\r\npromtect-stream-outcome: complete\r\n\r\n")
+            && !wire_text.ends_with("0\r\npromtect-stream-outcome: interrupted\r\n\r\n"),
+        "an interrupted response must not carry a successful terminal chunk: {wire_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn timed_out_stream_is_client_visible_and_audited() {
+    assert_interrupted_stream_is_client_visible(
+        post(mock_timed_out_stream),
+        Some(std::time::Duration::from_millis(50)),
+    )
+    .await;
 }
 
 /// A sentinel split across streamed chunk boundaries is fully reassembled and
