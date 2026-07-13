@@ -14,6 +14,7 @@ from threading import Lock
 from urllib.parse import parse_qs, urlparse
 
 SYNTHETIC_SECRET = "AKIAIOSFODNN7EXAMPLE"
+PROMTECT_NOTICE_MARKER = "Promtect prevented an exposure"
 SENTINEL_RE = re.compile(r"«promtect:[a-z_]+:[0-9a-f]+»")
 PROMPT_PATHS = {
     "/v1/messages",
@@ -329,6 +330,7 @@ class Handler(BaseHTTPRequestHandler):
             "content_encoding_seen": self.headers.get("content-encoding"),
             "hostile_header_seen": self.headers.get("x-promtect-hostile") is not None,
             "plaintext_canary_seen": leaked,
+            "promtect_notice_seen": PROMTECT_NOTICE_MARKER in text,
             "sentinel_seen": sentinel_match is not None,
         }
         if source == "protocol-fixture":

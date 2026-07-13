@@ -14,6 +14,12 @@
 
 use crate::audit::Audit;
 use crate::proxy::{self, Ctx, resolve_upstream};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::routing::post;
+use axum::{Json, Router};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, Seek};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,6 +64,7 @@ const CLAUDE_PROVIDER_SELECTORS: &[&str] = &[
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
 ];
+const CLAUDE_NOTICE_ROUTE: &str = "/_promtect/hooks/{token}";
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
     args.get(i + 1)
@@ -200,7 +207,7 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
         && let Some(key) = conflicting_claude_override(&tool_args)
     {
         return Err(format!(
-            "Claude argument {key:?} can override Promtect routing; remove it (guard injects protected settings automatically)"
+            "Claude argument {key:?} conflicts with Promtect's protected routing or automatic notice; remove it (guard injects protected settings automatically)"
         ));
     }
 
@@ -326,16 +333,17 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
     })
 }
 
-/// Return the first Claude settings argument that could override the
-/// guard-owned base URL. Claude accepts both `--settings VALUE` and
-/// `--settings=VALUE`; rejecting either avoids argument-order-dependent routing.
+/// Return the first Claude argument that conflicts with guard-owned routing or
+/// disables the automatic, Promtect-owned in-session notice.
 fn conflicting_claude_override(args: &[String]) -> Option<&str> {
-    args.iter()
-        .map(String::as_str)
-        .find(|arg| *arg == "--settings" || arg.starts_with("--settings="))
+    args.iter().map(String::as_str).find(|arg| {
+        *arg == "--settings"
+            || arg.starts_with("--settings=")
+            || matches!(*arg, "--safe-mode" | "--bare")
+    })
 }
 
-fn claude_settings_args(base_url: &str) -> [String; 2] {
+fn claude_settings_args(base_url: &str, notice_url: &str) -> [String; 2] {
     let mut env = serde_json::Map::new();
     env.insert(CLAUDE_BASE_VAR.to_string(), serde_json::json!(base_url));
     for selector in CLAUDE_PROVIDER_SELECTORS {
@@ -345,8 +353,241 @@ fn claude_settings_args(base_url: &str) -> [String; 2] {
     }
     [
         "--settings".to_string(),
-        serde_json::json!({ "env": env }).to_string(),
+        serde_json::json!({
+            "env": env,
+            "hooks": {
+                "Stop": [{
+                    "hooks": [{
+                        "type": "http",
+                        "url": notice_url,
+                        "timeout": 5
+                    }]
+                }]
+            }
+        })
+        .to_string(),
     ]
+}
+
+#[derive(Clone)]
+struct ClaudeNoticeState {
+    audit_path: Arc<std::path::PathBuf>,
+    cursor: Arc<std::sync::Mutex<u64>>,
+    token: Arc<str>,
+    strict: bool,
+}
+
+impl ClaudeNoticeState {
+    fn new(audit_path: impl Into<std::path::PathBuf>, token: String, strict: bool) -> Self {
+        let audit_path = audit_path.into();
+        let cursor = std::fs::metadata(&audit_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        Self {
+            audit_path: Arc::new(audit_path),
+            cursor: Arc::new(std::sync::Mutex::new(cursor)),
+            token: token.into(),
+            strict,
+        }
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClaudeNotice {
+    masked: u64,
+    detectors: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct RequestNotice {
+    masked: u64,
+    detectors: BTreeSet<String>,
+}
+
+fn valid_detector_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+/// Read only complete audit records written since the previous Claude Stop hook.
+/// The result contains counts and detector kinds, never request bodies or values.
+fn take_claude_notice(state: &ClaudeNoticeState) -> Option<ClaudeNotice> {
+    let mut cursor = state
+        .cursor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut file = std::fs::File::open(state.audit_path.as_path()).ok()?;
+    let len = file.metadata().ok()?.len();
+    if *cursor > len {
+        // A rotated/truncated audit must not replay an earlier session's events.
+        *cursor = len;
+        return None;
+    }
+    file.seek(std::io::SeekFrom::Start(*cursor)).ok()?;
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut requests: BTreeMap<String, RequestNotice> = BTreeMap::new();
+    let mut unsuccessful = BTreeSet::new();
+    let mut next_cursor = *cursor;
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).ok()?;
+        if bytes == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            // A writer may still be completing this record. Leave it pending for
+            // the next hook instead of accepting a partial JSON object.
+            break;
+        }
+        next_cursor = next_cursor.saturating_add(bytes as u64);
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(action) = value.get("action").and_then(|field| field.as_str()) else {
+            continue;
+        };
+        let Some(request_id) = value
+            .get("request_id")
+            .and_then(|field| field.as_str())
+            .filter(|request_id| !request_id.is_empty())
+        else {
+            continue;
+        };
+
+        match action {
+            "request" => {
+                let masked = value
+                    .get("masked")
+                    .and_then(|field| field.as_u64())
+                    .unwrap_or(0);
+                if masked == 0 {
+                    continue;
+                }
+                if value
+                    .get("blocked")
+                    .and_then(|field| field.as_bool())
+                    .unwrap_or(false)
+                {
+                    unsuccessful.insert(request_id.to_string());
+                    continue;
+                }
+                let entry = requests.entry(request_id.to_string()).or_default();
+                entry.masked = entry.masked.saturating_add(masked);
+                if let Some(detectors) = value.get("detectors").and_then(|field| field.as_array()) {
+                    entry.detectors.extend(
+                        detectors
+                            .iter()
+                            .filter_map(|detector| detector.as_str())
+                            .filter(|detector| valid_detector_name(detector))
+                            .map(str::to_string),
+                    );
+                }
+            }
+            "request_blocked" | "request_rejected" | "request_failed" => {
+                unsuccessful.insert(request_id.to_string());
+            }
+            _ => {}
+        }
+    }
+    *cursor = next_cursor;
+
+    let mut notice = ClaudeNotice::default();
+    for (request_id, request) in requests {
+        if unsuccessful.contains(&request_id) {
+            continue;
+        }
+        notice.masked = notice.masked.saturating_add(request.masked);
+        notice.detectors.extend(request.detectors);
+    }
+    (notice.masked > 0).then_some(notice)
+}
+
+fn detector_display_name(kind: &str) -> String {
+    match kind {
+        "aws_key" => "AWS access key".to_string(),
+        "anthropic_key" => "Anthropic API key".to_string(),
+        "github_token" => "GitHub token".to_string(),
+        "stripe_key" => "Stripe API key".to_string(),
+        _ => kind.replace('_', " "),
+    }
+}
+
+fn format_claude_notice(notice: &ClaudeNotice, strict: bool) -> String {
+    let detector_label = if notice.detectors.len() == 1 {
+        "Detector"
+    } else {
+        "Detectors"
+    };
+    let detectors = notice
+        .detectors
+        .iter()
+        .map(|kind| format!("{} (`{kind}`)", detector_display_name(kind)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut message = format!(
+        "🛡 Promtect prevented an exposure — masked {} sensitive value{} before {} left your machine. {detector_label}: {detectors}.",
+        notice.masked,
+        if notice.masked == 1 { "" } else { "s" },
+        if notice.masked == 1 { "it" } else { "they" },
+    );
+    if strict {
+        message.push_str(" Strict mode: plaintext restoration off.");
+    }
+    message
+}
+
+async fn claude_notice_hook(
+    State(state): State<ClaudeNoticeState>,
+    Path(token): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if token != state.token.as_ref() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({})));
+    }
+    let body = take_claude_notice(&state).map_or_else(
+        || serde_json::json!({}),
+        |notice| {
+            serde_json::json!({
+                "systemMessage": format_claude_notice(&notice, state.strict)
+            })
+        },
+    );
+    (StatusCode::OK, Json(body))
+}
+
+async fn bind_guard_dashboard(preferred_port: u16) -> Option<(tokio::net::TcpListener, u16)> {
+    let preferred_addr = format!("127.0.0.1:{preferred_port}");
+    match tokio::net::TcpListener::bind(&preferred_addr).await {
+        Ok(listener) => Some((listener, preferred_port)),
+        Err(preferred_error) => match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => match listener.local_addr() {
+                Ok(address) => {
+                    eprintln!(
+                        "promtect guard: dashboard port {preferred_port} is unavailable ({preferred_error}); using {} for this session.\n  Do not use an existing page on port {preferred_port}; it is not this guard session.",
+                        address.port()
+                    );
+                    Some((listener, address.port()))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "promtect guard: dashboard unavailable (could not read fallback address: {error})"
+                    );
+                    None
+                }
+            },
+            Err(fallback_error) => {
+                eprintln!(
+                    "promtect guard: dashboard unavailable: {preferred_addr} is occupied ({preferred_error}) and fallback bind failed ({fallback_error})"
+                );
+                None
+            }
+        },
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -782,7 +1023,21 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         );
     }
 
-    let app = proxy::app(ctx);
+    let (app, claude_notice_url) = if plan.claude_fail_closed {
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let notice_url = format!("{base_url}/_promtect/hooks/{token}");
+        let notice_state = ClaudeNoticeState::new(
+            std::path::PathBuf::from(&audit_path_for_dash),
+            token,
+            !plan.restore,
+        );
+        let notice_router = Router::new()
+            .route(CLAUDE_NOTICE_ROUTE, post(claude_notice_hook))
+            .with_state(notice_state);
+        (notice_router.merge(proxy::app(ctx)), Some(notice_url))
+    } else {
+        (proxy::app(ctx), None)
+    };
     let proxy_task = tokio::spawn(async move {
         // Drain in-flight proxy requests on SIGINT / SIGTERM so secrets masked
         // in a partially-buffered response are fully restored before the socket
@@ -823,31 +1078,31 @@ pub async fn guard(plan: GuardPlan) -> i32 {
 
     // Auto-start the dashboard so guard sessions get the same metrics UI as the
     // standalone proxy. Uses the same audit log, so guard traffic appears there.
-    // Non-fatal: if the port is taken (e.g. another guard session), skip silently.
+    // If the preferred port is occupied, bind an ephemeral loopback port and print
+    // the actual URL. Silently skipping here can leave a stale, unrelated dashboard
+    // on the preferred port looking authoritative for this session.
     let mut dashboard_task = None;
-    if let Ok(dash_port) = proxy::parse_port(
+    if let Ok(preferred_port) = proxy::parse_port(
         "PROMTECT_DASHBOARD_PORT",
         std::env::var("PROMTECT_DASHBOARD_PORT").ok().as_deref(),
         8799,
-    ) {
-        let dash_addr = format!("127.0.0.1:{dash_port}");
-        if let Ok(dash_listener) = tokio::net::TcpListener::bind(&dash_addr).await {
-            let dash_app = crate::dashboard::app(crate::dashboard::DashCtx {
-                audit_path: Arc::new(audit_path_for_dash.as_str().into()),
-                restore_enabled: plan.restore,
-            });
-            dashboard_task = Some(tokio::spawn(async move {
-                // Drain in-flight dashboard requests on signal so metrics
-                // pages aren't truncated when guard exits.
-                if let Err(e) = axum::serve(dash_listener, dash_app)
-                    .with_graceful_shutdown(crate::proxy::shutdown_signal())
-                    .await
-                {
-                    eprintln!("promtect guard: dashboard error: {e}");
-                }
-            }));
-            eprintln!("  dashboard: http://127.0.0.1:{dash_port}");
-        }
+    ) && let Some((dash_listener, dash_port)) = bind_guard_dashboard(preferred_port).await
+    {
+        let dash_app = crate::dashboard::app(crate::dashboard::DashCtx {
+            audit_path: Arc::new(audit_path_for_dash.as_str().into()),
+            restore_enabled: plan.restore,
+        });
+        dashboard_task = Some(tokio::spawn(async move {
+            // Drain in-flight dashboard requests on signal so metrics
+            // pages aren't truncated when guard exits.
+            if let Err(e) = axum::serve(dash_listener, dash_app)
+                .with_graceful_shutdown(crate::proxy::shutdown_signal())
+                .await
+            {
+                eprintln!("promtect guard: dashboard error: {e}");
+            }
+        }));
+        eprintln!("  dashboard: http://127.0.0.1:{dash_port}");
     }
 
     // Inherit the full parent env (so the user's API keys flow through, forwarded
@@ -862,7 +1117,9 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         // Claude settings.json `env` values override the child process
         // environment. Use Claude's documented highest-precedence inline
         // settings so a persistent gateway cannot bypass this proxy.
-        cmd.args(claude_settings_args(&base_url));
+        if let Some(notice_url) = claude_notice_url.as_deref() {
+            cmd.args(claude_settings_args(&base_url, notice_url));
+        }
     }
     cmd.args(&plan.tool_args)
         .env(&plan.base_var, &base_url)
@@ -1068,12 +1325,25 @@ mod tests {
 
     #[test]
     fn claude_inline_settings_force_guard_owned_routing() {
+        let args = claude_settings_args(
+            "http://127.0.0.1:12345",
+            "http://127.0.0.1:12345/_promtect/hooks/test-token",
+        );
+        assert_eq!(args[0], "--settings");
+        let settings: serde_json::Value =
+            serde_json::from_str(&args[1]).expect("inline Claude settings must be JSON");
         assert_eq!(
-            claude_settings_args("http://127.0.0.1:12345"),
-            [
-                "--settings".to_string(),
-                r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:12345","CLAUDE_CODE_USE_ANTHROPIC_AWS":"0","CLAUDE_CODE_USE_BEDROCK":"0","CLAUDE_CODE_USE_FOUNDRY":"0","CLAUDE_CODE_USE_MANTLE":"0","CLAUDE_CODE_USE_VERTEX":"0"}}"#.to_string(),
-            ]
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            "http://127.0.0.1:12345"
+        );
+        assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
+        assert_eq!(
+            settings["hooks"]["Stop"][0]["hooks"][0]["url"],
+            "http://127.0.0.1:12345/_promtect/hooks/test-token"
+        );
+        assert!(
+            !args[1].contains("additionalContext") && !args[1].contains("prompt"),
+            "the user-only notice must never become model context or a prompt"
         );
     }
 
@@ -1089,10 +1359,111 @@ mod tests {
         ] {
             let error = plan(&args).unwrap_err();
             assert!(
-                error.contains("can override Promtect routing"),
+                error.contains("conflicts with Promtect's protected routing"),
                 "expected fail-closed settings error for {args:?}, got {error:?}"
             );
         }
+    }
+
+    #[test]
+    fn claude_rejects_modes_that_disable_the_automatic_notice() {
+        for arg in ["--safe-mode", "--bare"] {
+            let error = plan(&["claude", arg]).unwrap_err();
+            assert!(
+                error.contains("automatic notice"),
+                "expected notice conflict for {arg:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_notice_is_value_free_and_consumed_once() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), true);
+        let audit = crate::audit::Audit::to_file(path.clone());
+        audit.record_request(
+            "request-1",
+            4,
+            &["aws_key", "anthropic_key", "github_token", "stripe_key"],
+            100,
+            120,
+        );
+
+        let notice = super::take_claude_notice(&state).expect("pending notice");
+        assert_eq!(notice.masked, 4);
+        assert_eq!(
+            notice.detectors,
+            BTreeSet::from([
+                "anthropic_key".to_string(),
+                "aws_key".to_string(),
+                "github_token".to_string(),
+                "stripe_key".to_string(),
+            ])
+        );
+        let message = super::format_claude_notice(&notice, true);
+        assert!(message.contains("masked 4 sensitive values"));
+        assert!(message.contains("AWS access key (`aws_key`)"));
+        assert!(message.contains("Strict mode: plaintext restoration off."));
+        assert!(!message.contains("AKIA"));
+        assert!(
+            super::take_claude_notice(&state).is_none(),
+            "a Stop hook must consume each notice exactly once"
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_notice_ignores_blocked_or_failed_requests() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-failed-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let audit = crate::audit::Audit::to_file(path.clone());
+        audit.record_request("request-blocked", 1, &["aws_key"], 100, 120);
+        audit.record(
+            "request_blocked",
+            "residual_secret",
+            "«residual-secret»",
+            "request-blocked",
+        );
+        audit.record_request("request-failed", 1, &["github_token"], 100, 120);
+        audit.record(
+            "request_failed",
+            "upstream",
+            "«upstream-request-failed»",
+            "request-failed",
+        );
+
+        assert!(super::take_claude_notice(&state).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn dashboard_uses_a_visible_fallback_when_default_port_is_occupied() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind occupied dashboard fixture");
+        let preferred_port = occupied
+            .local_addr()
+            .expect("read occupied dashboard fixture address")
+            .port();
+
+        let (fallback, fallback_port) = super::bind_guard_dashboard(preferred_port)
+            .await
+            .expect("dashboard fallback listener");
+
+        assert_ne!(fallback_port, preferred_port);
+        assert_eq!(
+            fallback
+                .local_addr()
+                .expect("read dashboard fallback address")
+                .port(),
+            fallback_port
+        );
     }
 
     #[test]

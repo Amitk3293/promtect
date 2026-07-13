@@ -24,6 +24,9 @@ and auto-generated notes also live on the
 - `promtect guard` prints a value-free end-of-session summary on exit (secrets masked
   this session, by detector, plus any output-scan findings), and stays quiet during
   the session so its notifications do not disturb a wrapped full-screen tool.
+- `promtect guard claude` shows a Promtect-owned, value-free notice in Claude after
+  a protected turn. The notice uses Claude's user-only Stop-hook `systemMessage`;
+  it does not alter prompts, model context, or provider response bytes.
 
 ### Changed
 - **Relicensed the core from Apache-2.0 to the Sustainable Use License (SUL v1.0)**,
@@ -39,6 +42,9 @@ and auto-generated notes also live on the
   disables third-party provider selectors for the guarded session, preventing
   those settings from routing requests around Promtect. Authentication remains
   inherited and is never serialized into process arguments.
+- Guard dashboards now fall back to a free loopback port when the preferred port
+  is occupied and print the exact URL, instead of silently leaving users on a
+  stale dashboard from another process.
 
 ## [0.1.7]
 

@@ -114,7 +114,52 @@ assert len(window) == 1, f"Claude guard made unexpected upstream requests: {wind
 match = protected[0]
 assert match.get("plaintext_canary_seen") is False, match
 assert match.get("sentinel_seen") is True, match
+assert match.get("promtect_notice_seen") is False, (
+    f"Promtect notice entered Claude model context: {match!r}"
+)
 assert "body" not in match, "real Claude body must not be retained"
+PY
+}
+
+assert_claude_notice() {
+  stdout_file=$1
+  stderr_file=$2
+  debug_file=$3
+  python3 - "$stdout_file" "$stderr_file" "$debug_file" "$SECRET" <<'PY'
+import pathlib
+import sys
+
+stdout_path, stderr_path, debug_path, secret = sys.argv[1:]
+stdout = pathlib.Path(stdout_path).read_text()
+stderr = pathlib.Path(stderr_path).read_text()
+debug = pathlib.Path(debug_path).read_text()
+marker = "Promtect prevented an exposure"
+expected = (
+    "🛡 Promtect prevented an exposure — masked 1 sensitive value before it left "
+    "your machine. Detector: AWS access key (`aws_key`)."
+)
+assert marker not in stdout, (
+    "the Promtect-owned notice entered Claude's model-result channel: "
+    f"{stdout!r}"
+)
+assert marker not in stderr, (
+    "headless Claude unexpectedly mixed the hook notice into Promtect diagnostics: "
+    f"{stderr!r}"
+)
+notice_lines = [line for line in debug.splitlines() if marker in line]
+assert debug.count("Hooks: HTTP hook response status 200") == 1, (
+    "expected exactly one successful Claude Stop-hook response"
+)
+assert debug.count("Successfully parsed and validated hook JSON output") == 1, (
+    "Claude did not validate exactly one Stop-hook response"
+)
+assert len(notice_lines) == 1, (
+    "expected exactly one Promtect-owned notice in Claude's validated hook response; "
+    f"notice_lines={notice_lines!r}"
+)
+assert expected in notice_lines[0], f"unexpected hook notice: {notice_lines!r}"
+assert secret not in notice_lines[0], "the hook notice must remain value-free"
+assert "«promtect:" not in notice_lines[0], "the hook notice exposed a sentinel"
 PY
 }
 
@@ -528,6 +573,7 @@ if ! HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_UPDATES=1 \
   PROMTECT_AUDIT=/tmp/claude-guard-audit.jsonl PROMTECT_DASHBOARD_PORT=18999 \
   promtect guard claude --upstream http://mock-provider:9000/guard-claude -- \
+    --debug-file /tmp/claude-guard.debug.log \
     --print --output-format text "$PROMPT" \
     > /tmp/claude-guard.stdout 2> /tmp/claude-guard.stderr; then
   printf 'FAIL Claude guard: hostile persisted settings prevented protected execution\n' >&2
@@ -537,12 +583,15 @@ fi
 claude_after=$(observer_count)
 assert_claude_guard_observation_window "$claude_before" "$claude_after"
 assert_output_restored "Claude guard with hostile persisted settings" /tmp/claude-guard.stdout
+assert_claude_notice \
+  /tmp/claude-guard.stdout /tmp/claude-guard.stderr /tmp/claude-guard.debug.log
 if ! grep -Fq 'this session masked 1 secret (aws_key)' /tmp/claude-guard.stderr; then
   printf 'FAIL Claude guard: value-free masking summary was absent\n' >&2
   sed -n '1,120p' /tmp/claude-guard.stderr >&2
   exit 1
 fi
 assert_guard_listener_teardown "Claude guard" /tmp/claude-guard.stderr
+printf 'PASS Claude guard: exactly one value-free Stop-hook notice stayed out of model output and context\n'
 printf 'PASS Claude guard: persisted base URL and Bedrock selector could not bypass Promtect\n'
 
 if ! HOME=/tmp/ollama OLLAMA_HOST="$PROXY" \
