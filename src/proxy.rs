@@ -24,8 +24,12 @@ use std::sync::Arc;
 /// (`PROMTECT_MAX_BODY_BYTES`) and testable without a multi-megabyte fixture.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+const UNSUPPORTED_CONTENT_ENCODING_MESSAGE: &str =
+    "promtect: unsupported request Content-Encoding; send an identity-encoded body";
+const UNSUPPORTED_CONTENT_ENCODING_AUDIT_MARKER: &str = "«unsupported-content-encoding»";
+
 /// Build a plain-text response without ever panicking. Used for Promtect's own
-/// error replies (413/502), where we fully control status and headers. The
+/// error replies (413/415/502), where we fully control status and headers. The
 /// fallback arm only fires for an impossible invalid-status case and still
 /// yields a valid `Response`, never a panic in the request path.
 fn text_response(status: u16, msg: impl Into<String>) -> Response {
@@ -245,9 +249,27 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     ctx.requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request_id = uuid::Uuid::new_v4().to_string();
+    let headers = req.headers().clone();
+
+    // SECURITY: reject compressed or malformed request bodies using headers only,
+    // before reading the body or constructing any upstream request. Promtect cannot
+    // safely scan encoded bytes, and forwarding them unscanned would leak secrets.
+    if !request_content_encoding_is_supported(&headers) {
+        ctx.audit.record(
+            "request_rejected",
+            "content_encoding",
+            UNSUPPORTED_CONTENT_ENCODING_AUDIT_MARKER,
+            &request_id,
+        );
+        eprintln!(
+            "[promtect] req {}: rejected unsupported request Content-Encoding",
+            &request_id[..8]
+        );
+        return text_response(415, UNSUPPORTED_CONTENT_ENCODING_MESSAGE);
+    }
+
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let headers = req.headers().clone();
 
     // Buffer the body with a hard cap. `to_bytes` returns Err once the stream
     // exceeds the limit, so we refuse oversized bodies with 413 instead of
@@ -381,6 +403,24 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             text_response(502, "promtect: upstream request failed".to_string())
         }
     }
+}
+
+/// Whether every request `Content-Encoding` value is a non-empty, identity-only
+/// coding list. An absent header is supported. Malformed bytes, empty tokens,
+/// unknown codings, and any non-identity coding fail closed.
+fn request_content_encoding_is_supported(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            let Ok(value) = value.to_str() else {
+                return false;
+            };
+            value.split(',').all(|coding| {
+                let coding = coding.trim();
+                !coding.is_empty() && coding.eq_ignore_ascii_case("identity")
+            })
+        })
 }
 
 /// Whether a *response* is a known binary/opaque type that must NOT be run
@@ -519,6 +559,88 @@ async fn restore_response(
 mod tests {
     use super::resolve_upstream;
     use super::{is_quiet, set_quiet};
+
+    fn headers_with_content_encoding(value: &'static str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_ENCODING,
+            axum::http::HeaderValue::from_static(value),
+        );
+        headers
+    }
+
+    #[test]
+    fn request_content_encoding_accepts_absent_header() {
+        assert!(super::request_content_encoding_is_supported(
+            &axum::http::HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn request_content_encoding_accepts_identity_with_case_and_whitespace() {
+        for value in ["identity", "IdEnTiTy", "identity , identity"] {
+            assert!(
+                super::request_content_encoding_is_supported(&headers_with_content_encoding(value)),
+                "{value:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_every_non_identity_coding() {
+        for value in [
+            "gzip",
+            "deflate",
+            "br",
+            "zstd",
+            "snappy",
+            "gzip, br",
+            "identity, gzip",
+            "GzIp",
+            "gzip , br",
+        ] {
+            assert!(
+                !super::request_content_encoding_is_supported(&headers_with_content_encoding(
+                    value
+                )),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_empty_or_malformed_lists() {
+        for value in ["", " ", ",", "identity,", ",identity"] {
+            assert!(
+                !super::request_content_encoding_is_supported(&headers_with_content_encoding(
+                    value
+                )),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_when_any_repeated_header_is_non_identity() {
+        let mut headers = headers_with_content_encoding("identity");
+        headers.append(
+            axum::http::header::CONTENT_ENCODING,
+            axum::http::HeaderValue::from_static("br"),
+        );
+
+        assert!(!super::request_content_encoding_is_supported(&headers));
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_non_utf8_header_value() {
+        let mut headers = axum::http::HeaderMap::new();
+        let value = axum::http::HeaderValue::from_bytes(b"\xff")
+            .expect("opaque non-UTF-8 header bytes are valid HeaderValue data");
+        assert!(value.to_str().is_err(), "test value must be non-UTF-8");
+        headers.insert(axum::http::header::CONTENT_ENCODING, value);
+
+        assert!(!super::request_content_encoding_is_supported(&headers));
+    }
 
     #[test]
     fn quiet_flag_round_trips() {

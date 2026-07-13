@@ -269,7 +269,10 @@ Promtect is a focused control, not a catch-everything. It's honest about its edg
 |---|---|
 | Known-format secrets in the request body (keys, tokens, DB-URL passwords, JWTs, PEM keys) | Unknown-format / high-entropy secrets with no recognizable shape |
 | UTF-8 text bodies of tools with a base-URL override (Claude Code, Cursor, Codex, Ollama, OpenRouter) | The model's **response** (restore only re-inserts what it masked) |
-| The streamed response (real-time restore, or strict mode) | Binary / multipart / base64 / compressed bodies |
+| The streamed response (real-time restore, or strict mode) | Binary / multipart / base64-encoded bodies |
+
+Requests with a non-identity `Content-Encoding` are rejected with HTTP 415 before
+Promtect contacts the upstream. Decompress the body before sending it through Promtect.
 | | Tools without a base-URL override (VS Code Copilot, browser chat) |
 
 Full scope and trust assumptions: **[THREAT-MODEL.md](THREAT-MODEL.md)**.
