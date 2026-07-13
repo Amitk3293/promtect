@@ -44,8 +44,16 @@ jobs:
       - name: Pin reviewed main source
         id: source
         shell: bash
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ] \
+            || { echo "release workflow must be dispatched from main" >&2; exit 1; }
+          [ "$GITHUB_SHA" = "$WORKFLOW_SHA" ] \
+            || { echo "workflow source SHA does not match dispatched main SHA" >&2; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$WORKFLOW_SHA" ] \
+            || { echo "checked-out workflow source is not exact" >&2; exit 1; }
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "tag must be a stable vX.Y.Z tag" >&2; exit 1; }
           main_ref="refs/remotes/origin/promtect-release-main"
@@ -63,6 +71,23 @@ jobs:
           tag_oid="$(git rev-parse "refs/tags/${TAG}")"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "tag_oid=$tag_oid" >> "$GITHUB_OUTPUT"
+
+  release-controls:
+    if: inputs.publish
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+      - name: Fail closed unless release controls already exist
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
+          PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
+          PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
 
   readiness:
     needs: validate
@@ -164,7 +189,7 @@ jobs:
 
   publish:
     if: inputs.publish
-    needs: [validate, verify]
+    needs: [validate, verify, release-controls]
     runs-on: ubuntu-latest
     environment: core-release
     permissions:
@@ -180,6 +205,12 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           fetch-depth: 0
+      - name: Recheck controls after environment approval
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
+          PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
+          PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
       - name: Require exact publication confirmation
         env:
           CONFIRMATION: ${{ inputs.publish_confirmation }}
@@ -210,23 +241,44 @@ jobs:
         run: |
           set -euo pipefail
 
+          metadata_fields="isDraft,isPrerelease,name,body,assets,tagName,targetCommitish"
+          notes_file="$(mktemp)"
+          trap 'rm -f "$notes_file"' EXIT
+          printf '%s\n\n%s\n\n%s' \
+            "<!-- promtect-core-release:v1 tag=$TAG source=$SOURCE_SHA -->" \
+            "Promtect Core $TAG." \
+            "Verify the attached archives with their SHA-256 sidecars before installation." \
+            > "$notes_file"
+
           validate_draft_target() {
             printf '%s\n' "$1" \
               | python3 scripts/verify-draft-release.py "$TAG" "$SOURCE_SHA"
           }
 
           bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
-          if release_json="$(gh release view "$TAG" --json isDraft,tagName,targetCommitish 2>/dev/null)"; then
-            validate_draft_target "$release_json"
+          if existing_json="$(gh release view "$TAG" \
+            --json "isDraft,assets,tagName,targetCommitish" 2>/dev/null)"; then
+            printf '%s\n' "$existing_json" \
+              | python3 scripts/verify-draft-release.py \
+                "$TAG" "$SOURCE_SHA" --normalization-candidate
+            gh release edit "$TAG" --draft \
+              --target "$SOURCE_SHA" \
+              --title "Promtect $TAG" \
+              --notes-file "$notes_file" \
+              --prerelease=false
           else
             gh release create "$TAG" --verify-tag --draft \
               --target "$SOURCE_SHA" \
-              --title "Promtect $TAG" --generate-notes
-            release_json="$(gh release view "$TAG" --json isDraft,tagName,targetCommitish)"
-            validate_draft_target "$release_json"
+              --title "Promtect $TAG" \
+              --notes-file "$notes_file"
           fi
+          release_json="$(gh release view "$TAG" --json "$metadata_fields")"
+          printf '%s\n' "$release_json" \
+            | python3 scripts/verify-draft-release.py \
+              "$TAG" "$SOURCE_SHA" --assets-subset
           gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
-          release_assets_json="$(gh release view "$TAG" --json isDraft,assets,tagName,targetCommitish)"
+          release_assets_json="$(gh release view "$TAG" \
+            --json "isDraft,isPrerelease,name,body,assets,tagName,targetCommitish")"
           printf '%s\n' "$release_assets_json" \
             | python3 scripts/verify-draft-release.py \
               "$TAG" "$SOURCE_SHA" --assets
@@ -236,6 +288,11 @@ jobs:
             --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
           bash scripts/verify-release-assets.sh "$TAG" "$verify_dir"
           bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
-          release_json="$(gh release view "$TAG" --json isDraft,tagName,targetCommitish)"
+          gh release edit "$TAG" --draft \
+            --target "$SOURCE_SHA" \
+            --title "Promtect $TAG" \
+            --notes-file "$notes_file" \
+            --prerelease=false
+          release_json="$(gh release view "$TAG" --json "$metadata_fields")"
           validate_draft_target "$release_json"
-          gh release edit "$TAG" --draft=false
+          gh release edit "$TAG" --draft=false --latest

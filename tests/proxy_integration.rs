@@ -211,6 +211,141 @@ async fn output_scan_flags_model_secret_in_live_response() {
     let _ = std::fs::remove_file(&audit_path);
 }
 
+/// A downstream paid/rulebook detector participates in both masking and the
+/// final residual check. If its first span is unusable, the second pass catches
+/// the surviving canary and blocks before the upstream receives a request.
+#[tokio::test]
+async fn active_extra_detector_blocks_a_residual_before_upstream() {
+    let (mock_url, seen) = spawn_mock().await;
+    let mut c = ctx(&mock_url);
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_for_detector = Arc::clone(&calls);
+    c.extra_detect = Some(Arc::new(move |text: &str| {
+        let Some(start) = text.find("CUSTOMSECRET") else {
+            return Vec::new();
+        };
+        let end = if calls_for_detector.fetch_add(1, Ordering::SeqCst) == 0 {
+            text.len() + 1
+        } else {
+            start + "CUSTOMSECRET".len()
+        };
+        vec![promtect::detect::Match::new(
+            "custom_rulebook",
+            "CUSTOMSECRET".to_owned(),
+            start,
+            end,
+        )]
+    }));
+    let promtect_url = spawn(promtect::proxy::app(c)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(r#"{"prompt":"CUSTOMSECRET"}"#)
+        .send()
+        .await
+        .expect("post through residual detector");
+    let status = response.status();
+    let body = response.text().await.expect("read value-free rejection");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert!(body.contains("custom_rulebook"));
+    assert!(!body.contains("CUSTOMSECRET"));
+}
+
+#[derive(Clone, Copy)]
+enum MalformedResidualSpan {
+    Empty,
+    Reversed,
+    OutOfRange,
+    NonCharBoundary,
+    ValueMismatch,
+}
+
+async fn assert_malformed_residual_blocks_before_upstream(case: MalformedResidualSpan) {
+    let (upstream_url, connections) = spawn_socket_counter().await;
+    let mut c = ctx(&upstream_url);
+    c.extra_detect = Some(Arc::new(move |candidate: &str| {
+        if let Some(start) = candidate.find("CUSTOMSECRET") {
+            return vec![promtect::detect::Match::new(
+                "custom_rulebook",
+                "CUSTOMSECRET".to_owned(),
+                start,
+                start + "CUSTOMSECRET".len(),
+            )];
+        }
+
+        let sentinel_start = candidate
+            .find("«promtect:custom_rulebook:")
+            .expect("the first detector pass must mint a custom sentinel");
+        let inside = sentinel_start + "«".len();
+        let (value, start, end) = match case {
+            MalformedResidualSpan::Empty => ("", inside, inside),
+            MalformedResidualSpan::Reversed => ("x", inside + 2, inside + 1),
+            MalformedResidualSpan::OutOfRange => {
+                ("CUSTOMSECRET", candidate.len(), candidate.len() + 1)
+            }
+            MalformedResidualSpan::NonCharBoundary => ("x", sentinel_start + 1, inside),
+            MalformedResidualSpan::ValueMismatch => {
+                let start = candidate
+                    .find("promtect")
+                    .expect("minted sentinel must contain its marker");
+                ("CUSTOMSECRET", start, start + "promtect".len())
+            }
+        };
+
+        vec![promtect::detect::Match::new(
+            "custom_rulebook",
+            value.to_owned(),
+            start,
+            end,
+        )]
+    }));
+    let promtect_url = spawn(promtect::proxy::app(c)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(r#"{"prompt":"CUSTOMSECRET"}"#)
+        .send()
+        .await
+        .expect("post through malformed residual detector");
+    let status = response.status();
+    let body = response.text().await.expect("read value-free rejection");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+    assert!(body.contains("custom_rulebook"));
+    assert!(!body.contains("CUSTOMSECRET"));
+}
+
+#[tokio::test]
+async fn empty_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::Empty).await;
+}
+
+#[tokio::test]
+async fn reversed_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::Reversed).await;
+}
+
+#[tokio::test]
+async fn out_of_range_residual_span_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::OutOfRange).await;
+}
+
+#[tokio::test]
+async fn non_char_boundary_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::NonCharBoundary).await;
+}
+
+#[tokio::test]
+async fn value_mismatched_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::ValueMismatch).await;
+}
+
 /// Three distinct secrets in one body are each masked before reaching the upstream
 /// and all three are restored in the response returned to the client.
 #[tokio::test]
@@ -1041,6 +1176,12 @@ async fn strict_mode_does_not_restore_secrets() {
     let (mock_url, seen) = spawn_stream_mock().await;
     let mut strict = ctx(&mock_url);
     strict.restore = false;
+    let scan_calls = Arc::new(AtomicU64::new(0));
+    let scan_calls_for_callback = Arc::clone(&scan_calls);
+    strict.output_scan = Some(Arc::new(move |_text: &str| {
+        scan_calls_for_callback.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    }));
     let promtect_url = spawn(promtect::proxy::app(strict)).await;
 
     let (status, text) = post_through(&promtect_url, &body).await;
@@ -1058,6 +1199,11 @@ async fn strict_mode_does_not_restore_secrets() {
     assert!(
         !text.contains(aws),
         "strict mode must NOT restore the real secret: {text:?}"
+    );
+    assert_eq!(
+        scan_calls.load(Ordering::SeqCst),
+        0,
+        "strict mode streams sentinels verbatim and must not run the restored-text output scan"
     );
 }
 

@@ -13,9 +13,10 @@ Before the first public release:
 - Make the Core and Homebrew tap repositories anonymously readable. Promtect Pro
   remains private and must never be included in a Core artifact.
 - Configure the GitHub environments `core-release` and
-  `core-container-release` with required reviewers. The workflows also require
-  exact typed confirmation; environment protection is the human authorization
-  boundary.
+  `core-container-release` with required reviewers and a single custom
+  deployment-branch policy for `main`. Self-review must be disabled. The
+  workflows also require exact typed confirmation; environment protection is
+  the human authorization boundary.
 - Configure an active repository ruleset for `refs/tags/v*` that restricts tag
   creation to release operators and prevents tag updates and deletion. The
   workflows re-fetch and compare both the annotated tag object ID and commit
@@ -25,6 +26,18 @@ Before the first public release:
 - Keep release tags annotated. Signed tags are preferred when the release
   operator has a configured signing identity; GitHub artifact attestations are
   mandatory for the four published archives.
+- Add a read-only fine-grained `RELEASE_READINESS_TOKEN` Actions secret that can
+  inspect environments and repository rulesets. Add comma-separated numeric
+  repository variables `RELEASE_REVIEWER_IDS` and
+  `RELEASE_BYPASS_ACTOR_IDS` containing exactly the approved GitHub reviewer and
+  tag-ruleset bypass actor IDs. The workflows only issue GET requests with this
+  token; control provisioning remains a manual administrator action.
+
+Both publication workflows verify these controls before a protected environment
+is referenced, so a missing environment cannot be silently auto-created as the
+authorization boundary. They verify them again immediately after approval and
+before any release or package mutation. Missing credentials, controls, exact
+actors, or a main-only deployment policy fail closed.
 
 Until those controls and anonymous-read checks are green, run candidate builds
 with `publish=false` only.
@@ -63,6 +76,7 @@ Pushing the tag does not start either publication workflow.
 
 Manually dispatch `.github/workflows/release.yml` with:
 
+- workflow ref: `main` (any other selected ref fails before candidate work);
 - `tag`: the existing annotated `vX.Y.Z` tag;
 - `publish`: `false`;
 - no publication confirmation.
@@ -99,10 +113,12 @@ run.
 After approval, the job checks out the already validated commit, re-fetches the
 remote annotated tag, and requires both its tag object ID and target commit to
 remain unchanged. It downloads and reverifies the same-run artifact, creates
-GitHub build-provenance attestations, and validates an existing draft's exact
-target before any upload. It revalidates the tag, draft identity, downloaded
-assets, and target again before making the release public. It refuses to replace
-an existing published release.
+GitHub build-provenance attestations, and normalizes an existing draft to a
+deterministic title and marker-bound body before any upload. It rejects
+unexpected draft assets, prerelease state, or metadata drift. It revalidates the
+tag, complete asset set, deterministic metadata, downloaded assets, and target
+again before making the release public and marking it as GitHub's latest stable
+release. It refuses to replace an existing published release.
 
 Do not delete or replace a published asset. If an artifact is wrong, fix the
 problem and publish a new patch version.
@@ -132,15 +148,34 @@ Docker environment before merging the formula. Finally repeat
 ## Optional container publication
 
 The GHCR image is not part of the Homebrew release and is never triggered by a
-tag. Dispatch `.github/workflows/docker-publish.yml` separately with the same
-tag and `publish container vX.Y.Z`; approve the `core-container-release`
-environment only when container distribution is intentionally in scope. The
-job checks out the exact pre-approval commit and rejects a changed remote tag.
-Exact `X.Y.Z` and `vX.Y.Z` image tags are immutable: an existing tag aborts the
-run. The shared `X.Y` tag advances only when the incoming patch is newer than
-every immutable patch tag already published on that release line; all container
-publications are serialized to prevent two patch releases from racing. A failed
-or repeated publication requires a new patch version, never tag replacement.
+tag. Dispatch `.github/workflows/docker-publish.yml` separately **from the
+`main` workflow ref** with the same tag and `publish container vX.Y.Z`; approve
+the `core-container-release` environment only when container distribution is
+intentionally in scope. The job checks out the exact pre-approval commit and
+rejects a changed remote tag.
+
+The build first pushes content by digest without a customer-facing tag. Only
+after the build completes does the serialized job re-read grouped GHCR version
+records, refuse an existing exact tag, and prove the current `X.Y` tag belongs
+to the highest paired `X.Y.Z`/`vX.Y.Z` digest. It then promotes that reviewed
+digest to the two exact tags and rolling minor tag. A bounded postcondition
+requires both the package API and direct registry reads for all three tags to
+resolve to the pushed digest. Missing or deleted provenance fails closed rather
+than guessing from flattened tag history.
+
+GHCR does not provide a permanent immutable-tag guarantee. These controls
+enforce non-replacement for this serialized workflow and detect publication
+drift at completion; a separate actor with package write access could still move
+or delete a tag later. Limit package writers, monitor tag-to-digest mappings,
+and treat signed attestations/digest pins as the durable identity. A failed or
+repeated publication requires a new patch version, never intentional tag
+replacement.
+
+The conventional container `latest` tag is deprecated and is never published or
+advanced. Consumers must pin `X.Y.Z`, `vX.Y.Z`, or deliberately track `X.Y`.
+Publication fails while a legacy `latest` tag exists, so the current stale tag
+must be removed through a separately reviewed repository-administration action
+before the first run of this workflow.
 
 ## Versioning
 

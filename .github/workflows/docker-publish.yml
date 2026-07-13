@@ -46,8 +46,13 @@ jobs:
         env:
           CONFIRMATION: ${{ inputs.publish_confirmation }}
           REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ] \
+            || { echo "container workflow must be dispatched from main" >&2; exit 1; }
+          [ "$GITHUB_SHA" = "$WORKFLOW_SHA" ] \
+            || { echo "workflow source SHA does not match dispatched main SHA" >&2; exit 1; }
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [ "$REPOSITORY_VISIBILITY" = "public" ]
           [ "$CONFIRMATION" = "publish container $TAG" ]
@@ -75,6 +80,22 @@ jobs:
       - name: Test
         run: cargo test
 
+  release-controls:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+      - name: Fail closed unless release controls already exist
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
+          PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
+          PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
+
   build-push:
     runs-on: ubuntu-latest
     environment: core-container-release
@@ -82,7 +103,7 @@ jobs:
       contents: read
       packages: write
     # Only publish after the test suite passes.
-    needs: test
+    needs: [test, release-controls]
     env:
       SOURCE_SHA: ${{ needs.test.outputs.source_sha }}
       TAG_OID: ${{ needs.test.outputs.tag_oid }}
@@ -91,6 +112,12 @@ jobs:
         with:
           ref: ${{ needs.test.outputs.source_sha }}
           fetch-depth: 0
+      - name: Recheck controls after environment approval
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
+          PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
+          PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
       - name: Revalidate reviewed tag after environment approval
         run: bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -99,38 +126,114 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Refuse immutable replacement or minor-tag regression
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          versions="$(mktemp)"
-          errors="$(mktemp)"
-          trap 'rm -f "$versions" "$errors"' EXIT
-          endpoint="/users/${GITHUB_REPOSITORY_OWNER}/packages/container/promtect/versions?per_page=100"
-          if ! gh api --paginate --slurp "$endpoint" > "$versions" 2> "$errors"; then
-            if grep -q 'HTTP 404' "$errors"; then
-              printf '[]\n' > "$versions"
-            else
-              cat "$errors" >&2
-              exit 1
-            fi
-          fi
-          python3 scripts/check-ghcr-tags.py "$TAG" "$versions"
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/amitk3293/promtect
-          tags: |
-            type=semver,pattern={{version}},value=${{ inputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
-            type=raw,value=${{ inputs.tag }}
           labels: |
             org.opencontainers.image.revision=${{ needs.test.outputs.source_sha }}
             org.opencontainers.image.version=${{ inputs.tag }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      - id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=ghcr.io/amitk3293/promtect,push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Recheck tags, promote reviewed digest, and verify postcondition
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          versions="$(mktemp)"
+          errors="$(mktemp)"
+          registry_error="$(mktemp)"
+          state="$(mktemp)"
+          trap 'rm -f "$versions" "$errors" "$registry_error" "$state"' EXIT
+          endpoint="/users/${GITHUB_REPOSITORY_OWNER}/packages/container/promtect/versions?per_page=100"
+          fetch_versions() {
+            if ! gh api --paginate --slurp "$endpoint" > "$versions" 2> "$errors"; then
+              if grep -q 'HTTP 404' "$errors"; then
+                printf '[]\n' > "$versions"
+              else
+                cat "$errors" >&2
+                return 1
+              fi
+            fi
+          }
+
+          bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
+          fetch_versions
+          python3 scripts/check-ghcr-tags.py "$TAG" "$versions" --state-output "$state"
+
+          version="${TAG#v}"
+          rolling="${version%.*}"
+          image="ghcr.io/amitk3293/promtect"
+          inspect_digest() {
+            docker buildx imagetools inspect "$1" --raw \
+              2> "$registry_error" | sha256sum | awk '{print "sha256:" $1}'
+          }
+          require_absent() {
+            local reference="$1"
+            local resolved
+            if resolved="$(inspect_digest "$reference")"; then
+              echo "immutable GHCR tag already exists at $resolved: $reference" >&2
+              return 1
+            fi
+            if ! grep -Eqi 'manifest unknown|not found|404' "$registry_error"; then
+              cat "$registry_error" >&2
+              echo "could not prove GHCR tag absence: $reference" >&2
+              return 1
+            fi
+          }
+          require_absent "$image:$version"
+          require_absent "$image:$TAG"
+
+          expected_rolling_digest="$(python3 - "$state" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              print(json.load(handle)["rolling_digest"] or "")
+          PY
+          )"
+          if actual_rolling_digest="$(inspect_digest "$image:$rolling")"; then
+            [ -n "$expected_rolling_digest" ] \
+              && [ "$actual_rolling_digest" = "$expected_rolling_digest" ] \
+              || { echo "GHCR API and registry disagree about $rolling" >&2; exit 1; }
+          else
+            grep -Eqi 'manifest unknown|not found|404' "$registry_error" \
+              || { cat "$registry_error" >&2; exit 1; }
+            [ -z "$expected_rolling_digest" ] \
+              || { echo "GHCR registry is missing API-recorded $rolling" >&2; exit 1; }
+          fi
+
+          docker buildx imagetools create \
+            --tag "$image:$version" \
+            --tag "$image:$TAG" \
+            --tag "$image:$rolling" \
+            "$image@$PUSHED_DIGEST"
+
+          verified=false
+          for _ in 1 2 3 4 5 6; do
+            fetch_versions
+            api_ok=false
+            registry_ok=true
+            if python3 scripts/check-ghcr-tags.py "$TAG" "$versions" \
+              --expected-digest "$PUSHED_DIGEST"; then
+              api_ok=true
+            fi
+            for published_tag in "$version" "$TAG" "$rolling"; do
+              actual_digest="sha256:$(docker buildx imagetools inspect \
+                "$image:$published_tag" --raw | sha256sum | awk '{print $1}')" \
+                || registry_ok=false
+              [ "$actual_digest" = "$PUSHED_DIGEST" ] || registry_ok=false
+            done
+            if [ "$api_ok" = true ] && [ "$registry_ok" = true ]; then
+              verified=true
+              break
+            fi
+            sleep 5
+          done
+          [ "$verified" = true ] \
+            || { echo "GHCR tags did not converge on the pushed digest" >&2; exit 1; }
+          bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"

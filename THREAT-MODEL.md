@@ -33,16 +33,23 @@ streamed reply so the answer stays useful.
   detection is a planned, separate capability.)
 - **The model's response is not scanned for secrets.** Restore only re-inserts
   sentinels minted for *this* request; a secret the model itself emits is not detected.
-- **Non-text bodies.** Binary, multipart, or base64-encoded request bodies are forwarded
-  unscanned (a secret encoded before it reaches Promtect is not matched). Non-identity
-  `Content-Encoding` request bodies are rejected with HTTP 415 before any upstream
-  request because Promtect cannot safely scan compressed bytes.
+- **Encoded and non-text body content.** Promtect scans raw request bytes only when the
+  complete body is valid UTF-8; it does not decode base64, percent-encoding, protobuf,
+  or multipart parts. A text-only multipart body is scanned as flat UTF-8 and may match
+  ordinary detector shapes, but multipart structure is not interpreted and any body
+  containing non-UTF-8 bytes is forwarded unscanned. Non-identity `Content-Encoding`
+  request bodies are rejected with HTTP 415 before DNS resolution or an upstream
+  connection because Promtect cannot safely scan compressed bytes.
 - **Tools without a base-URL override.** VS Code Copilot and browser/web chat
   (chatgpt.com, claude.ai) cannot be proxied without a root CA, which Promtect
   deliberately does not install.
 - **Auth headers.** The API key in `Authorization` / `x-api-key` is forwarded
   verbatim, never masked, that is the tool's own credential to the provider, and
   masking it would break auth.
+- **Response surfaces outside restored text.** Response output scanning is a paid,
+  observe-only capability and runs only on textual, uncompressed responses while
+  transparent restoration is enabled. Strict mode, binary responses, and compressed
+  responses stream without response scanning or mutation.
 
 ## Trust assumptions
 
