@@ -44,5 +44,9 @@ promtect selftest        # → promtect selftest: PASS — no leak
 
 - Pass your real Anthropic API key as usual (`ANTHROPIC_API_KEY` / `x-api-key`).
   Promtect forwards the auth header untouched — it only ever masks the body.
+- `guard claude` owns routing for the guarded session, but intentionally inherits
+  authentication. If your Claude settings contain a gateway-specific
+  `ANTHROPIC_AUTH_TOKEN`, use the matching `--upstream` or remove that credential
+  before targeting a different upstream; Promtect cannot identify token ownership.
 - Strict mode: `PROMTECT_RESTORE=false` leaves placeholders in the response (the
   secret is never re-inserted). Use it when policy forbids restoration.

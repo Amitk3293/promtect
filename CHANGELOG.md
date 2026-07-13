@@ -35,6 +35,10 @@ and auto-generated notes also live on the
 ### Fixed
 - `promtect --version`, `promtect -V`, and `promtect version` now print the version
   and exit, instead of starting the proxy.
+- `promtect guard claude` now overrides persisted Claude base-URL settings and
+  disables third-party provider selectors for the guarded session, preventing
+  those settings from routing requests around Promtect. Authentication remains
+  inherited and is never serialized into process arguments.
 
 ## [0.1.7]
 

@@ -42,11 +42,22 @@ pub struct GuardPlan {
     /// Whether this is the named Codex preset, which requires additional
     /// authentication, routing, and compression checks before launch.
     pub codex_fail_closed: bool,
+    /// Whether this is the named Claude preset, which must override persistent
+    /// Claude settings with guard-owned inline routing for this session.
+    pub claude_fail_closed: bool,
 }
 
 /// Default Headroom URL — Headroom binds `127.0.0.1:8787` by default.
 /// Use `--headroom=<url>` to override (e.g. `--headroom=http://127.0.0.1:9000`).
 const HEADROOM_DEFAULT: &str = "http://127.0.0.1:8787";
+const CLAUDE_BASE_VAR: &str = "ANTHROPIC_BASE_URL";
+const CLAUDE_PROVIDER_SELECTORS: &[&str] = &[
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+];
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
     args.get(i + 1)
@@ -185,6 +196,13 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
             "Codex argument {key:?} can bypass Promtect routing or compression safety; remove it"
         ));
     }
+    if tool == Some("claude")
+        && let Some(key) = conflicting_claude_override(&tool_args)
+    {
+        return Err(format!(
+            "Claude argument {key:?} can override Promtect routing; remove it (guard injects protected settings automatically)"
+        ));
+    }
 
     // ── per-tool wiring (verified against each tool's docs) ──────────────────
     let (base_var, base_path, mode): (String, String, String) = match tool {
@@ -192,11 +210,7 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
             if openrouter {
                 return Err("--openrouter is not valid with claude (Anthropic only)".to_string());
             }
-            (
-                "ANTHROPIC_BASE_URL".into(),
-                String::new(),
-                "anthropic".into(),
-            )
+            (CLAUDE_BASE_VAR.into(), String::new(), "anthropic".into())
         }
         Some("codex") => ("OPENAI_BASE_URL".into(), "/v1".into(), "openai".into()),
         Some("ollama") => {
@@ -308,7 +322,31 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
         port,
         notes,
         codex_fail_closed: tool == Some("codex"),
+        claude_fail_closed: tool == Some("claude"),
     })
+}
+
+/// Return the first Claude settings argument that could override the
+/// guard-owned base URL. Claude accepts both `--settings VALUE` and
+/// `--settings=VALUE`; rejecting either avoids argument-order-dependent routing.
+fn conflicting_claude_override(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .find(|arg| *arg == "--settings" || arg.starts_with("--settings="))
+}
+
+fn claude_settings_args(base_url: &str) -> [String; 2] {
+    let mut env = serde_json::Map::new();
+    env.insert(CLAUDE_BASE_VAR.to_string(), serde_json::json!(base_url));
+    for selector in CLAUDE_PROVIDER_SELECTORS {
+        // Claude documents these selectors as enabled by `1`. An explicit `0`
+        // overrides hostile persisted settings without relying on inherited env.
+        env.insert((*selector).to_string(), serde_json::json!("0"));
+    }
+    [
+        "--settings".to_string(),
+        serde_json::json!({ "env": env }).to_string(),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -820,6 +858,12 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         configure_codex_command(&mut cmd, auth);
         cmd.args(codex_config_args(&base_url, auth));
     }
+    if plan.claude_fail_closed {
+        // Claude settings.json `env` values override the child process
+        // environment. Use Claude's documented highest-precedence inline
+        // settings so a persistent gateway cannot bypass this proxy.
+        cmd.args(claude_settings_args(&base_url));
+    }
     cmd.args(&plan.tool_args)
         .env(&plan.base_var, &base_url)
         .kill_on_drop(true);
@@ -1018,6 +1062,37 @@ mod tests {
         assert!(p.restore);
         assert!(p.tool_args.is_empty());
         assert!(p.notes.is_empty());
+        assert!(p.claude_fail_closed);
+        assert!(!p.codex_fail_closed);
+    }
+
+    #[test]
+    fn claude_inline_settings_force_guard_owned_routing() {
+        assert_eq!(
+            claude_settings_args("http://127.0.0.1:12345"),
+            [
+                "--settings".to_string(),
+                r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:12345","CLAUDE_CODE_USE_ANTHROPIC_AWS":"0","CLAUDE_CODE_USE_BEDROCK":"0","CLAUDE_CODE_USE_FOUNDRY":"0","CLAUDE_CODE_USE_MANTLE":"0","CLAUDE_CODE_USE_VERTEX":"0"}}"#.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_rejects_user_settings_overrides() {
+        for args in [
+            vec!["claude", "--settings", "/tmp/settings.json"],
+            vec![
+                "claude",
+                "--settings={\"env\":{\"ANTHROPIC_BASE_URL\":\"https://example.test\"}}",
+            ],
+            vec!["claude", "--", "--settings", "/tmp/settings.json"],
+        ] {
+            let error = plan(&args).unwrap_err();
+            assert!(
+                error.contains("can override Promtect routing"),
+                "expected fail-closed settings error for {args:?}, got {error:?}"
+            );
+        }
     }
 
     #[test]
@@ -1028,6 +1103,7 @@ mod tests {
         assert_eq!(p.base_path, "/v1");
         assert_eq!(p.upstream, "https://api.openai.com");
         assert!(p.codex_fail_closed);
+        assert!(!p.claude_fail_closed);
     }
 
     #[test]

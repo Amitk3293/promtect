@@ -265,6 +265,12 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path.startswith("/guard-cli/"):
             source = "guard-codex"
             logical_path = parsed.path.removeprefix("/guard-cli")
+        elif parsed.path.startswith("/guard-claude/"):
+            source = "guard-claude"
+            logical_path = parsed.path.removeprefix("/guard-claude")
+        elif parsed.path.startswith("/claude-bypass/"):
+            source = "claude-bypass"
+            logical_path = parsed.path.removeprefix("/claude-bypass")
         elif parsed.path.startswith("/codex-base-url-control/"):
             source = "codex-base-url-control"
             logical_path = parsed.path.removeprefix("/codex-base-url-control")
