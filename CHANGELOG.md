@@ -53,6 +53,16 @@ and auto-generated notes also live on the
   strict byte, record, and field limits plus a value-free degraded response.
 - Promtect no longer honors implicit system proxy variables for upstream traffic;
   gateways remain available through the explicit upstream/chaining configuration.
+- Guarded tools now run inside an owned Unix process group with terminal job-control
+  handoff. Normal exit and SIGINT/SIGTERM clean up helpers, restore the terminal,
+  and drain proxy/dashboard connections; cancelled response streams emit a
+  value-free `stream_interrupted` audit event.
+- Concurrent guards serialize audit tail repair and complete JSONL appends through
+  an owner-only pathname lock. Same-inode copy-truncation now produces a degraded
+  Claude notice instead of a false empty result.
+- Named Claude guard is pinned to the reviewed Claude Code 2.1.207 contract. It
+  rejects hidden managed settings, cloud/root commands, safe mode, alternate
+  managed/remote settings sources, and persisted proxy routes before a prompt.
 
 ## [0.1.7]
 

@@ -140,8 +140,18 @@ impl Audit {
         let Some(sink) = guard.as_mut() else {
             return Ok(());
         };
+        // Lock order is always the process-local sink mutex followed by the
+        // pathname lock. Keeping one order prevents two Audit instances in this
+        // process from deadlocking while the OS lock serializes other processes.
+        let _path_lock = match Self::acquire_path_lock(&sink.path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.warn_once();
+                return Err(error);
+            }
+        };
         if sink.handle.is_none() {
-            match Self::open_append(&sink.path) {
+            match Self::open_append_locked(&sink.path) {
                 Ok(file) => sink.handle = Some(file),
                 Err(error) => {
                     self.warn_once();
@@ -165,7 +175,48 @@ impl Audit {
         Ok(file)
     }
 
-    /// Open the audit log for append, creating it owner-only (`0600`) on Unix and
+    /// Acquire the owner-only advisory lock shared by every `Audit` instance
+    /// targeting `path`. The returned handle holds the lock until it is dropped,
+    /// including when the process exits unexpectedly.
+    fn audit_lock_path(path: &std::path::Path) -> PathBuf {
+        let mut lock_name = path.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        PathBuf::from(lock_name)
+    }
+
+    fn acquire_path_lock(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        let lock_path = Self::audit_lock_path(path);
+
+        let mut opts = OpenOptions::new();
+        opts.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        configure_no_follow(&mut opts);
+        reject_symlink_without_atomic_no_follow(&lock_path)?;
+        let lock = opts.open(&lock_path)?;
+        let metadata = validate_audit_file(&lock)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        lock.lock()?;
+        if !same_audit_file(&lock, &lock_path)? {
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "audit lock changed while it was being acquired",
+            ));
+        }
+        Ok(lock)
+    }
+
+    /// Open the audit log for append while the caller holds
+    /// `acquire_path_lock(path)`, creating it owner-only (`0600`) on Unix and
     /// repairing the mode of a pre-existing file that is group/other-accessible.
     ///
     /// The log is value-free (no secret values), but on a shared machine even the
@@ -175,7 +226,7 @@ impl Audit {
     /// an older build) could linger world-readable; after opening we tighten any
     /// stray group/other bits back to `0600` (#41). The repair is best-effort: if
     /// `set_permissions` fails we still return the handle (fail-open).
-    fn open_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    fn open_append_locked(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         let mut opts = OpenOptions::new();
         opts.create(true).read(true).append(true);
         #[cfg(unix)]
@@ -283,6 +334,14 @@ impl Audit {
             return; // null sink: discard.
         };
 
+        let _path_lock = match Self::acquire_path_lock(&sink.path) {
+            Ok(lock) => lock,
+            Err(_) => {
+                self.warn_once();
+                return;
+            }
+        };
+
         // One identity check per request summary catches rotation before the
         // terminal request/failure records without reopening the pathname for
         // every mask/unmask event on the proxy hot path.
@@ -298,7 +357,7 @@ impl Audit {
 
         // Open lazily; a cached handle is reused across events.
         if sink.handle.is_none() {
-            match Self::open_append(&sink.path) {
+            match Self::open_append_locked(&sink.path) {
                 Ok(f) => sink.handle = Some(f),
                 Err(_) => {
                     self.warn_once();
@@ -308,15 +367,15 @@ impl Audit {
         }
 
         if let Some(f) = sink.handle.as_mut()
-            && writeln!(f, "{}", line).is_err()
+            && Self::write_line(f, line).is_err()
         {
             // A cached handle can go stale (log rotated/removed). Drop it and
             // retry once with a fresh open so the next event also re-opens if
             // this retry fails too.
             sink.handle = None;
-            match Self::open_append(&sink.path) {
+            match Self::open_append_locked(&sink.path) {
                 Ok(mut f) => {
-                    if writeln!(f, "{}", line).is_ok() {
+                    if Self::write_line(&mut f, line).is_ok() {
                         sink.handle = Some(f);
                     } else {
                         self.warn_once();
@@ -325,6 +384,13 @@ impl Audit {
                 Err(_) => self.warn_once(),
             }
         }
+    }
+
+    fn write_line(file: &mut std::fs::File, line: &str) -> std::io::Result<()> {
+        let mut framed = Vec::with_capacity(line.len().saturating_add(1));
+        framed.extend_from_slice(line.as_bytes());
+        framed.push(b'\n');
+        file.write_all(&framed)
     }
 
     /// Emit a single process-lifetime stderr warning on the first audit write
@@ -557,6 +623,11 @@ fn effective_user_id() -> std::io::Result<u32> {
 mod tests {
     use super::*;
 
+    fn remove_audit_fixture(path: &std::path::Path) {
+        std::fs::remove_file(path).ok();
+        std::fs::remove_file(Audit::audit_lock_path(path)).ok();
+    }
+
     #[test]
     fn session_stats_are_process_local_and_count_only_summary_actions() {
         let path = std::env::temp_dir().join(format!(
@@ -589,7 +660,7 @@ mod tests {
                 output_secrets: 0,
             }
         );
-        std::fs::remove_file(path).ok();
+        remove_audit_fixture(&path);
     }
 
     #[test]
@@ -600,7 +671,7 @@ mod tests {
         let audit = Audit::to_file(path.clone());
         audit.record_request("req-abc", 2, &["aws_key", "anthropic_key"], 512, 498);
         let contents = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
 
         assert!(contents.contains("\"action\":\"request\""));
         assert!(contents.contains("\"request_id\":\"req-abc\""));
@@ -624,7 +695,7 @@ mod tests {
         audit.record_blocked_request("req-blocked");
 
         let contents = std::fs::read_to_string(&path).expect("read blocked request audit");
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
 
         assert!(contents.contains("\"request_id\":\"req-blocked\""));
         assert!(contents.contains("\"blocked\":true"));
@@ -641,7 +712,7 @@ mod tests {
         assert!(contents.contains("\"action\":\"mask\""));
         assert!(contents.contains("req-xyz"));
         assert!(!contents.contains("AKIA")); // never logs the real secret
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
     }
 
     /// #41: a pre-existing world-readable (`0644`) audit file must be tightened
@@ -669,7 +740,7 @@ mod tests {
         audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "req-perm");
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
         assert_eq!(mode, 0o600, "append must tighten perms to owner-only");
     }
 
@@ -686,7 +757,7 @@ mod tests {
         audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "req-fresh");
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
         assert_eq!(mode, 0o600);
     }
 
@@ -709,7 +780,7 @@ mod tests {
         audit.record("mask", "aws_key", "opaque-sentinel", "req-symlink");
 
         let actual = std::fs::read(&target).expect("read target after rejected audit writes");
-        std::fs::remove_file(&link).ok();
+        remove_audit_fixture(&link);
         std::fs::remove_file(&target).ok();
         assert!(
             prepare_result.is_err(),
@@ -728,9 +799,11 @@ mod tests {
             std::env::temp_dir().join(format!("promtect-audit-directory-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&path).expect("create audit target directory");
 
-        let result = Audit::open_append(&path);
+        let audit = Audit::to_file(path.clone());
+        let result = audit.prepare();
 
         let is_still_directory = path.is_dir();
+        std::fs::remove_file(Audit::audit_lock_path(&path)).ok();
         std::fs::remove_dir(&path).ok();
         assert!(
             result.is_err() && is_still_directory,
@@ -750,12 +823,139 @@ mod tests {
         audit.record_request("req-1", 1, &["aws_key"], 100, 90);
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
         // Three events → three JSONL lines.
         assert_eq!(contents.lines().count(), 3, "every event must be appended");
         assert!(contents.contains("\"action\":\"mask\""));
         assert!(contents.contains("\"action\":\"unmask\""));
         assert!(contents.contains("\"action\":\"request\""));
+    }
+
+    #[test]
+    fn independent_audits_wait_for_the_same_path_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-lock-contention-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"{\"truncated\"").expect("seed incomplete audit tail");
+        let held_lock = Audit::acquire_path_lock(&path).expect("hold audit pathname lock");
+        let second = Audit::to_file(path.clone());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce blocked writer");
+            second.record("mask", "aws_key", "opaque", "second-process");
+            done_tx.send(()).expect("announce completed writer");
+        });
+
+        started_rx.recv().expect("writer started");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "an independent Audit must not append while another process-like lock is held"
+        );
+        drop(held_lock);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer continues after lock release");
+        writer.join().expect("join independent audit writer");
+
+        let contents = std::fs::read_to_string(&path).expect("read serialized audit record");
+        remove_audit_fixture(&path);
+        assert_eq!(contents.lines().count(), 1);
+        assert!(contents.contains("second-process"));
+        assert!(
+            contents
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+            "tail repair and the following append must share one critical section"
+        );
+    }
+
+    #[test]
+    fn concurrent_independent_audits_keep_all_jsonl_records_intact() {
+        const WRITERS: usize = 8;
+        const RECORDS_PER_WRITER: usize = 64;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-lock-records-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let start = Arc::new(std::sync::Barrier::new(WRITERS));
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer_id| {
+                let audit = Audit::to_file(path.clone());
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for record_id in 0..RECORDS_PER_WRITER {
+                        audit.record(
+                            "mask",
+                            "aws_key",
+                            "opaque",
+                            &format!("writer-{writer_id}-record-{record_id}"),
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for writer in writers {
+            writer.join().expect("join concurrent audit writer");
+        }
+
+        let contents = std::fs::read_to_string(&path).expect("read concurrent audit output");
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every concurrent line is valid JSON"))
+            .collect();
+        remove_audit_fixture(&path);
+        assert_eq!(records.len(), WRITERS * RECORDS_PER_WRITER);
+    }
+
+    #[test]
+    fn lock_failure_marks_audit_unhealthy_without_blocking_masking() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-lock-failure-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let lock_path = Audit::audit_lock_path(&path);
+        std::fs::create_dir(&lock_path).expect("block audit lock with a directory");
+        let audit = Audit::to_file(path.clone());
+
+        audit.record("mask", "aws_key", "opaque", "request-1");
+
+        std::fs::remove_dir(lock_path).ok();
+        assert!(
+            !audit.is_healthy(),
+            "Claude health must expose lock failure"
+        );
+        assert_eq!(audit.session_stats().masked, 1, "masking stays fail-open");
+        assert!(
+            !path.exists(),
+            "an unlocked audit record must not be written"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_path_lock_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("promtect-lock-mode-{}.jsonl", uuid::Uuid::new_v4()));
+        let audit = Audit::to_file(path.clone());
+        audit.record("mask", "aws_key", "opaque", "request-1");
+
+        let mode = std::fs::metadata(Audit::audit_lock_path(&path))
+            .expect("stat audit path lock")
+            .permissions()
+            .mode()
+            & 0o777;
+        remove_audit_fixture(&path);
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
@@ -772,7 +972,7 @@ mod tests {
 
         let old_contents = std::fs::read_to_string(&rotated).expect("read rotated audit");
         let new_contents = std::fs::read_to_string(&path).expect("read replacement audit");
-        std::fs::remove_file(path).ok();
+        remove_audit_fixture(&path);
         std::fs::remove_file(rotated).ok();
         assert!(
             !audit.is_healthy(),
@@ -799,7 +999,7 @@ mod tests {
         audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "next");
 
         let contents = std::fs::read_to_string(&path).expect("read repaired audit log");
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
         let records: Vec<serde_json::Value> = contents
             .lines()
             .map(|line| serde_json::from_str(line).expect("every retained line must be valid JSON"))
@@ -826,7 +1026,7 @@ mod tests {
         let audit = Audit::to_file(path.clone());
         audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "next");
         let contents = std::fs::read_to_string(&path).expect("read repaired audit log");
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
 
         assert_eq!(contents.lines().count(), 2);
         assert!(
@@ -859,7 +1059,7 @@ mod tests {
         let result = audit.prepare();
 
         let retained_len = std::fs::metadata(&path).expect("stat retained audit").len();
-        std::fs::remove_file(&path).ok();
+        remove_audit_fixture(&path);
         assert!(result.is_err(), "oversized malformed tail must fail closed");
         assert_eq!(
             retained_len, SPARSE_LEN,

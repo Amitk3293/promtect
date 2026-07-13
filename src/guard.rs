@@ -76,6 +76,32 @@ const CLAUDE_AUTH_OVERRIDE_VARS: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
 ];
+const CLAUDE_RUNTIME_OVERRIDE_VARS: &[&str] = &[
+    "CLAUDE_CODE_SAFE_MODE",
+    "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+    "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
+    "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
+    "CLAUDE_CODE_HOST_CREDS_FILE",
+];
+const CLAUDE_SUPPORTED_VERSION: &str = "2.1.207 (Claude Code)";
+const CLAUDE_UNSUPPORTED_ROOT_COMMANDS: &[&str] = &[
+    "agents",
+    "auth",
+    "auto-mode",
+    "doctor",
+    "gateway",
+    "install",
+    "mcp",
+    "plugin",
+    "plugins",
+    "project",
+    "setup-token",
+    "ultrareview",
+    "update",
+    "upgrade",
+];
 const CLAUDE_NOTICE_ROUTE: &str = "/_promtect/hooks/{token}";
 const CLAUDE_NOTICE_MAX_DELTA_BYTES: u64 = 1024 * 1024;
 const CLAUDE_NOTICE_MAX_RECORD_BYTES: u64 = 16 * 1024;
@@ -358,6 +384,9 @@ fn conflicting_claude_override(args: &[String]) -> Option<&str> {
     args.iter().map(String::as_str).find(|arg| {
         *arg == "--settings"
             || arg.starts_with("--settings=")
+            || *arg == "--managed-settings"
+            || arg.starts_with("--managed-settings=")
+            || CLAUDE_UNSUPPORTED_ROOT_COMMANDS.contains(arg)
             || matches!(
                 *arg,
                 "--safe-mode"
@@ -381,8 +410,31 @@ fn claude_settings_json(base_url: &str, notice_url: &str) -> String {
         env.insert((*selector).to_string(), serde_json::json!("0"));
     }
     env.insert("ANTHROPIC_UNIX_SOCKET".to_string(), serde_json::json!(""));
+    for proxy in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "WS_PROXY",
+        "WSS_PROXY",
+        "ws_proxy",
+        "wss_proxy",
+    ] {
+        env.insert(proxy.to_string(), serde_json::json!(""));
+    }
+    env.insert(
+        "NO_PROXY".to_string(),
+        serde_json::json!("127.0.0.1,localhost"),
+    );
+    env.insert(
+        "no_proxy".to_string(),
+        serde_json::json!("127.0.0.1,localhost"),
+    );
     serde_json::json!({
         "env": env,
+        "disableAllHooks": false,
         "hooks": {
             "Stop": [{
                 "hooks": [{
@@ -542,9 +594,10 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> ClaudeNoticeRead {
         Err(_) => return ClaudeNoticeRead::Degraded,
     };
     if *cursor > len {
-        // A rotated/truncated audit must not replay an earlier session's events.
+        // A same-inode copy-truncate invalidates the saved generation. Never
+        // silently turn that loss of evidence into a false zero-event result.
         *cursor = len;
-        return ClaudeNoticeRead::Empty;
+        return ClaudeNoticeRead::Degraded;
     }
     let delta = len - *cursor;
     if delta == 0 {
@@ -782,12 +835,45 @@ fn json_has_settings(contents: &str) -> Result<bool, serde_json::Error> {
     })
 }
 
+#[cfg(unix)]
+fn open_claude_settings_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::Mode;
+
+    let fd = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let file = std::fs::File::from(fd);
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "settings source is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_claude_settings_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "settings source is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 fn read_claude_settings_file(
     path: &std::path::Path,
     source: &str,
 ) -> Result<Option<String>, String> {
     const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
-    let file = match std::fs::File::open(path) {
+    let file = match open_claude_settings_file(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -941,6 +1027,62 @@ fn validate_claude_auth_status(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
+fn validate_claude_version(bytes: &[u8]) -> Result<(), String> {
+    let version = std::str::from_utf8(bytes)
+        .map_err(|_| "Claude version check returned invalid text".to_string())?
+        .trim();
+    if version == CLAUDE_SUPPORTED_VERSION {
+        Ok(())
+    } else {
+        Err(format!(
+            "Claude version is unsupported; guard claude currently requires {CLAUDE_SUPPORTED_VERSION}"
+        ))
+    }
+}
+
+async fn verify_claude_version(bin: &str) -> Result<(), String> {
+    let mut command = tokio::process::Command::new(bin);
+    configure_guard_child_network_env(&mut command);
+    command
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("could not run Claude version preflight ({error})"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not read Claude version preflight".to_string())?;
+    let output = tokio::time::timeout(Duration::from_secs(5), async {
+        use tokio::io::AsyncReadExt;
+
+        const MAX_VERSION_BYTES: u64 = 256;
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_VERSION_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| "could not read Claude version preflight".to_string())?;
+        if bytes.len() as u64 > MAX_VERSION_BYTES {
+            child.kill().await.ok();
+            return Err("Claude version preflight output exceeded its safety limit".to_string());
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|_| "Claude version preflight failed".to_string())?;
+        Ok((status, bytes))
+    })
+    .await
+    .map_err(|_| "Claude version preflight timed out".to_string())??;
+    if !output.0.success() {
+        return Err("Claude version preflight failed".to_string());
+    }
+    validate_claude_version(&output.1)
+}
+
 fn first_claude_auth_override(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
     CLAUDE_AUTH_OVERRIDE_VARS
         .iter()
@@ -948,7 +1090,21 @@ fn first_claude_auth_override(is_set: impl Fn(&str) -> bool) -> Option<&'static 
         .find(|variable| is_set(variable))
 }
 
+fn first_claude_runtime_override(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
+    CLAUDE_RUNTIME_OVERRIDE_VARS
+        .iter()
+        .copied()
+        .find(|variable| is_set(variable))
+}
+
 async fn verify_claude_unmanaged_profile(bin: &str) -> Result<(), String> {
+    if let Some(variable) =
+        first_claude_runtime_override(|variable| std::env::var_os(variable).is_some())
+    {
+        return Err(format!(
+            "Claude runtime override {variable} is set; guard claude cannot verify protected routing and the automatic notice"
+        ));
+    }
     if let Some(variable) =
         first_claude_auth_override(|variable| std::env::var_os(variable).is_some())
     {
@@ -966,6 +1122,8 @@ async fn verify_claude_unmanaged_profile(bin: &str) -> Result<(), String> {
     })
     .await
     .map_err(|_| "Claude managed-profile preflight failed".to_string())??;
+
+    verify_claude_version(bin).await?;
 
     let mut command = tokio::process::Command::new(bin);
     configure_guard_child_network_env(&mut command);
@@ -1464,154 +1622,179 @@ async fn run_codex_dry_run(plan: &GuardPlan) -> i32 {
     }
 }
 
-#[cfg(unix)]
-fn descendants_from_pairs(root: u32, pairs: &[(u32, u32)]) -> Vec<(u32, usize)> {
-    let mut descendants = Vec::new();
-    let mut frontier = vec![(root, 0usize)];
-    let mut seen = BTreeSet::from([root]);
-    while let Some((parent, depth)) = frontier.pop() {
-        for &(pid, ppid) in pairs {
-            if ppid == parent && seen.insert(pid) {
-                let child_depth = depth.saturating_add(1);
-                descendants.push((pid, child_depth));
-                frontier.push((pid, child_depth));
-            }
-        }
-    }
-    descendants.sort_by(|(left_pid, left_depth), (right_pid, right_depth)| {
-        right_depth
-            .cmp(left_depth)
-            .then_with(|| left_pid.cmp(right_pid))
-    });
-    descendants
-}
-
-#[cfg(target_os = "linux")]
-fn process_parent_pairs() -> std::io::Result<Vec<(u32, u32)>> {
-    let mut pairs = Vec::new();
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        let Some(close) = stat.rfind(')') else {
-            continue;
-        };
-        let mut fields = stat[close + 1..].split_whitespace();
-        let _state = fields.next();
-        let Some(ppid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
-            continue;
-        };
-        pairs.push((pid, ppid));
-    }
-    Ok(pairs)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn process_parent_pairs() -> std::io::Result<Vec<(u32, u32)>> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid="])
-        .output()?;
-    if !output.status.success() {
-        return Err(std::io::Error::other("process tree snapshot failed"));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
-        })
-        .collect())
-}
-
-#[cfg(unix)]
-fn send_unix_signal(pid: u32, signal: &str) -> std::io::Result<()> {
-    // `kill` is a POSIX shell builtin even in slim runtime images that omit the
-    // standalone /bin/kill executable. The command text is fixed; signal and
-    // numeric PID are positional arguments, never interpolated into shell code.
-    let status = std::process::Command::new("/bin/sh")
-        .args([
-            "-c",
-            "kill \"$1\" \"$2\"",
-            "promtect-signal",
-            signal,
-            &pid.to_string(),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("process signal failed"))
-    }
-}
-
-#[cfg(unix)]
-fn terminate_descendant_tree(root: u32) -> std::io::Result<()> {
-    send_unix_signal(root, "-STOP")?;
-    let mut stopped = BTreeSet::new();
-    let mut descendants = Vec::new();
-    let mut snapshot_error = None;
-    for _ in 0..8 {
-        let pairs = match process_parent_pairs() {
-            Ok(pairs) => pairs,
-            Err(error) => {
-                snapshot_error = Some(error);
-                break;
-            }
-        };
-        descendants = descendants_from_pairs(root, &pairs);
-        let mut added = false;
-        for &(pid, _) in &descendants {
-            if stopped.insert(pid) {
-                // A descendant can exit between the snapshot and the signal.
-                // Keep cleaning the rest of the tree instead of abandoning a
-                // stopped root and any descendants already frozen.
-                let _ = send_unix_signal(pid, "-STOP");
-                added = true;
-            }
-        }
-        if !added {
-            break;
-        }
-    }
-    for (pid, _) in descendants {
-        let _ = send_unix_signal(pid, "-KILL");
-    }
-    let root_result = send_unix_signal(root, "-KILL");
-    if let Some(error) = snapshot_error {
-        return Err(error);
-    }
-    root_result
-}
-
 async fn terminate_guarded_child(
     child: &mut tokio::process::Child,
 ) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
-        match tokio::task::spawn_blocking(move || terminate_descendant_tree(pid)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) | Err(_) => {
-                eprintln!(
-                    "promtect guard: warning: descendant cleanup was incomplete; forcing the guarded tool to stop"
-                );
-                child.start_kill().ok();
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        if let Ok(raw) = i32::try_from(pid) {
+            let pgrp = Pid::from_raw(raw);
+            let _ = killpg(pgrp, Signal::SIGTERM);
+            if let Ok(status) = tokio::time::timeout(Duration::from_millis(750), child.wait()).await
+            {
+                return status;
             }
+            let _ = killpg(pgrp, Signal::SIGKILL);
         }
     }
-    #[cfg(not(unix))]
+
     child.start_kill().ok();
 
     child.wait().await
+}
+
+#[cfg(unix)]
+fn configure_guard_process_group(command: &mut tokio::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // Give the guarded tool an owned process group. Background helpers inherit
+    // this boundary even after their direct parent exits or they are reparented,
+    // so cleanup never has to guess from a stale PPID snapshot.
+    command.as_std_mut().process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_guard_process_group(_command: &mut tokio::process::Command) {}
+
+#[cfg(unix)]
+fn set_foreground_process_group(pgrp: nix::unistd::Pid) -> nix::Result<()> {
+    use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+
+    // Restoring the parent's foreground group necessarily happens while the
+    // parent is temporarily a background group. Block SIGTTOU only on this
+    // calling thread around tcsetpgrp, then restore the exact prior mask.
+    let mut blocked = SigSet::empty();
+    blocked.add(Signal::SIGTTOU);
+    let mut previous = SigSet::empty();
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))?;
+    let changed = nix::unistd::tcsetpgrp(std::io::stdin(), pgrp);
+    let restored = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+    changed.and(restored)
+}
+
+#[cfg(unix)]
+struct GuardTerminalLease {
+    original_pgrp: nix::unistd::Pid,
+}
+
+#[cfg(unix)]
+impl GuardTerminalLease {
+    fn acquire(child_pid: u32) -> Result<Option<Self>, String> {
+        use nix::errno::Errno;
+        use nix::sys::signal::{Signal, killpg};
+        use nix::unistd::Pid;
+
+        let original_pgrp = match nix::unistd::tcgetpgrp(std::io::stdin()) {
+            Ok(pgrp) => pgrp,
+            Err(Errno::ENOTTY) => return Ok(None),
+            Err(error) => return Err(format!("cannot inspect terminal job control ({error})")),
+        };
+        let child_pgrp = Pid::from_raw(i32::try_from(child_pid).map_err(|_| {
+            "guarded tool process identifier exceeded the platform limit".to_string()
+        })?);
+        set_foreground_process_group(child_pgrp)
+            .map_err(|error| format!("cannot give the terminal to the guarded tool ({error})"))?;
+        // The child can attempt a terminal read in the short spawn-to-transfer
+        // window and receive SIGTTIN. Resume the whole owned group after transfer.
+        let _ = killpg(child_pgrp, Signal::SIGCONT);
+        Ok(Some(Self { original_pgrp }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GuardTerminalLease {
+    fn drop(&mut self) {
+        if let Err(error) = set_foreground_process_group(self.original_pgrp) {
+            eprintln!(
+                "promtect guard: warning: could not restore terminal foreground ownership ({error})"
+            );
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct GuardTerminalLease;
+
+#[cfg(not(unix))]
+impl GuardTerminalLease {
+    fn acquire(_child_pid: u32) -> Result<Option<Self>, String> {
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(pgid: u32) -> bool {
+    use nix::sys::signal::killpg;
+    use nix::unistd::Pid;
+
+    i32::try_from(pgid)
+        .ok()
+        .is_some_and(|raw| killpg(Pid::from_raw(raw), None).is_ok())
+}
+
+#[cfg(unix)]
+async fn cleanup_guard_process_group(pgid: u32) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let Ok(raw) = i32::try_from(pgid) else {
+        return;
+    };
+    let pgrp = Pid::from_raw(raw);
+    let _ = killpg(pgrp, Signal::SIGTERM);
+    for _ in 0..20 {
+        if !process_group_exists(pgid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = killpg(pgrp, Signal::SIGKILL);
+    for _ in 0..20 {
+        if !process_group_exists(pgid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    eprintln!("promtect guard: warning: the guarded process group did not disappear cleanly");
+}
+
+#[cfg(not(unix))]
+async fn cleanup_guard_process_group(_pgid: u32) {}
+
+async fn wait_for_guard_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn drain_guard_service(mut task: tokio::task::JoinHandle<()>, name: &str) {
+    if tokio::time::timeout(Duration::from_secs(10), &mut task)
+        .await
+        .is_err()
+    {
+        eprintln!("promtect guard: warning: {name} did not drain within 10 seconds; forcing stop");
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+async fn shutdown_guard_services(
+    shutdown: &tokio::sync::watch::Sender<bool>,
+    signal_task: tokio::task::JoinHandle<()>,
+    proxy_task: tokio::task::JoinHandle<()>,
+    dashboard_task: Option<tokio::task::JoinHandle<()>>,
+) {
+    shutdown.send_replace(true);
+    signal_task.abort();
+    drain_guard_service(proxy_task, "proxy").await;
+    if let Some(task) = dashboard_task {
+        drain_guard_service(task, "dashboard").await;
+    }
 }
 
 /// Run a [`GuardPlan`]: start an ephemeral proxy, point the tool at it via its
@@ -1782,13 +1965,18 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     } else {
         (proxy::app(ctx), None)
     };
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let signal_shutdown_tx = shutdown_tx.clone();
+    let signal_task = tokio::spawn(async move {
+        crate::proxy::shutdown_signal().await;
+        signal_shutdown_tx.send_replace(true);
+    });
     let proxy_task = tokio::spawn(async move {
-        // Drain in-flight proxy requests on SIGINT / SIGTERM so secrets masked
-        // in a partially-buffered response are fully restored before the socket
-        // closes.  An error from with_graceful_shutdown still surfaces so a
-        // premature stop is never silently swallowed.
+        // One guard-owned shutdown signal drains both services on normal tool
+        // exit and on SIGINT/SIGTERM. This keeps partially restored responses
+        // alive until Axum finishes their in-flight connection.
         if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(crate::proxy::shutdown_signal())
+            .with_graceful_shutdown(wait_for_guard_shutdown(shutdown_rx))
             .await
         {
             eprintln!("promtect guard: proxy stopped serving ({e}) — tool is no longer masked");
@@ -1797,7 +1985,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
 
     if let Some(auth) = codex_auth {
         if let Err(error) = verify_codex_config(&plan.bin, &base_url, auth).await {
-            proxy_task.abort();
+            shutdown_guard_services(&shutdown_tx, signal_task, proxy_task, None).await;
             match error {
                 CodexPreflightError::NotFound => {
                     eprintln!(
@@ -1836,11 +2024,12 @@ pub async fn guard(plan: GuardPlan) -> i32 {
             audit_path: Arc::new(audit_path_for_dash.as_str().into()),
             restore_enabled: plan.restore,
         });
+        let dashboard_shutdown = shutdown_tx.subscribe();
         dashboard_task = Some(tokio::spawn(async move {
             // Drain in-flight dashboard requests on signal so metrics
             // pages aren't truncated when guard exits.
             if let Err(e) = axum::serve(dash_listener, dash_app)
-                .with_graceful_shutdown(crate::proxy::shutdown_signal())
+                .with_graceful_shutdown(wait_for_guard_shutdown(dashboard_shutdown))
                 .await
             {
                 eprintln!("promtect guard: dashboard error: {e}");
@@ -1855,20 +2044,15 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // kill_on_drop is a direct-child fallback; explicit shutdown owns descendants.
     let claude_settings_file = if plan.claude_fail_closed {
         let Some(notice_url) = claude_notice_url.as_deref() else {
-            proxy_task.abort();
-            if let Some(task) = dashboard_task {
-                task.abort();
-            }
+            shutdown_guard_services(&shutdown_tx, signal_task, proxy_task, dashboard_task).await;
             eprintln!("promtect guard: could not create Claude protection settings");
             return 1;
         };
         match ClaudeSettingsFile::create(&base_url, notice_url) {
             Ok(file) => Some(file),
             Err(_) => {
-                proxy_task.abort();
-                if let Some(task) = dashboard_task {
-                    task.abort();
-                }
+                shutdown_guard_services(&shutdown_tx, signal_task, proxy_task, dashboard_task)
+                    .await;
                 eprintln!("promtect guard: could not create owner-only Claude protection settings");
                 return 1;
             }
@@ -1889,6 +2073,9 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         configure_guard_child_network_env(&mut cmd);
         cmd.env_remove("ANTHROPIC_UNIX_SOCKET")
             .env_remove("CLAUDE_CODE_USE_GATEWAY");
+        for variable in CLAUDE_RUNTIME_OVERRIDE_VARS {
+            cmd.env_remove(variable);
+        }
         // Claude settings.json `env` values override the child process
         // environment. Inline settings win over user/project settings. The
         // preflight above separately rejects higher-precedence managed profiles.
@@ -1907,26 +2094,46 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     if plan.base_var == "OPENAI_API_BASE" {
         cmd.env("OPENAI_BASE_URL", &base_url);
     }
+    configure_guard_process_group(&mut cmd);
     // Wrapping a full-screen TUI (Claude Code, Codex, …): stay quiet during the
     // session so per-request notifications do not corrupt the tool's terminal.
     // The audit log + dashboard still capture everything; the summary prints below.
     crate::proxy::set_quiet(true);
+    let mut guarded_pgid = None;
+    let mut terminal_lease = None;
+    let mut launch_refused = false;
+    let child_shutdown = shutdown_tx.subscribe();
     let status = match cmd.spawn() {
         Ok(mut child) => {
-            tokio::select! {
-                status = child.wait() => status,
-                _ = crate::proxy::shutdown_signal() => {
-                    eprintln!("promtect guard: shutdown requested; stopping the guarded tool");
-                    terminate_guarded_child(&mut child).await
+            if let Some(pid) = child.id() {
+                guarded_pgid = Some(pid);
+                match GuardTerminalLease::acquire(pid) {
+                    Ok(lease) => terminal_lease = lease,
+                    Err(error) => {
+                        eprintln!("promtect guard: refusing to continue: {error}");
+                        launch_refused = true;
+                    }
+                }
+            }
+            if launch_refused {
+                terminate_guarded_child(&mut child).await
+            } else {
+                tokio::select! {
+                    status = child.wait() => status,
+                        _ = wait_for_guard_shutdown(child_shutdown) => {
+                        eprintln!("promtect guard: shutdown requested; stopping the guarded tool");
+                        terminate_guarded_child(&mut child).await
+                    }
                 }
             }
         }
         Err(error) => Err(error),
     };
-    proxy_task.abort();
-    if let Some(task) = dashboard_task {
-        task.abort();
+    if let Some(pgid) = guarded_pgid {
+        cleanup_guard_process_group(pgid).await;
     }
+    drop(terminal_lease);
+    shutdown_guard_services(&shutdown_tx, signal_task, proxy_task, dashboard_task).await;
 
     // Tripwire: if the proxy never saw a request, the tool bypassed it entirely
     // (e.g. it ignored the base-URL var) — secrets may have gone out unmasked.
@@ -1965,6 +2172,9 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         }
     }
 
+    if launch_refused {
+        return 1;
+    }
     match status {
         Ok(s) => exit_code(&s, &plan.bin),
         Err(e) => {
@@ -2046,16 +2256,6 @@ fn exit_code(status: &std::process::ExitStatus, bin: &str) -> i32 {
 mod tests {
     use super::*;
 
-    #[test]
-    #[cfg(unix)]
-    fn descendant_selection_is_transitive_and_excludes_siblings() {
-        let pairs = [(10, 1), (11, 10), (12, 11), (13, 10), (20, 1), (21, 20)];
-        assert_eq!(
-            descendants_from_pairs(10, &pairs),
-            vec![(12, 2), (11, 1), (13, 1)]
-        );
-    }
-
     fn plan(args: &[&str]) -> Result<GuardPlan, String> {
         plan_guard(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
@@ -2102,6 +2302,23 @@ mod tests {
         for selector in CLAUDE_PROVIDER_SELECTORS {
             assert_eq!(settings["env"][*selector], "0");
         }
+        for proxy in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "WS_PROXY",
+            "WSS_PROXY",
+            "ws_proxy",
+            "wss_proxy",
+        ] {
+            assert_eq!(settings["env"][proxy], "");
+        }
+        assert_eq!(settings["env"]["NO_PROXY"], "127.0.0.1,localhost");
+        assert_eq!(settings["env"]["no_proxy"], "127.0.0.1,localhost");
+        assert_eq!(settings["disableAllHooks"], false);
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"][0]["url"],
@@ -2157,12 +2374,22 @@ mod tests {
                 "--settings={\"env\":{\"ANTHROPIC_BASE_URL\":\"https://example.test\"}}",
             ],
             vec!["claude", "--", "--settings", "/tmp/settings.json"],
+            vec!["claude", "--managed-settings", "{}"],
+            vec!["claude", "--managed-settings={}"],
         ] {
             let error = plan(&args).unwrap_err();
             assert!(
                 error.contains("conflicts with Promtect's protected routing"),
                 "expected fail-closed settings error for {args:?}, got {error:?}"
             );
+        }
+    }
+
+    #[test]
+    fn claude_rejects_non_session_root_commands() {
+        for command in super::CLAUDE_UNSUPPORTED_ROOT_COMMANDS {
+            let error = plan(&["claude", command]).expect_err("root command must fail closed");
+            assert!(error.contains("protected routing or automatic notice"));
         }
     }
 
@@ -2422,7 +2649,13 @@ mod tests {
         ));
         let state =
             super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let records = "{}\n".repeat(super::CLAUDE_NOTICE_MAX_RECORDS + 1);
+        let record = serde_json::json!({
+            "action": "ignored",
+            "request_id": "different-session:request"
+        })
+        .to_string()
+            + "\n";
+        let records = record.repeat(super::CLAUDE_NOTICE_MAX_RECORDS + 1);
         std::fs::write(&path, records).expect("write excessive audit records");
 
         assert_eq!(
@@ -2435,6 +2668,28 @@ mod tests {
             super::take_claude_notice(&state),
             super::ClaudeNoticeRead::Notice(_)
         ));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_notice_copy_truncate_degrades_instead_of_claiming_empty() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-copy-truncate-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            b"{\"action\":\"ignored\",\"request_id\":\"prior:request\"}\n",
+        )
+        .expect("seed audit");
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
+        std::fs::write(&path, b"").expect("copy truncate audit");
+
+        assert_eq!(
+            super::take_claude_notice(&state),
+            super::ClaudeNoticeRead::Degraded
+        );
         std::fs::remove_file(path).ok();
     }
 
@@ -2650,6 +2905,16 @@ mod tests {
     }
 
     #[test]
+    fn claude_version_gate_is_exact_and_value_free() {
+        super::validate_claude_version(super::CLAUDE_SUPPORTED_VERSION.as_bytes())
+            .expect("pinned Claude version must pass");
+        let error = super::validate_claude_version(b"2.1.208 (Claude Code)")
+            .expect_err("unreviewed Claude version must fail closed");
+        assert!(error.contains(super::CLAUDE_SUPPORTED_VERSION));
+        assert!(!error.contains("2.1.208"));
+    }
+
+    #[test]
     fn claude_auth_environment_overrides_fail_closed() {
         for expected in super::CLAUDE_AUTH_OVERRIDE_VARS {
             assert_eq!(
@@ -2658,6 +2923,17 @@ mod tests {
             );
         }
         assert_eq!(super::first_claude_auth_override(|_| false), None);
+    }
+
+    #[test]
+    fn claude_runtime_environment_overrides_fail_closed() {
+        for expected in super::CLAUDE_RUNTIME_OVERRIDE_VARS {
+            assert_eq!(
+                super::first_claude_runtime_override(|variable| variable == *expected),
+                Some(*expected)
+            );
+        }
+        assert_eq!(super::first_claude_runtime_override(|_| false), None);
     }
 
     #[test]

@@ -43,7 +43,8 @@ promtect selftest        # → promtect selftest: PASS — no leak
 ## Notes
 
 - `guard claude` currently supports a verified first-party, individual Claude
-  Max profile only. It refuses API-key, Pro, Team, Enterprise, gateway, remote,
+  Max profile on the reviewed Claude Code 2.1.207 CLI contract only. It refuses
+  unreviewed CLI versions, API-key, Pro, Team, Enterprise, gateway, remote,
   MDM, registry, file-based, drop-in, or unknown profiles before binding because
   Claude's managed settings outrank command-line routing and hooks. API-key users
   can still use the manual proxy method above, without the automatic in-session
@@ -57,6 +58,10 @@ promtect selftest        # → promtect selftest: PASS — no leak
   its loopback Promtect URL cannot be routed through another proxy first. Known
   endpoint- or server-managed settings are rejected before Claude starts;
   use the manual proxy or an unmanaged individual Max profile.
+- Named guard accepts interactive Claude sessions, not Claude's separate root
+  commands (`ultrareview`, `gateway`, `agents`, update/install, and similar).
+  Those commands have independent network or lifecycle behavior that Promtect
+  has not verified, so guard rejects them before binding or authentication.
 - The unmanaged-profile check is a launch-time preflight, not an operating-system
   sandbox. Promtect cannot prevent a newly installed higher-precedence policy from
   changing a running Claude process; stop Claude and restart the guard before continuing.
