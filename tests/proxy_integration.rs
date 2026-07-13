@@ -1,10 +1,21 @@
 //! Integration tests for the Promtect proxy: header forwarding, multi-secret masking,
 //! 502 on upstream error, sentinel deduplication, and response restore invariants.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
-use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+use axum::{
+    Json, Router,
+    body::{Body, to_bytes},
+    extract::State,
+    http::{HeaderMap, HeaderValue, Request, header::CONTENT_ENCODING},
+    routing::post,
+};
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::ServiceExt;
 
 // ── Shared mock-upstream state ────────────────────────────────────────────────
 
@@ -13,10 +24,12 @@ use serde_json::{Value, json};
 struct Seen {
     body: Arc<Mutex<String>>,
     headers: Arc<Mutex<HeaderMap>>,
+    requests: Arc<AtomicU64>,
 }
 
 /// Echo handler: stores the received headers + body, returns `{"echo": <body>}`.
 async fn mock(State(seen): State<Seen>, headers: HeaderMap, body: String) -> Json<Value> {
+    seen.requests.fetch_add(1, Ordering::Relaxed);
     *seen.headers.lock().unwrap() = headers;
     *seen.body.lock().unwrap() = body.clone();
     Json(json!({ "echo": body }))
@@ -64,11 +77,55 @@ async fn spawn_mock() -> (String, Seen) {
     (url, seen)
 }
 
+/// Start a raw HTTP receiver that counts accepted TCP sockets before returning a
+/// minimal response. This distinguishes "no upstream request" from the stronger
+/// security invariant "no upstream connection was opened".
+async fn spawn_socket_counter() -> (String, Arc<AtomicU64>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicU64::new(0));
+    let accepted = Arc::clone(&connections);
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+
+    (format!("http://{addr}"), connections)
+}
+
 /// POST JSON body through Promtect; return the response body text.
 async fn post_through(promtect_url: &str, body: &str) -> (reqwest::StatusCode, String) {
     let resp = reqwest::Client::new()
         .post(format!("{promtect_url}/"))
         .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    (status, text)
+}
+
+/// POST a body with an explicit request `Content-Encoding` through Promtect.
+async fn post_with_encoding(
+    promtect_url: &str,
+    body: &str,
+    encoding: &str,
+) -> (reqwest::StatusCode, String) {
+    let resp = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .header("content-encoding", encoding)
         .body(body.to_string())
         .send()
         .await
@@ -476,6 +533,236 @@ async fn body_within_cap_passes_through() {
         seen.body.lock().unwrap().contains("hello world"),
         "a body under the cap must reach the upstream"
     );
+}
+
+/// Every non-identity request content coding is rejected before the mock upstream
+/// receives an HTTP request. The client-visible error is constant and does not
+/// reflect either the body or attacker-controlled encoding value.
+#[tokio::test]
+async fn non_identity_content_encodings_return_value_free_415_without_forwarding() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"{aws}"}}"#);
+    let encodings = [
+        "gzip",
+        "deflate",
+        "br",
+        "zstd",
+        "snappy-private-value",
+        "gzip, br",
+        "identity, gzip",
+        "GzIp",
+        "gzip , br",
+    ];
+
+    let (mock_url, seen) = spawn_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    for encoding in encodings {
+        let (status, response) = post_with_encoding(&promtect_url, &body, encoding).await;
+
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{encoding:?} must be rejected"
+        );
+        assert_eq!(
+            response,
+            "promtect: unsupported request Content-Encoding; send an identity-encoded body",
+            "the 415 response must be constant and value-free"
+        );
+        assert!(
+            !response.contains(aws),
+            "the response reflected the request body"
+        );
+        assert!(
+            !response.contains(encoding),
+            "the response reflected the Content-Encoding value"
+        );
+    }
+
+    assert_eq!(
+        seen.requests.load(Ordering::Relaxed),
+        0,
+        "rejected requests must not reach the upstream handler"
+    );
+}
+
+/// Rejection happens before reqwest resolves or opens the configured upstream.
+/// The controlled receiver counts accepted TCP sockets, not merely HTTP handlers.
+#[tokio::test]
+async fn rejected_content_encoding_opens_no_upstream_socket() {
+    let (upstream_url, connections) = spawn_socket_counter().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&upstream_url))).await;
+
+    let (status, _) = post_with_encoding(
+        &promtect_url,
+        r#"{"content":"AKIAIOSFODNN7EXAMPLE"}"#,
+        "gzip",
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "Promtect opened a TCP socket to the upstream"
+    );
+}
+
+/// Opaque non-UTF-8 header bytes cannot be emitted reliably by an HTTP client,
+/// so drive the Axum router directly. The malformed value must still receive the
+/// same fixed rejection, produce only fixed audit metadata, and open no socket.
+#[tokio::test]
+async fn non_utf8_content_encoding_is_value_free_and_opens_no_upstream_socket() {
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let body_marker = "non-utf8-private-body";
+    let body = format!(r#"{{"content":"{secret}","marker":"{body_marker}"}}"#);
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect_non_utf8_encoding_{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let (upstream_url, connections) = spawn_socket_counter().await;
+    let mut proxy_ctx = ctx(&upstream_url);
+    proxy_ctx.audit = Arc::new(promtect::audit::Audit::to_file(audit_path.clone()));
+    let app = promtect::proxy::app(proxy_ctx);
+
+    let mut request = Request::post("/")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let opaque = HeaderValue::from_bytes(b"\xff")
+        .expect("opaque non-UTF-8 header bytes are valid HeaderValue data");
+    assert!(opaque.to_str().is_err(), "test value must be non-UTF-8");
+    request.headers_mut().insert(CONTENT_ENCODING, opaque);
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let response_body = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        response_body,
+        "promtect: unsupported request Content-Encoding; send an identity-encoded body"
+    );
+    assert!(
+        !response_body
+            .as_ref()
+            .windows(secret.len())
+            .any(|w| w == secret.as_bytes())
+    );
+    assert!(
+        !response_body
+            .as_ref()
+            .windows(body_marker.len())
+            .any(|w| w == body_marker.as_bytes())
+    );
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "Promtect opened a TCP socket for a non-UTF-8 Content-Encoding"
+    );
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(audit.contains(r#""action":"request_rejected""#));
+    assert!(audit.contains(r#""detector":"content_encoding""#));
+    assert!(audit.contains("«unsupported-content-encoding»"));
+    assert!(
+        !audit.contains(secret),
+        "audit contains the synthetic secret"
+    );
+    assert!(
+        !audit.contains(body_marker),
+        "audit reflects request-body content"
+    );
+
+    let _ = std::fs::remove_file(audit_path);
+}
+
+/// Absent and identity-only request encodings keep the existing masking and
+/// restoration path, including mixed-case and optional whitespace around tokens.
+#[tokio::test]
+async fn identity_and_absent_content_encoding_continue_through_masking_and_restoration() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"{aws}"}}"#);
+    let encodings = [
+        None,
+        Some("identity"),
+        Some("IdEnTiTy"),
+        Some("identity , identity"),
+    ];
+
+    let (mock_url, seen) = spawn_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    for encoding in encodings {
+        let (status, response) = match encoding {
+            Some(value) => post_with_encoding(&promtect_url, &body, value).await,
+            None => post_through(&promtect_url, &body).await,
+        };
+
+        assert!(status.is_success(), "{encoding:?} should be accepted");
+        assert!(
+            response.contains(aws),
+            "{encoding:?} response did not restore the synthetic key"
+        );
+        let upstream_body = seen.body.lock().unwrap().clone();
+        assert!(
+            !upstream_body.contains(aws),
+            "{encoding:?} bypassed request masking"
+        );
+        assert!(
+            upstream_body.contains("«promtect:aws_key:"),
+            "{encoding:?} did not reach the upstream as a sentinel"
+        );
+    }
+
+    assert_eq!(
+        seen.requests.load(Ordering::Relaxed),
+        encodings.len() as u64
+    );
+}
+
+/// The rejection audit event contains only a fixed action/reason marker and a
+/// request ID. It never records the body, secret, or attacker-controlled coding.
+#[tokio::test]
+async fn rejected_content_encoding_writes_value_free_audit_event() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let encoding = "snappy-private-value";
+    let body = format!(r#"{{"content":"{aws}","marker":"body-private-value"}}"#);
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect_rejected_encoding_{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+
+    let (mock_url, seen) = spawn_mock().await;
+    let mut proxy_ctx = ctx(&mock_url);
+    proxy_ctx.audit = Arc::new(promtect::audit::Audit::to_file(audit_path.clone()));
+    let promtect_url = spawn(promtect::proxy::app(proxy_ctx)).await;
+
+    let (status, response) = post_with_encoding(&promtect_url, &body, encoding).await;
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+
+    assert_eq!(status, reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        response,
+        "promtect: unsupported request Content-Encoding; send an identity-encoded body"
+    );
+    assert!(audit.contains(r#""action":"request_rejected""#));
+    assert!(audit.contains(r#""detector":"content_encoding""#));
+    assert!(audit.contains("«unsupported-content-encoding»"));
+    assert!(!audit.contains(aws), "audit contains the synthetic secret");
+    assert!(
+        !audit.contains(encoding),
+        "audit reflects the encoding value"
+    );
+    assert!(
+        !audit.contains("body-private-value"),
+        "audit reflects request-body content"
+    );
+    assert_eq!(seen.requests.load(Ordering::Relaxed), 0);
+
+    let _ = std::fs::remove_file(audit_path);
 }
 
 // ── Streaming (SSE) restore ─────────────────────────────────────────────────

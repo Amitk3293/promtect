@@ -33,8 +33,10 @@ streamed reply so the answer stays useful.
   detection is a planned, separate capability.)
 - **The model's response is not scanned for secrets.** Restore only re-inserts
   sentinels minted for *this* request; a secret the model itself emits is not detected.
-- **Non-text bodies.** Binary, multipart, base64-encoded, or compressed request bodies
-  are forwarded unscanned (a secret encoded before it reaches Promtect is not matched).
+- **Non-text bodies.** Binary, multipart, or base64-encoded request bodies are forwarded
+  unscanned (a secret encoded before it reaches Promtect is not matched). Non-identity
+  `Content-Encoding` request bodies are rejected with HTTP 415 before any upstream
+  request because Promtect cannot safely scan compressed bytes.
 - **Tools without a base-URL override.** VS Code Copilot and browser/web chat
   (chatgpt.com, claude.ai) cannot be proxied without a root CA, which Promtect
   deliberately does not install.
