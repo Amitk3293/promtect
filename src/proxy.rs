@@ -117,14 +117,27 @@ fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Mat
 
 /// Re-run the exact active request detector chain over a masked body.
 ///
-/// Each non-sentinel segment is scanned independently so neither sentinel
-/// syntax nor a manufactured replacement token can trigger an arbitrary custom
-/// rule. Reusing [`compose_matches`] is the security invariant: a downstream
-/// paid or custom detector cannot participate in masking while being omitted
-/// from the final residual-leak check.
-fn scan_for_residual_leaks(masked: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Match> {
-    crate::mask::sentinel_free_segments(masked)
-        .flat_map(|segment| compose_matches(segment, extra))
+/// The detector receives the complete masked body, preserving anchored and
+/// context-sensitive rule semantics plus original byte offsets. Matches wholly
+/// contained inside an exact sentinel minted by this request's vault are
+/// discarded; unknown sentinel-shaped input and matches extending outside a
+/// minted sentinel remain residual leaks and fail closed. Reusing
+/// [`compose_matches`] is the security invariant: a downstream paid or custom
+/// detector cannot participate in masking while being omitted from the final
+/// residual check.
+fn scan_for_residual_leaks(
+    masked: &str,
+    extra: &Option<ExtraDetector>,
+    vault: &Vault,
+) -> Vec<detect::Match> {
+    let sentinel_spans: Vec<_> = crate::mask::minted_sentinel_spans(masked, vault).collect();
+    compose_matches(masked, extra)
+        .into_iter()
+        .filter(|hit| {
+            !sentinel_spans
+                .iter()
+                .any(|span| span.start <= hit.start && hit.end <= span.end)
+        })
         .collect()
 }
 
@@ -362,7 +375,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
                 // Re-run detectors with sentinels stripped so their kind:HEX content
                 // can't false-positive. A surviving match means masking missed it —
                 // block rather than forward plaintext secrets.
-                let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect);
+                let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect, &vault);
                 if !leaks.is_empty() {
                     let leak_kinds: Vec<&str> = {
                         let mut v: Vec<&str> = leaks.iter().map(|m| m.kind).collect();
@@ -877,7 +890,7 @@ mod tests {
             masked.contains("CUSTOMSECRET"),
             "the deliberately invalid first span must survive masking"
         );
-        let leaks = super::scan_for_residual_leaks(&masked, &active);
+        let leaks = super::scan_for_residual_leaks(&masked, &active, &vault);
         assert!(
             leaks.iter().any(|hit| hit.kind == "custom"),
             "the active extra detector must inspect and catch the residual canary"
@@ -887,7 +900,9 @@ mod tests {
 
     #[test]
     fn residual_scan_without_extra_remains_core_only() {
-        let leaks = super::scan_for_residual_leaks("AKIAIOSFODNN7EXAMPLE and CUSTOMSECRET", &None);
+        let vault = crate::vault::Vault::new();
+        let leaks =
+            super::scan_for_residual_leaks("AKIAIOSFODNN7EXAMPLE and CUSTOMSECRET", &None, &vault);
 
         assert!(leaks.iter().any(|hit| hit.kind == "aws_key"));
         assert!(!leaks.iter().any(|hit| hit.kind == "custom"));
@@ -896,7 +911,7 @@ mod tests {
     #[test]
     fn residual_scan_does_not_manufacture_matches_for_custom_rules() {
         let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
-            ["CUSTOMSECRET", "MASKED"]
+            ["CUSTOMSECRET", "promtect"]
                 .into_iter()
                 .filter_map(|needle| {
                     candidate.find(needle).map(|start| {
@@ -922,8 +937,104 @@ mod tests {
 
         assert!(masked.contains("«promtect:custom:"));
         assert!(
-            super::scan_for_residual_leaks(&masked, &active).is_empty(),
-            "sentinel handling must not expose a literal MASKED token to custom detectors"
+            super::scan_for_residual_leaks(&masked, &active, &vault).is_empty(),
+            "custom matches wholly inside sentinel syntax must not become residual leaks"
         );
+    }
+
+    #[test]
+    fn residual_scan_preserves_whole_body_context_across_a_sentinel() {
+        let vault = crate::vault::Vault::new();
+        let sentinel = vault.sentinel_for("custom", "masked_secret");
+        let masked = format!("BEGIN {sentinel} residual_secret END");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            if !candidate.starts_with("BEGIN ") || !candidate.ends_with(" END") {
+                return Vec::new();
+            }
+            let Some(start) = candidate.find("residual_secret") else {
+                return Vec::new();
+            };
+            vec![super::detect::Match::new(
+                "context_rule",
+                "residual_secret".to_owned(),
+                start,
+                start + "residual_secret".len(),
+            )]
+        });
+
+        let leaks = super::scan_for_residual_leaks(&masked, &Some(detector), &vault);
+
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].kind, "context_rule");
+        assert_eq!(leaks[0].value.as_str(), "residual_secret");
+    }
+
+    #[test]
+    fn residual_scan_does_not_create_artificial_fragment_anchors() {
+        let vault = crate::vault::Vault::new();
+        let sentinel = vault.sentinel_for("custom", "masked_secret");
+        let masked = format!("prefix {sentinel} anchored_tail");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            if candidate.strip_prefix(" anchored_tail").is_none() {
+                return Vec::new();
+            }
+            vec![super::detect::Match::new(
+                "anchored_rule",
+                "anchored_tail".to_owned(),
+                1,
+                candidate.len(),
+            )]
+        });
+
+        assert!(
+            super::scan_for_residual_leaks(&masked, &Some(detector), &vault).is_empty(),
+            "a tail fragment must not be presented to a rule as a new full input"
+        );
+    }
+
+    #[test]
+    fn residual_scan_blocks_a_match_partially_overlapping_a_minted_sentinel() {
+        let vault = crate::vault::Vault::new();
+        let sentinel = vault.sentinel_for("custom", "masked_secret");
+        let masked = format!("prefix {sentinel} residual_tail");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            let Some(start) = candidate.find("promtect") else {
+                return Vec::new();
+            };
+            let end = candidate.len();
+            vec![super::detect::Match::new(
+                "overlap_rule",
+                candidate[start..end].to_owned(),
+                start,
+                end,
+            )]
+        });
+
+        let leaks = super::scan_for_residual_leaks(&masked, &Some(detector), &vault);
+
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].kind, "overlap_rule");
+    }
+
+    #[test]
+    fn residual_scan_does_not_trust_user_supplied_sentinel_shapes() {
+        let vault = crate::vault::Vault::new();
+        let masked = "prefix «promtect:custom:0000» suffix";
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            let Some(start) = candidate.find("promtect") else {
+                return Vec::new();
+            };
+            vec![super::detect::Match::new(
+                "sentinel_shape_rule",
+                "promtect".to_owned(),
+                start,
+                start + "promtect".len(),
+            )]
+        });
+
+        let leaks = super::scan_for_residual_leaks(masked, &Some(detector), &vault);
+
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].kind, "sentinel_shape_rule");
     }
 }
