@@ -392,6 +392,9 @@ assert_codex_guard_rejected "cloud after model value named exec" --model exec cl
 assert_codex_guard_rejected "cloud after profile value named exec" --profile exec cloud
 assert_codex_guard_rejected "cloud after cd value named exec" --cd exec cloud
 assert_codex_guard_rejected "unknown root command" future-network-command
+assert_codex_guard_rejected "bare version prompt" version
+assert_codex_guard_rejected "bare version prompt after profile" \
+  --profile safe version
 
 failed_status_before=$(observer_count)
 if env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=/tmp/codex-guard \

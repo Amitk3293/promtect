@@ -376,10 +376,7 @@ fn inspect_codex_args(args: &[String]) -> Result<CodexInvocation, &str> {
             i += 1;
             continue;
         }
-        if matches!(
-            arg,
-            "--help" | "-h" | "--version" | "-V" | "help" | "version"
-        ) {
+        if matches!(arg, "--help" | "-h" | "--version" | "-V" | "help") {
             return Ok(CodexInvocation::DryRun);
         }
         if matches!(arg, "exec" | "e") {
@@ -1182,6 +1179,17 @@ mod tests {
         let error = plan(&["codex", "future-network-command"]).unwrap_err();
 
         assert!(error.contains("bypass Promtect"), "{error}");
+
+        for args in [
+            vec!["codex", "version"],
+            vec!["codex", "--profile", "safe", "version"],
+        ] {
+            let error = plan(&args).unwrap_err();
+            assert!(
+                error.contains("bypass Promtect"),
+                "expected bare version prompt to fail closed for {args:?}, got {error:?}"
+            );
+        }
     }
 
     #[test]
