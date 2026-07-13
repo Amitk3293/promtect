@@ -217,7 +217,7 @@
   a:hover { color: var(--accent-hover); }
   code, pre, kbd, samp { font-family: var(--font-mono); font-size: 0.92em; }
   ::selection { background: color-mix(in oklab, var(--seal-500) 30%, transparent); }
-  :focus-visible { outline: none; box-shadow: var(--ring); border-radius: var(--radius-sm); }
+  :focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; border-radius: var(--radius-sm); }
 
   /* --- Text helpers --- */
   .al-eyebrow {
@@ -326,7 +326,7 @@
   }
   .al-tab:hover { color: var(--text-strong); }
   .al-tab--active { background: var(--surface-raised); color: var(--text-strong); }
-  .al-tab:focus-visible { outline: none; box-shadow: var(--ring); }
+  .al-tab:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 
   /* ---- Icon button ---- */
   .al-iconbtn {
@@ -338,7 +338,7 @@
     transition: background var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
   }
   .al-iconbtn:hover { background: var(--surface-inset); color: var(--text-strong); border-color: var(--border-strong); }
-  .al-iconbtn:focus-visible { outline: none; box-shadow: var(--ring); }
+  .al-iconbtn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
   .al-iconbtn svg { width: 18px; height: 18px; }
   .al-iconbtn.is-spinning svg { animation: al-spin 600ms var(--ease-out); }
   @keyframes al-spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
@@ -505,7 +505,8 @@
   .al-license__v { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--text-body); }
 
   /* ---- Table ---- */
-  .al-table { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+  .al-tablewrap { width: 100%; overflow-x: auto; overscroll-behavior-inline: contain; }
+  .al-table { width: 100%; min-width: 680px; border-collapse: collapse; font-size: var(--text-sm); }
   .al-table th {
     text-align: left; font-family: var(--font-mono); font-size: var(--text-2xs);
     letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-faint);
@@ -547,6 +548,14 @@
     .al-topbar__status .al-badge--static { display: none; }
   }
   @media (max-width: 620px) {
+    .al-topbar { height: auto; min-height: 62px; flex-wrap: wrap; padding-block: var(--space-3); }
+    .al-topbar__brand svg { width: 118px; height: auto; }
+    .al-topbar__brand .al-topbar__sep, .al-topbar__title { display: none; }
+    .al-topbar__status { margin-left: auto; }
+    .al-topbar__actions { width: 100%; margin-left: 0; justify-content: space-between; }
+    .al-tabs { flex: 1; }
+    .al-tab { flex: 1; }
+    .al-page { padding-inline: var(--space-3); }
     .al-pipeline { padding: var(--space-5); }
     .al-detrow { grid-template-columns: 110px 1fr 44px; gap: var(--space-3); }
   }
@@ -720,7 +729,7 @@
 
       var connTone = state.connected ? "clear" : "leak";
       var connText = state.connected ? "live" : "offline";
-      var status = el("div", { class: "al-topbar__status" }, [
+      var status = el("div", { class: "al-topbar__status", "aria-live": "polite" }, [
         Badge({ tone: "accent", staticDot: true, dot: true, label: "127.0.0.1:8799" }),
         Badge({ tone: "neutral", staticDot: true, dot: true, label: "loopback" }),
         Badge({ tone: connTone, dot: true, label: connText })
@@ -739,15 +748,28 @@
       });
       refreshBtn.appendChild(iconSpan(ICON.refresh).firstChild);
 
-      var tabs = el("div", { class: "al-tabs", role: "tablist" }, [
+      var tabItems = [
         { value: "overview", label: "Overview" },
         { value: "endpoints", label: "Endpoints" }
-      ].map(function (it) {
+      ];
+      var tabs = el("div", { class: "al-tabs", role: "tablist", "aria-label": "Dashboard views" }, tabItems.map(function (it, index) {
         return el("button", {
           class: "al-tab" + (it.value === state.view ? " al-tab--active" : ""),
-          type: "button", role: "tab",
+          id: "tab-" + it.value, type: "button", role: "tab",
+          "aria-controls": "dashboard-panel",
           "aria-selected": it.value === state.view ? "true" : "false",
-          onclick: function () { actions.onView(it.value); }
+          tabindex: it.value === state.view ? "0" : "-1",
+          onclick: function () { actions.onView(it.value, true); },
+          onkeydown: function (event) {
+            var next = index;
+            if (event.key === "ArrowRight") next = (index + 1) % tabItems.length;
+            else if (event.key === "ArrowLeft") next = (index + tabItems.length - 1) % tabItems.length;
+            else if (event.key === "Home") next = 0;
+            else if (event.key === "End") next = tabItems.length - 1;
+            else return;
+            event.preventDefault();
+            actions.onView(tabItems[next].value, true);
+          }
         }, it.label);
       }));
 
@@ -763,7 +785,7 @@
       var head = el("div", { class: "al-pipeline__head" }, [
         el("div", null, [
           el("div", { class: "al-eyebrow", style: "margin-bottom: 6px" }, "Pipeline · request lifecycle"),
-          el("h3", { class: "al-panel__title" }, "Mask, forward, restore")
+          el("h3", { class: "al-panel__title" }, d.restoreOn ? "Mask, forward, restore" : "Mask and forward in strict mode")
         ]),
         el("div", { class: "al-legend", style: "gap: var(--space-3)" }, [
           Badge({ tone: state.connected ? "clear" : "leak", dot: true, label: state.connected ? "syncing" : "paused" }),
@@ -794,16 +816,18 @@
       var flow = el("div", { class: "al-pipeline__flow" }, [
         node("01", "Detect", ICON.scan, "detect", fmt(d.headline.requestsProtected), "requests scanned"),
         wire(false),
-        node("02", "Mask", ICON.mask, "mask", fmt(d.headline.secretsBlocked), "secrets sealed"),
-        wire(true),
-        node("03", "Restore", ICON.undo, "restore", fmt(d.headline.requestsClean), "passed clean")
+        node("02", "Mask", ICON.mask, "mask", fmt(d.headline.secretsMasked), "secrets masked"),
+        wire(d.restoreOn),
+        d.restoreOn
+          ? node("03", "Restore", ICON.undo, "restore", fmt(d.headline.secretsRestored), "secrets restored")
+          : node("03", "Restore off", ICON.lock, "", "OFF", "strict mode active")
       ]);
 
       return Card({ className: "al-pipeline al-rise" }, [head, flow]);
     }
 
     // ===========================================================================
-    //  HEADLINE — secrets blocked / requests protected / clean rate
+    //  HEADLINE — distinct value-free lifecycle outcomes
     // ===========================================================================
     function Headline(d) {
       var h = d.headline;
@@ -814,13 +838,22 @@
       }
       return el("div", { class: "al-headline al-rise", style: "animation-delay: 60ms" }, [
         Card({ index: "01" }, [icon("caught", ICON.shield), MetricStat({
-          label: "Secrets blocked", value: fmt(h.secretsBlocked), tone: "caught", foot: "all-time"
+          label: "Secrets masked", value: fmt(h.secretsMasked), tone: "caught", foot: "forwarded as sentinels"
         })]),
         Card({ index: "02" }, [icon("accent", ICON.activity), MetricStat({
           label: "Requests protected", value: fmt(h.requestsProtected), tone: "accent", foot: "all-time"
         })]),
         Card({ index: "03" }, [icon("clear", ICON.lock), MetricStat({
-          label: "Clean rate", value: h.cleanPct + "%", tone: "clear", foot: fmt(h.requestsClean) + " clean"
+          label: "Requests blocked", value: fmt(h.requestsBlocked), tone: "caught", foot: "not forwarded"
+        })]),
+        Card({ index: "04" }, [icon("clear", ICON.undo), MetricStat({
+          label: "Secrets restored", value: fmt(h.secretsRestored), tone: "clear", foot: "response sentinels expanded"
+        })]),
+        Card({ index: "05" }, [icon("accent", ICON.sparkle), MetricStat({
+          label: "Output secrets", value: fmt(h.outputSecrets), tone: "accent", foot: "response-side findings"
+        })]),
+        Card({ index: "06" }, [icon("caught", ICON.activity), MetricStat({
+          label: "Failures", value: fmt(h.failures), tone: "caught", foot: fmt(h.streamInterruptions) + " interrupted streams"
         })])
       ]);
     }
@@ -947,9 +980,19 @@
         ])));
       } else {
         rows = d.recent.map(function (r) {
-          var result = r.masked > 0
-            ? Badge({ tone: "caught", dot: true, label: r.masked + " masked" })
-            : Badge({ tone: "clear", dot: true, label: "clean" });
+          var result = r.interrupted
+            ? Badge({ tone: "leak", dot: true, label: "interrupted" })
+            : r.failures > 0
+              ? Badge({ tone: "leak", dot: true, label: "failed" })
+              : r.blocked
+                ? Badge({ tone: "caught", dot: true, label: "blocked" })
+                : r.outputSecrets > 0
+                  ? Badge({ tone: "pro", dot: true, label: r.outputSecrets + " output" })
+                  : r.restored > 0
+                    ? Badge({ tone: "clear", dot: true, label: r.restored + " restored" })
+                    : r.masked > 0
+                      ? Badge({ tone: "caught", dot: true, label: r.masked + " masked" })
+                      : Badge({ tone: "clear", dot: true, label: "clean" });
           var detCell = el("div", { class: "al-detcell" },
             r.detectors.length
               ? r.detectors.map(function (k) { return DetectorTag(k); })
@@ -963,7 +1006,9 @@
           ]);
         });
       }
-      return Card({ className: "al-panel", index: "08" }, [head, el("table", { class: "al-table" }, [thead, el("tbody", null, rows)])]);
+      return Card({ className: "al-panel", index: "08" }, [head,
+        el("div", { class: "al-tablewrap", tabindex: "0", "aria-label": "Recent requests table" },
+          el("table", { class: "al-table" }, [thead, el("tbody", null, rows)]))]);
     }
 
     // ===========================================================================
@@ -989,7 +1034,12 @@
         requests_total: h.requestsProtected,
         requests_with_secrets: h.withSecrets,
         requests_clean: h.requestsClean,
-        secrets_masked_total: h.secretsBlocked,
+        secrets_masked_total: h.secretsMasked,
+        requests_blocked_total: h.requestsBlocked,
+        secrets_restored_total: h.secretsRestored,
+        output_secrets_total: h.outputSecrets,
+        failures_total: h.failures,
+        stream_interruptions_total: h.streamInterruptions,
         by_detector: d.byDetector.slice(0, 6).reduce(function (a, x) { a[x.kind] = x.count; return a; }, {}),
         bytes_in_total: d.bytesIn,
         bytes_out_total: d.bytesOut
@@ -1050,6 +1100,11 @@
           ts: Number(r.ts_ms) || 0,
           reqId: rid8(r.request_id),
           masked: Number(r.masked) || 0,
+          blocked: Boolean(r.blocked),
+          restored: Number(r.restored) || 0,
+          outputSecrets: Number(r.output_secrets) || 0,
+          failures: Number(r.failures) || 0,
+          interrupted: Boolean(r.interrupted),
           detectors: Array.isArray(r.detectors) ? r.detectors.slice() : []
         };
       });
@@ -1057,12 +1112,15 @@
       var timeline = deriveTimeline(m.recent);
       var cleanPct = total > 0 ? ((clean / total) * 100).toFixed(1) : "0.0";
 
-      // restore on/off is not exposed by the API; default to "on" (the proxy
-      // default) so the pipeline motif reads truthfully in the common case.
       return {
         empty: total === 0,
         headline: {
-          secretsBlocked: Number(m.secrets_masked_total) || 0,
+          secretsMasked: Number(m.secrets_masked_total) || 0,
+          requestsBlocked: Number(m.requests_blocked_total) || 0,
+          secretsRestored: Number(m.secrets_restored_total) || 0,
+          outputSecrets: Number(m.output_secrets_total) || 0,
+          failures: Number(m.failures_total) || 0,
+          streamInterruptions: Number(m.stream_interruptions_total) || 0,
           requestsProtected: total,
           requestsClean: clean,
           cleanPct: cleanPct,
@@ -1073,7 +1131,7 @@
         recent: recent,
         bytesIn: Number(m.bytes_in_total) || 0,
         bytesOut: Number(m.bytes_out_total) || 0,
-        restoreOn: true,
+        restoreOn: m.restore_enabled === true,
         pro: { active: proKinds > 0, proKinds: proKinds, freeKinds: freeKinds }
       };
     }
@@ -1115,7 +1173,10 @@
 
     function render() {
       var d = state.model;
-      var main = el("main", { class: "al-page" }, [
+      var main = el("main", {
+        class: "al-page", id: "dashboard-panel", role: "tabpanel",
+        "aria-labelledby": "tab-" + state.view
+      }, [
         el("div", { class: "al-page__head al-rise" }, [
           el("div", { class: "al-page__kicker" },
             Badge({ tone: "accent", staticDot: true, dot: true, label: "Local · offline · value-free" })),
@@ -1141,7 +1202,11 @@
 
       var app = el("div", { class: "al-app" }, [
         TopBar(state, {
-          onView: function (v) { state.view = v; render(); },
+          onView: function (v, focusTab) {
+            state.view = v;
+            render();
+            if (focusTab) document.getElementById("tab-" + v).focus();
+          },
           onRefresh: function () { poll(); }
         }),
         main

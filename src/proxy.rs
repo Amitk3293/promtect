@@ -4,7 +4,7 @@
 use crate::audit::Audit;
 use crate::detect;
 use crate::mask::mask_with_matches;
-use crate::stream::{StreamRestorer, restore_stream};
+use crate::stream::{StreamRestorer, recover_stream_errors, restore_stream};
 use crate::vault::Vault;
 use axum::{
     Router,
@@ -14,7 +14,10 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
+use http_body_util::BodyExt as _;
 use std::sync::Arc;
+
+const STREAM_OUTCOME_HEADER: &str = "promtect-stream-outcome";
 
 /// Default cap on the request body Promtect will buffer in memory before masking.
 /// A masking proxy has to read the whole body to scan it, so an unbounded read
@@ -278,6 +281,12 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     let body_bytes = match axum::body::to_bytes(req.into_body(), ctx.max_body_bytes).await {
         Ok(b) => b,
         Err(_) => {
+            ctx.audit.record(
+                "request_blocked",
+                "body_limit",
+                "«request-body-rejected»",
+                &request_id,
+            );
             return text_response(
                 413,
                 format!(
@@ -362,6 +371,12 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
                         body_bytes.len(),
                         masked.len(),
                     );
+                    ctx.audit.record(
+                        "request_blocked",
+                        "residual_secret",
+                        "«residual-secret»",
+                        &request_id,
+                    );
                     return text_response(
                         400,
                         format!(
@@ -400,6 +415,12 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             // don't disclose the upstream host/path to the proxied tool (which may
             // echo or log the response). The error never contains the secret.
             eprintln!("promtect: upstream request failed: {e}");
+            ctx.audit.record(
+                "request_failed",
+                "upstream",
+                "«upstream-request-failed»",
+                &request_id,
+            );
             text_response(502, "promtect: upstream request failed".to_string())
         }
     }
@@ -533,25 +554,42 @@ async fn restore_response(
     // A binary response (e.g. an image endpoint) must stream back byte-for-byte —
     // running it through the restorer would lossily corrupt it. `text/event-stream`
     // is textual, so SSE is restored.
-    let body = if will_restore {
+    let source = if will_restore {
         // Transparent mode: restore secrets incrementally as the response
         // streams. SSE answers reach the client token-by-token instead of being
         // buffered whole (the M0 "hang"). The vault moves into the stream, which
         // the server polls after this handler returns.
-        let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id)
+        let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id.clone())
             .with_output_scanner(ctx.output_scan.clone());
-        Body::from_stream(restore_stream(r.bytes_stream().boxed(), sr))
+        restore_stream(r.bytes_stream().boxed(), sr).boxed()
     } else {
         // Strict mode (PROMTECT_RESTORE=false), or a binary/compressed response:
         // never re-insert secrets. Stream the body straight through; the
         // per-request vault is dropped (and its contents zeroized) unused.
         drop(vault);
-        Body::from_stream(r.bytes_stream())
+        r.bytes_stream().boxed()
     };
+
+    let audit = Arc::clone(&ctx.audit);
+    let outcome_request_id = request_id.clone();
+    let (recovered, outcome) = recover_stream_errors(source, audit, outcome_request_id);
+    let body = Body::from_stream(recovered).with_trailers(async move {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            STREAM_OUTCOME_HEADER,
+            if outcome.was_interrupted() {
+                axum::http::HeaderValue::from_static("interrupted")
+            } else {
+                axum::http::HeaderValue::from_static("complete")
+            },
+        );
+        Some(Ok::<_, axum::Error>(trailers))
+    });
+    out = out.header("trailer", STREAM_OUTCOME_HEADER);
 
     // Status and headers come from an already-parsed upstream response, so this
     // build cannot realistically fail; fall back to a clean 502 rather than panic.
-    out.body(body)
+    out.body(Body::new(body))
         .unwrap_or_else(|_| text_response(502, "promtect: could not assemble upstream response"))
 }
 

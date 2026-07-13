@@ -409,6 +409,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         if let Ok(dash_listener) = tokio::net::TcpListener::bind(&dash_addr).await {
             let dash_app = crate::dashboard::app(crate::dashboard::DashCtx {
                 audit_path: Arc::new(audit_path_for_dash.as_str().into()),
+                restore_enabled: plan.restore,
             });
             tokio::spawn(async move {
                 // Drain in-flight dashboard requests on signal so metrics

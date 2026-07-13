@@ -53,6 +53,12 @@ They verify behavior that spans the full request/response pipeline.
 
 **Run:** `cargo test` (all L2) or `cargo test --test integration` / `cargo test --test proxy_integration` individually
 
+**Dashboard browser matrix** (`tests/dashboard-browser/`): runs the real embedded
+dashboard in Docker and verifies desktop rendering, strict/restore mode truth,
+mobile overflow, keyboard tab focus, and reduced-motion behavior with Chromium.
+The Playwright package and browser image are pinned to the same version.
+**Run:** `make dashboard-browser-test`.
+
 **Dashboard server** (`tests/dashboard.rs`): starts the observability server on an
 ephemeral port and asserts `/api/metrics` (JSON), `/metrics` (Prometheus text), and
 `/` (the embedded offline UI) each respond correctly, and that a missing audit file

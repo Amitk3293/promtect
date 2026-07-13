@@ -25,7 +25,9 @@ use crate::vault::Vault;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A response-side detection pass, injected by `promtect-pro` (license-gated):
 /// it scans the restored response text for secrets the model echoed back or
@@ -305,6 +307,71 @@ where
     })
 }
 
+/// Shared completion state for a downstream response stream.
+///
+/// The response body exposes this as the value-free
+/// `promtect-stream-outcome` HTTP trailer after all payload bytes. A trailer is
+/// used because an interruption is not knowable when the response headers are
+/// first sent, and adding a marker to an SSE/NDJSON payload would corrupt the
+/// provider protocol.
+#[derive(Clone)]
+pub(crate) struct StreamOutcome {
+    interrupted: Arc<AtomicBool>,
+}
+
+impl StreamOutcome {
+    pub(crate) fn was_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+}
+
+/// Convert a fallible response stream into a byte-preserving downstream stream.
+///
+/// Every successful upstream byte is emitted unchanged. If the source fails,
+/// the error itself is converted into one value-free audit event and an HTTP
+/// trailer by the caller; it is not re-yielded after the final bytes because
+/// Hyper may abort the connection before a preceding carry-flush frame reaches
+/// the client. The returned outcome handle distinguishes that recovered
+/// interruption from an ordinary end-of-stream without changing payload bytes.
+pub(crate) fn recover_stream_errors<E, S>(
+    stream: S,
+    audit: Arc<Audit>,
+    request_id: String,
+) -> (
+    impl Stream<Item = Result<Bytes, Infallible>> + Send,
+    StreamOutcome,
+)
+where
+    E: Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    let outcome = StreamOutcome {
+        interrupted: Arc::new(AtomicBool::new(false)),
+    };
+    let outcome_for_stream = outcome.clone();
+    let recovered = stream.filter_map(move |item| {
+        let audit = Arc::clone(&audit);
+        let request_id = request_id.clone();
+        let outcome = outcome_for_stream.clone();
+        async move {
+            match item {
+                Ok(bytes) => Some(Ok(bytes)),
+                Err(_) => {
+                    outcome.interrupted.store(true, Ordering::Release);
+                    audit.record(
+                        "stream_interrupted",
+                        "upstream",
+                        "«stream-interrupted»",
+                        &request_id,
+                    );
+                    None
+                }
+            }
+        }
+    });
+    (recovered, outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -551,5 +618,42 @@ mod tests {
             "x «promtect:aws_key:00",
             "held carry bytes must be flushed, not dropped, before the error"
         );
+    }
+
+    #[tokio::test]
+    async fn recovered_interruption_preserves_bytes_and_writes_value_free_outcome() {
+        #[derive(Debug)]
+        struct TestErr;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-stream-outcome-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(Audit::to_file(path.clone()));
+        let (vault, _sentinel) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
+        let sr = StreamRestorer::new(vault, Arc::clone(&audit), "request-1".into());
+        let partial = "data: «promtect:aws_key:00";
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, TestErr>(Bytes::from(partial)),
+            Err(TestErr),
+        ])
+        .boxed();
+
+        let restored = restore_stream(upstream, sr);
+        let (recovered, outcome) =
+            recover_stream_errors(restored, Arc::clone(&audit), "request-1".into());
+        let emitted: Vec<u8> = recovered
+            .map(|item| item.expect("recovered stream is infallible"))
+            .flat_map(futures_util::stream::iter)
+            .collect()
+            .await;
+        drop(audit);
+
+        let log = std::fs::read_to_string(&path).expect("read stream outcome audit");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(emitted, partial.as_bytes());
+        assert!(outcome.was_interrupted());
+        assert!(log.contains("\"action\":\"stream_interrupted\""));
+        assert!(!log.contains("AKIAIOSFODNN7EXAMPLE"));
     }
 }

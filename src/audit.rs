@@ -2,7 +2,7 @@
 // Copyright (c) 2026 AK DevOps Solutions SL
 
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Seek, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -74,13 +74,13 @@ impl Audit {
     /// `set_permissions` fails we still return the handle (fail-open).
     fn open_append(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         let mut opts = OpenOptions::new();
-        opts.create(true).append(true);
+        opts.create(true).read(true).append(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let f = opts.open(path)?;
+        let mut f = opts.open(path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -92,7 +92,66 @@ impl Audit {
                 let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
             }
         }
+        Self::repair_truncated_tail(&mut f)?;
         Ok(f)
+    }
+
+    /// Remove an incomplete final JSONL record before the next append.
+    ///
+    /// A process crash can leave the final event without its terminating newline.
+    /// Appending directly would concatenate the next valid JSON object onto that
+    /// fragment and corrupt both records. Scan backwards in bounded chunks and
+    /// truncate to the last complete line. The discarded bytes are never copied
+    /// elsewhere, preserving the owner-only and value-free storage boundary even
+    /// when the file was externally modified.
+    fn repair_truncated_tail(file: &mut std::fs::File) -> std::io::Result<()> {
+        const SCAN_CHUNK: usize = 8 * 1024;
+
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        file.seek(std::io::SeekFrom::End(-1))?;
+        let mut last = [0_u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(());
+        }
+
+        let mut end = len;
+        let mut buf = [0_u8; SCAN_CHUNK];
+        let complete_prefix = loop {
+            let start = end.saturating_sub(SCAN_CHUNK as u64);
+            let width = usize::try_from(end - start).unwrap_or(SCAN_CHUNK);
+            file.seek(std::io::SeekFrom::Start(start))?;
+            file.read_exact(&mut buf[..width])?;
+
+            if let Some(offset) = buf[..width].iter().rposition(|byte| *byte == b'\n') {
+                break start + offset as u64 + 1;
+            }
+            if start == 0 {
+                break 0;
+            }
+            end = start;
+        };
+
+        // Preserve a complete JSON object whose only defect is a missing final
+        // newline. Audit events are tiny; cap validation so an untrusted huge tail
+        // cannot force an equally huge allocation during startup recovery.
+        let tail_len = len - complete_prefix;
+        if tail_len <= 64 * 1024 {
+            let mut tail = vec![0_u8; usize::try_from(tail_len).unwrap_or(0)];
+            file.seek(std::io::SeekFrom::Start(complete_prefix))?;
+            file.read_exact(&mut tail)?;
+            if serde_json::from_slice::<serde_json::Value>(&tail).is_ok() {
+                file.write_all(b"\n")?;
+                return Ok(());
+            }
+        }
+
+        file.set_len(complete_prefix)?;
+        Ok(())
     }
 
     /// Append one already-serialised JSONL line, fail-open.
@@ -304,6 +363,59 @@ mod tests {
         assert!(contents.contains("\"action\":\"mask\""));
         assert!(contents.contains("\"action\":\"unmask\""));
         assert!(contents.contains("\"action\":\"request\""));
+    }
+
+    #[test]
+    fn truncated_tail_is_removed_before_next_valid_event() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-tail-repair-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            b"{\"action\":\"request\",\"request_id\":\"complete\"}\n{\"action\":\"mask\"",
+        )
+        .expect("seed truncated audit log");
+
+        let audit = Audit::to_file(path.clone());
+        audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "next");
+
+        let contents = std::fs::read_to_string(&path).expect("read repaired audit log");
+        std::fs::remove_file(&path).ok();
+        let records: Vec<serde_json::Value> = contents
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every retained line must be valid JSON"))
+            .collect();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["request_id"], "complete");
+        assert_eq!(records[1]["request_id"], "next");
+        assert!(!contents.contains("{\"action\":\"mask\"{\""));
+    }
+
+    #[test]
+    fn complete_final_json_without_newline_is_preserved() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-tail-newline-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &path,
+            b"{\"action\":\"request\",\"request_id\":\"complete\"}",
+        )
+        .expect("seed newline-less audit log");
+
+        let audit = Audit::to_file(path.clone());
+        audit.record("mask", "aws_key", "«promtect:aws_key:0001»", "next");
+        let contents = std::fs::read_to_string(&path).expect("read repaired audit log");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(contents.lines().count(), 2);
+        assert!(
+            contents
+                .lines()
+                .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok())
+        );
     }
 
     /// #47: the one-shot write-failure warning is gated by the `warned` flag —

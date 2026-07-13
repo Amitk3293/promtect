@@ -795,6 +795,162 @@ async fn spawn_stream_mock() -> (String, Seen) {
     (url, seen)
 }
 
+fn truncate_before_sentinel_close(masked: &str) -> String {
+    let close = masked
+        .find('»')
+        .expect("masked request contains a sentinel close");
+    masked[..close].to_string()
+}
+
+async fn mock_interrupted_stream(
+    State(seen): State<Seen>,
+    body: String,
+) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    let partial = truncate_before_sentinel_close(&body);
+    let first = futures_util::stream::once(async move {
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(partial))
+    });
+    let failure = futures_util::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("synthetic interrupted stream"))
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(futures_util::StreamExt::chain(
+            first, failure,
+        )))
+        .unwrap()
+}
+
+async fn mock_timed_out_stream(State(seen): State<Seen>, body: String) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    let partial = truncate_before_sentinel_close(&body);
+    let first = futures_util::stream::once(async move {
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(partial))
+    });
+    let stalled = futures_util::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(b"late"))
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(futures_util::StreamExt::chain(
+            first, stalled,
+        )))
+        .unwrap()
+}
+
+async fn assert_recovered_stream_failure(
+    upstream_handler: axum::routing::MethodRouter<Seen>,
+    read_timeout: Option<std::time::Duration>,
+) {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let request_body = format!(r#"{{"content":"{aws}"}}"#);
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-stream-recovery-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let seen = Seen::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/", upstream_handler)
+            .with_state(seen.clone()),
+    )
+    .await;
+    let mut proxy_ctx = ctx(&upstream);
+    proxy_ctx.audit = Arc::new(promtect::audit::Audit::to_file(audit_path.clone()));
+    if let Some(timeout) = read_timeout {
+        proxy_ctx.client = reqwest::Client::builder()
+            .read_timeout(timeout)
+            .build()
+            .expect("timeout test client");
+    }
+    let proxy = spawn(promtect::proxy::app(proxy_ctx)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/"))
+        .header("content-type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("proxy response headers");
+    assert_eq!(
+        response
+            .headers()
+            .get("trailer")
+            .and_then(|v| v.to_str().ok()),
+        Some("promtect-stream-outcome")
+    );
+    let received = response.bytes().await.expect("recovered response body");
+    let masked = seen.body.lock().unwrap().clone();
+    let expected = truncate_before_sentinel_close(&masked);
+    let audit = std::fs::read_to_string(&audit_path).expect("stream recovery audit");
+    std::fs::remove_file(&audit_path).ok();
+
+    assert_eq!(received, expected.as_bytes());
+    assert!(!masked.contains(aws));
+    assert!(audit.contains("\"action\":\"stream_interrupted\""));
+    assert!(!audit.contains(aws));
+}
+
+#[tokio::test]
+async fn interrupted_stream_preserves_every_upstream_byte_and_audits_outcome() {
+    assert_recovered_stream_failure(post(mock_interrupted_stream), None).await;
+}
+
+#[tokio::test]
+async fn interrupted_stream_sends_terminal_http1_outcome_trailer() {
+    let seen = Seen::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/", post(mock_interrupted_stream))
+            .with_state(seen),
+    )
+    .await;
+    let proxy = spawn(promtect::proxy::app(ctx(&upstream))).await;
+    let authority = proxy
+        .strip_prefix("http://")
+        .expect("spawn returns an HTTP URL");
+    let body = r#"{"content":"AKIAIOSFODNN7EXAMPLE"}"#;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nTE: trailers\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    let mut socket = tokio::net::TcpStream::connect(authority)
+        .await
+        .expect("connect raw HTTP/1.1 client to proxy");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw HTTP/1.1 request");
+    let mut wire = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.read_to_end(&mut wire),
+    )
+    .await
+    .expect("proxy closes Connection: close response")
+    .expect("read raw HTTP/1.1 response");
+    let wire = String::from_utf8_lossy(&wire).to_ascii_lowercase();
+
+    assert!(wire.contains("trailer: promtect-stream-outcome\r\n"));
+    assert!(
+        wire.ends_with("0\r\npromtect-stream-outcome: interrupted\r\n\r\n"),
+        "terminal outcome trailer missing from HTTP/1.1 wire response: {wire:?}"
+    );
+}
+
+#[tokio::test]
+async fn timed_out_stream_preserves_every_received_byte_and_audits_outcome() {
+    assert_recovered_stream_failure(
+        post(mock_timed_out_stream),
+        Some(std::time::Duration::from_millis(50)),
+    )
+    .await;
+}
+
 /// A sentinel split across streamed chunk boundaries is fully reassembled and
 /// restored: the client sees the real secret, never a sentinel, and the SSE
 /// content-type is preserved.
