@@ -1,0 +1,42 @@
+FROM node:22.23.1-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf
+
+ARG TARGETARCH
+ARG OLLAMA_VERSION=0.31.2
+ARG AIDER_VERSION=0.86.2
+ARG OLLAMA_AMD64_SHA256=2c88f0f31a959bac5a3cad4cc5296ec568551d4aa79f548f554adb2b575b3133
+ARG OLLAMA_ARM64_SHA256=07a0adfcf3ed48ff110e2a3bcec897ca4d3f77d6f817d6ff63e83debfd102a31
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH=/opt/provider-clis/node_modules/.bin:${PATH}
+
+COPY package.json package-lock.json /opt/provider-clis/
+COPY requirements.lock /tmp/requirements.lock
+
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends ca-certificates curl git python3 python3-pip zstd \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm ci --prefix /opt/provider-clis --omit=dev \
+ && grep --extended-regexp "^aider-chat==${AIDER_VERSION}[[:space:]]*\\\\$" /tmp/requirements.lock \
+ && pip3 install --break-system-packages --only-binary=:all: --require-hashes --requirement /tmp/requirements.lock \
+ && case "${TARGETARCH}" in \
+      amd64) ollama_arch=amd64; ollama_sha256="${OLLAMA_AMD64_SHA256}" ;; \
+      arm64) ollama_arch=arm64; ollama_sha256="${OLLAMA_ARM64_SHA256}" ;; \
+      *) echo "unsupported Docker architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl --fail --silent --show-error --location \
+      --output /tmp/ollama.tar.zst \
+      "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${ollama_arch}.tar.zst" \
+ && echo "${ollama_sha256}  /tmp/ollama.tar.zst" | sha256sum --check --strict \
+ && tar --zstd --extract --file /tmp/ollama.tar.zst --directory /usr bin/ollama \
+ && rm /tmp/ollama.tar.zst /tmp/requirements.lock \
+ && useradd --create-home --uid 10001 harness \
+ && mkdir --parents /harness /synthetic \
+ && chown -R harness:harness /harness /synthetic
+
+WORKDIR /harness
+COPY mock_provider.py run_protocols.py verify_cli_observations.py run_clis.sh ./
+
+USER harness
+WORKDIR /synthetic

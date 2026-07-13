@@ -1,3 +1,4 @@
 /target
 .claude/
 *.jsonl
+tests/provider-harness/.requirements-wheels/

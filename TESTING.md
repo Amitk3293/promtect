@@ -113,6 +113,20 @@ failure.
 
 ---
 
+### L6 — Provider protocols and pinned CLIs (Docker only)
+
+`tests/provider-harness/` runs the packaged Promtect binary, provider mocks,
+protocol assertions, and current supported CLIs entirely in Docker. Runtime is
+credential-free and isolated on an internal network. It covers Anthropic SSE,
+OpenAI Responses SSE, Ollama NDJSON, byte-split restoration, compression,
+sentinel mutation, timeout, refusal, interruption, and real CLI routing.
+
+**Run:** `make provider-harness`. See
+[`tests/provider-harness/README.md`](tests/provider-harness/README.md) for the
+pins, safety model, and explicit failure-mode expectations.
+
+---
+
 ## Adding to the Suite — the Contract
 
 - **New detector** → add at least one positive case and one negative case
@@ -133,6 +147,7 @@ make test                           # run the full test suite
 make lint                           # cargo fmt --check + clippy -D warnings
 make coverage                       # text coverage summary (needs cargo-llvm-cov)
 make smoke                          # smoke-test the compiled binary
+make provider-harness               # Docker-only provider + real-CLI validation
 
 cargo test --test integration       # L2 canary integration tests only
 cargo test --test proxy_integration # L2 proxy integration tests only
