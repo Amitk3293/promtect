@@ -162,6 +162,17 @@ pub(crate) fn neutralize_sentinels(masked: &str) -> std::borrow::Cow<'_, str> {
     SENTINEL_RE.replace_all(masked, "«MASKED»")
 }
 
+/// Yield only text that remains outside Promtect sentinel spans.
+///
+/// The proxy uses this for downstream-composed residual checks. Unlike replacing
+/// sentinels with a fixed word, splitting cannot manufacture input that an
+/// arbitrary paid or rulebook detector mistakes for a real secret.
+pub(crate) fn sentinel_free_segments(masked: &str) -> impl Iterator<Item = &str> {
+    SENTINEL_RE
+        .split(masked)
+        .filter(|segment| !segment.is_empty())
+}
+
 /// Re-scan a masked body with the public Core detector set.
 ///
 /// Downstream-composed proxies use their active detector chain through the

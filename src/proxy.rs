@@ -117,13 +117,15 @@ fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Mat
 
 /// Re-run the exact active request detector chain over a masked body.
 ///
-/// Sentinels are neutralized first so their kind/counter syntax cannot produce
-/// false positives. Reusing [`compose_matches`] is the security invariant: a
-/// downstream paid or custom detector cannot participate in masking while being
-/// omitted from the final residual-leak check.
+/// Each non-sentinel segment is scanned independently so neither sentinel
+/// syntax nor a manufactured replacement token can trigger an arbitrary custom
+/// rule. Reusing [`compose_matches`] is the security invariant: a downstream
+/// paid or custom detector cannot participate in masking while being omitted
+/// from the final residual-leak check.
 fn scan_for_residual_leaks(masked: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Match> {
-    let neutralized = crate::mask::neutralize_sentinels(masked);
-    compose_matches(&neutralized, extra)
+    crate::mask::sentinel_free_segments(masked)
+        .flat_map(|segment| compose_matches(segment, extra))
+        .collect()
 }
 
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
@@ -889,5 +891,39 @@ mod tests {
 
         assert!(leaks.iter().any(|hit| hit.kind == "aws_key"));
         assert!(!leaks.iter().any(|hit| hit.kind == "custom"));
+    }
+
+    #[test]
+    fn residual_scan_does_not_manufacture_matches_for_custom_rules() {
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            ["CUSTOMSECRET", "MASKED"]
+                .into_iter()
+                .filter_map(|needle| {
+                    candidate.find(needle).map(|start| {
+                        super::detect::Match::new(
+                            "custom",
+                            needle.to_owned(),
+                            start,
+                            start + needle.len(),
+                        )
+                    })
+                })
+                .collect()
+        });
+        let active = Some(detector);
+        let vault = crate::vault::Vault::new();
+        let masked = crate::mask::mask_with_matches(
+            "payload CUSTOMSECRET",
+            super::compose_matches("payload CUSTOMSECRET", &active),
+            &vault,
+            &crate::audit::Audit::null(),
+            "request",
+        );
+
+        assert!(masked.contains("«promtect:custom:"));
+        assert!(
+            super::scan_for_residual_leaks(&masked, &active).is_empty(),
+            "sentinel handling must not expose a literal MASKED token to custom detectors"
+        );
     }
 }
