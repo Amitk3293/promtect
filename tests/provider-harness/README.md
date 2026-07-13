@@ -35,6 +35,12 @@ time, so the build is not claimed to be byte-for-byte deterministic. Claude's
 npm installer remains version-pinned even though current documentation
 recommends the native installer.
 
+CI runs the complete harness natively on both supported Linux architectures:
+`ubuntu-24.04` for `linux/amd64` and `ubuntu-24.04-arm` for `linux/arm64`.
+Each matrix job verifies the host architecture before Docker builds the CLI
+image, so architecture-specific Python wheels and Ollama archive hashes cannot
+borrow a green result from the other platform.
+
 ### Regenerating the Python lock
 
 Run these commands from the repository root. They resolve the direct pin in
