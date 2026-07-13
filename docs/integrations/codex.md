@@ -15,9 +15,14 @@ ChatGPT subscription authentication, all runtime `-c`/`--config` and feature
 overrides, remote/cloud/server modes, OpenRouter, and local-provider selection
 before starting the protected session. Those modes cannot currently satisfy the
 fail-closed routing contract. Use normal flags such as `--model` for supported
-options. The protected route uses HTTP Responses transport with WebSockets,
-automatic provider retries, request compression, and child-side external proxy
-variables disabled, so each model call has one observable upstream attempt.
+options. Guard supports the interactive CLI plus the `exec`/`e` and `review`
+root commands. Multi-word positional prompts remain supported, but use
+`exec <prompt>` for a single-token prompt; unknown root commands and ambiguous
+variadic image arguments fail closed. `--help` and `--version` remain local dry
+runs and do not require provider authentication. The protected route uses HTTP
+Responses transport with WebSockets, automatic provider retries, request
+compression, and child-side external proxy variables disabled, so each model
+call has one observable upstream attempt.
 
 The rest of this guide is the manual method.
 

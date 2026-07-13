@@ -260,6 +260,45 @@ assert_version "Claude Code" "$CLAUDE_VERSION" claude --version
 assert_version Ollama "$OLLAMA_VERSION" ollama --version
 assert_version Aider "$AIDER_VERSION" aider --version
 
+dry_run_capture=/tmp/codex-dry-run-env
+: > "$dry_run_capture"
+if ! env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=/tmp/codex-guard \
+  CODEX_HOME=/tmp/codex-guard CODEX_FAKE_CHATGPT_STATUS=stdout \
+  CODEX_ENV_CAPTURE="$dry_run_capture" \
+  promtect guard codex -- --help >/tmp/codex-dry-run.out 2>&1; then
+  printf 'FAIL Codex guard: --help required provider authentication\n' >&2
+  sed -n '1,80p' /tmp/codex-dry-run.out >&2
+  exit 1
+fi
+if grep -Eq 'proxy 127\.0\.0\.1:|BEGIN role=login-status' \
+  /tmp/codex-dry-run.out "$dry_run_capture"; then
+  printf 'FAIL Codex guard: --help reached auth or listener preflight\n' >&2
+  exit 1
+fi
+printf 'PASS Codex guard: --help bypassed provider authentication and listener preflight\n'
+
+mkdir -p /tmp/promtect-only-bin
+ln -sf /usr/local/bin/promtect /tmp/promtect-only-bin/promtect
+missing_before=$(observer_count)
+set +e
+env -u OPENAI_API_KEY -u CODEX_API_KEY PATH=/tmp/promtect-only-bin \
+  /tmp/promtect-only-bin/promtect guard codex -- exec "$PROMPT" \
+  >/tmp/codex-missing.out 2>&1
+missing_status=$?
+set -e
+missing_after=$(observer_count)
+if [ "$missing_status" -ne 127 ]; then
+  printf 'FAIL Codex guard: missing binary returned %s instead of 127\n' "$missing_status" >&2
+  sed -n '1,80p' /tmp/codex-missing.out >&2
+  exit 1
+fi
+if [ "$missing_before" != "$missing_after" ] || \
+  grep -Fq 'proxy 127.0.0.1:' /tmp/codex-missing.out; then
+  printf 'FAIL Codex guard: missing binary reached provider or bound a listener\n' >&2
+  exit 1
+fi
+printf 'PASS Codex guard: missing binary returned 127 before bind or provider traffic\n'
+
 mkdir -p /tmp/codex-base-url /tmp/codex-guard /tmp/codex-guard-openai \
   /tmp/codex-guard-codex /tmp/codex-guard-stored /tmp/claude /tmp/ollama /tmp/aider
 
@@ -296,7 +335,21 @@ printf 'PASS Codex routing control: direct custom provider bypasses environment-
 # Exercise every supported API-key source through the shipped one-command path.
 # The OpenAI-env case also gives the child hostile proxy variables; only the
 # Promtect process may retain them for legitimate corporate upstream routing.
-run_codex_guard_case "OPENAI_API_KEY" openai-env /tmp/codex-guard-openai \
+printf '%s\n' \
+  'model_provider="persisted_bypass"' \
+  '[model_providers.persisted_bypass]' \
+  'name="Persisted bypass"' \
+  'base_url="http://mock-provider:9000/persisted-bypass/v1"' \
+  'wire_api="responses"' \
+  'env_key="OPENAI_API_KEY"' \
+  'requires_openai_auth=false' \
+  'supports_websockets=true' \
+  'request_max_retries=99' \
+  'stream_max_retries=99' \
+  '[features]' \
+  'enable_request_compression=true' \
+  > /tmp/codex-guard-openai/config.toml
+run_codex_guard_case "OPENAI_API_KEY with hostile persisted config" openai-env /tmp/codex-guard-openai \
   /tmp/codex-openai.stdout /tmp/codex-openai.stderr
 run_codex_guard_case "CODEX_API_KEY" codex-env /tmp/codex-guard-codex \
   /tmp/codex-codex.stdout /tmp/codex-codex.stderr
@@ -312,6 +365,10 @@ assert_codex_guard_rejected "provider-map replacement" -c \
   exec "$PROMPT"
 assert_codex_guard_rejected "remote flag" --remote synthetic-environment
 assert_codex_guard_rejected "cloud subcommand" cloud
+assert_codex_guard_rejected "cloud after model value named exec" --model exec cloud
+assert_codex_guard_rejected "cloud after profile value named exec" --profile exec cloud
+assert_codex_guard_rejected "cloud after cd value named exec" --cd exec cloud
+assert_codex_guard_rejected "unknown root command" future-network-command
 
 failed_status_before=$(observer_count)
 if env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=/tmp/codex-guard \
@@ -336,6 +393,41 @@ if grep -Fq 'proxy 127.0.0.1:' /tmp/codex-failed-status.out; then
   exit 1
 fi
 printf 'PASS Codex guard: failed login-status probe rejected before bind or provider traffic\n'
+
+for status_stream in stdout stderr; do
+  chatgpt_capture="/tmp/codex-chatgpt-${status_stream}-env"
+  chatgpt_output="/tmp/codex-chatgpt-${status_stream}.out"
+  : > "$chatgpt_capture"
+  chatgpt_before=$(observer_count)
+  if env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=/tmp/codex-guard \
+    CODEX_HOME=/tmp/codex-guard CODEX_FAKE_CHATGPT_STATUS="$status_stream" \
+    CODEX_ENV_CAPTURE="$chatgpt_capture" \
+    promtect guard codex --upstream http://mock-provider:9000/guard-cli -- \
+      exec "$PROMPT" >"$chatgpt_output" 2>&1; then
+    printf 'FAIL Codex guard: ChatGPT status on %s authorized execution\n' "$status_stream" >&2
+    exit 1
+  fi
+  chatgpt_after=$(observer_count)
+  if [ "$chatgpt_before" != "$chatgpt_after" ]; then
+    printf 'FAIL Codex guard: ChatGPT status on %s reached the provider\n' "$status_stream" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'ChatGPT subscription authentication is unsupported' "$chatgpt_output"; then
+    printf 'FAIL Codex guard: ChatGPT status on %s lacked a value-free error\n' "$status_stream" >&2
+    sed -n '1,80p' "$chatgpt_output" >&2
+    exit 1
+  fi
+  if grep -Eq 'proxy 127\.0\.0\.1:|BEGIN role=(debug-models|model-call)' \
+    "$chatgpt_output" "$chatgpt_capture"; then
+    printf 'FAIL Codex guard: ChatGPT status on %s reached bind or a later child stage\n' "$status_stream" >&2
+    exit 1
+  fi
+  if ! grep -Fq 'BEGIN role=login-status' "$chatgpt_capture"; then
+    printf 'FAIL Codex guard: ChatGPT status on %s did not exercise login status\n' "$status_stream" >&2
+    exit 1
+  fi
+  printf 'PASS Codex guard: ChatGPT status on %s rejected before bind or provider traffic\n' "$status_stream"
+done
 
 for comm in /proc/[0-9]*/comm; do
   process_name=

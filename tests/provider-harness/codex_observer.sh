@@ -9,11 +9,6 @@ for arg in "$@"; do
   previous=$arg
 done
 
-if [ "${CODEX_FAKE_FAILED_STATUS-}" = 1 ] && [ "$role" = login-status ]; then
-  printf 'Logged in using an API key\n'
-  exit 1
-fi
-
 if [ -n "${CODEX_ENV_CAPTURE-}" ]; then
   {
     printf 'BEGIN role=%s\n' "$role"
@@ -28,6 +23,21 @@ fi
 
 if [ -n "${CODEX_PID_CAPTURE-}" ]; then
   printf '%s\n' "$$" >> "$CODEX_PID_CAPTURE"
+fi
+
+if [ "${CODEX_FAKE_FAILED_STATUS-}" = 1 ] && [ "$role" = login-status ]; then
+  printf 'Logged in using an API key\n'
+  exit 1
+fi
+
+if [ "${CODEX_FAKE_CHATGPT_STATUS-}" = stdout ] && [ "$role" = login-status ]; then
+  printf 'Logged in using ChatGPT\n'
+  exit 0
+fi
+
+if [ "${CODEX_FAKE_CHATGPT_STATUS-}" = stderr ] && [ "$role" = login-status ]; then
+  printf 'Logged in using ChatGPT\n' >&2
+  exit 0
 fi
 
 exec /opt/provider-clis/node_modules/.bin/codex "$@"

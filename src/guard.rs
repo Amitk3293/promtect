@@ -244,6 +244,12 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
     } else {
         resolve_upstream(Some(&mode), None)?
     };
+    if tool == Some("codex") && is_openrouter_upstream(&upstream) {
+        return Err(
+            "OpenRouter is not supported by guard codex: Codex can select routing that bypasses Promtect"
+                .to_string(),
+        );
+    }
 
     // ── advisory notes ──────────────────────────────────────────────────────
     let mut notes = Vec::new();
@@ -305,12 +311,51 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
     })
 }
 
-/// Return the first Codex argument that can select a transport outside the
-/// guard-owned provider.
-fn conflicting_codex_override(args: &[String]) -> Option<&str> {
-    let mut before_safe_subcommand = true;
-    for arg in args {
-        let arg = arg.as_str();
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexInvocation {
+    Interactive,
+    Exec,
+    Review,
+    DryRun,
+}
+
+/// Classify the root Codex invocation while rejecting routing overrides and
+/// unsupported root commands. Options with values must be consumed before a
+/// token can be treated as a subcommand.
+fn inspect_codex_args(args: &[String]) -> Result<CodexInvocation, &str> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
+    ];
+    const VALUE_PREFIXES: &[&str] = &[
+        "--model=",
+        "--profile=",
+        "--sandbox=",
+        "--cd=",
+        "--add-dir=",
+        "--ask-for-approval=",
+    ];
+    const ATTACHED_SHORT_VALUE_PREFIXES: &[&str] = &["-m", "-p", "-s", "-C", "-a"];
+    const FLAG_OPTIONS: &[&str] = &[
+        "--strict-config",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--search",
+        "--no-alt-screen",
+    ];
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
         // Codex/Clap accepts separated, equals, and attached short forms. Reject
         // every runtime TOML override instead of trying to keep a denylist in
         // sync with Codex's evolving configuration schema.
@@ -318,16 +363,16 @@ fn conflicting_codex_override(args: &[String]) -> Option<&str> {
             || arg.starts_with("--config=")
             || (arg.starts_with("-c") && arg.len() > 2)
         {
-            return Some(arg);
+            return Err(arg);
         }
         if matches!(arg, "--oss" | "--local-provider") || arg.starts_with("--local-provider=") {
-            return Some(arg);
+            return Err(arg);
         }
         if matches!(arg, "--enable" | "--disable")
             || arg.starts_with("--enable=")
             || arg.starts_with("--disable=")
         {
-            return Some(arg);
+            return Err(arg);
         }
         if matches!(
             arg,
@@ -335,21 +380,63 @@ fn conflicting_codex_override(args: &[String]) -> Option<&str> {
         ) || arg.starts_with("--remote=")
             || arg.starts_with("--remote-auth-token-env=")
         {
-            return Some(arg);
+            return Err(arg);
         }
-        if before_safe_subcommand
-            && matches!(
-                arg,
-                "remote-control" | "cloud" | "app-server" | "mcp-server" | "exec-server"
-            )
+
+        if VALUE_OPTIONS.contains(&arg) {
+            if args.get(i + 1).is_none() {
+                return Err(arg);
+            }
+            i += 2;
+            continue;
+        }
+        if VALUE_PREFIXES.iter().any(|prefix| arg.starts_with(prefix))
+            || ATTACHED_SHORT_VALUE_PREFIXES
+                .iter()
+                .any(|prefix| arg.starts_with(prefix) && arg.len() > prefix.len())
+            || FLAG_OPTIONS.contains(&arg)
         {
-            return Some(arg);
+            i += 1;
+            continue;
         }
-        if arg == "exec" {
-            before_safe_subcommand = false;
+        if matches!(
+            arg,
+            "--help" | "-h" | "--version" | "-V" | "help" | "version"
+        ) {
+            return Ok(CodexInvocation::DryRun);
         }
+        if matches!(arg, "exec" | "e") {
+            return Ok(CodexInvocation::Exec);
+        }
+        if arg == "review" {
+            return Ok(CodexInvocation::Review);
+        }
+        if !arg.starts_with('-') && arg.chars().any(char::is_whitespace) {
+            return Ok(CodexInvocation::Interactive);
+        }
+
+        // `--image` is variadic, so parsing it without Codex's own Clap model is
+        // ambiguous. Unknown flags and positional root tokens are denied rather
+        // than risking a newly-added transport command.
+        return Err(arg);
     }
-    None
+    Ok(CodexInvocation::Interactive)
+}
+
+/// Return the first Codex argument that can select a transport outside the
+/// guard-owned provider.
+fn conflicting_codex_override(args: &[String]) -> Option<&str> {
+    inspect_codex_args(args).err()
+}
+
+fn is_openrouter_upstream(upstream: &str) -> bool {
+    reqwest::Url::parse(upstream)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("openrouter.ai")
+                || host.to_ascii_lowercase().ends_with(".openrouter.ai")
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -357,6 +444,20 @@ enum CodexAuthSource {
     OpenAiEnvironment,
     CodexEnvironment,
     StoredApiKey,
+}
+
+#[derive(Debug)]
+enum CodexPreflightError {
+    NotFound,
+    Rejected(String),
+}
+
+fn codex_process_error(action: &str, error: std::io::Error) -> CodexPreflightError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        CodexPreflightError::NotFound
+    } else {
+        CodexPreflightError::Rejected(format!("cannot {action} ({error})"))
+    }
 }
 
 fn codex_config_args(base_url: &str, auth: CodexAuthSource) -> Vec<String> {
@@ -417,7 +518,7 @@ fn classify_stored_codex_auth(status: &str) -> Result<CodexAuthSource, &'static 
     Err("Codex guard requires API-key authentication")
 }
 
-async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, String> {
+async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, CodexPreflightError> {
     // An explicit environment key selects the guard-owned environment-auth
     // provider. A separate stored ChatGPT session cannot power or reroute it.
     if has_nonblank_env("OPENAI_API_KEY") {
@@ -432,17 +533,20 @@ async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, String> {
     cmd.args(["login", "status"]).kill_on_drop(true);
     let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
         .await
-        .map_err(|_| "Codex login status timed out".to_string())?
-        .map_err(|e| format!("cannot check Codex login status ({e})"))?;
+        .map_err(|_| CodexPreflightError::Rejected("Codex login status timed out".to_string()))?
+        .map_err(|error| codex_process_error("check Codex login status", error))?;
     if !output.status.success() {
-        return Err("Codex login status check failed".to_string());
+        return Err(CodexPreflightError::Rejected(
+            "Codex login status check failed".to_string(),
+        ));
     }
     // Codex versions have emitted this value-free status on both stdout and
     // stderr. Inspect both, but never relay either stream: future versions may
     // add authentication details that must not reach Promtect's own logs.
     let mut status = String::from_utf8_lossy(&output.stdout).into_owned();
     status.push_str(&String::from_utf8_lossy(&output.stderr));
-    classify_stored_codex_auth(&status).map_err(str::to_string)
+    classify_stored_codex_auth(&status)
+        .map_err(|error| CodexPreflightError::Rejected(error.to_string()))
 }
 
 fn configure_codex_network_env(cmd: &mut tokio::process::Command) {
@@ -479,7 +583,7 @@ async fn verify_codex_config(
     bin: &str,
     base_url: &str,
     auth: CodexAuthSource,
-) -> Result<(), String> {
+) -> Result<(), CodexPreflightError> {
     let mut args = codex_config_args(base_url, auth);
     args.extend(["debug".to_string(), "models".to_string()]);
     let mut cmd = tokio::process::Command::new(bin);
@@ -490,12 +594,29 @@ async fn verify_codex_config(
         .kill_on_drop(true);
     let status = tokio::time::timeout(Duration::from_secs(10), cmd.status())
         .await
-        .map_err(|_| "Codex config check timed out".to_string())?
-        .map_err(|e| format!("cannot run Codex config check ({e})"))?;
+        .map_err(|_| CodexPreflightError::Rejected("Codex config check timed out".to_string()))?
+        .map_err(|error| codex_process_error("run Codex config check", error))?;
     if status.success() {
         Ok(())
     } else {
-        Err("Codex rejected the fail-closed routing configuration".to_string())
+        Err(CodexPreflightError::Rejected(
+            "Codex rejected the fail-closed routing configuration".to_string(),
+        ))
+    }
+}
+
+async fn run_codex_dry_run(plan: &GuardPlan) -> i32 {
+    let mut cmd = tokio::process::Command::new(&plan.bin);
+    configure_codex_network_env(&mut cmd);
+    match cmd.args(&plan.tool_args).kill_on_drop(true).status().await {
+        Ok(status) => exit_code(&status, &plan.bin),
+        Err(error) => {
+            eprintln!(
+                "promtect guard: failed to run '{}' ({error}). Is it installed and on your PATH?",
+                plan.bin
+            );
+            127
+        }
     }
 }
 
@@ -503,10 +624,26 @@ async fn verify_codex_config(
 /// base-URL env var, run the tool, and return its exit code. The proxy task is
 /// dropped when the process exits.
 pub async fn guard(plan: GuardPlan) -> i32 {
+    if plan.codex_fail_closed
+        && matches!(
+            inspect_codex_args(&plan.tool_args),
+            Ok(CodexInvocation::DryRun)
+        )
+    {
+        return run_codex_dry_run(&plan).await;
+    }
+
     let codex_auth = if plan.codex_fail_closed {
         match verify_codex_auth(&plan.bin).await {
             Ok(source) => Some(source),
-            Err(error) => {
+            Err(CodexPreflightError::NotFound) => {
+                eprintln!(
+                    "promtect guard: failed to run '{}' (command not found). Is it installed and on your PATH?",
+                    plan.bin
+                );
+                return 127;
+            }
+            Err(CodexPreflightError::Rejected(error)) => {
                 eprintln!(
                     "promtect guard: refusing to start Codex: {error}.\n  \
                      Use an OpenAI API key or choose another supported guard; no provider request was sent."
@@ -614,11 +751,22 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     if let Some(auth) = codex_auth {
         if let Err(error) = verify_codex_config(&plan.bin, &base_url, auth).await {
             proxy_task.abort();
-            eprintln!(
-                "promtect guard: refusing to start Codex: {error}.\n  \
-                 Upgrade Codex or remove conflicting configuration; no prompt was sent."
-            );
-            return 1;
+            match error {
+                CodexPreflightError::NotFound => {
+                    eprintln!(
+                        "promtect guard: failed to run '{}' (command not found). Is it installed and on your PATH?",
+                        plan.bin
+                    );
+                    return 127;
+                }
+                CodexPreflightError::Rejected(error) => {
+                    eprintln!(
+                        "promtect guard: refusing to start Codex: {error}.\n  \
+                         Upgrade Codex or remove conflicting configuration; no prompt was sent."
+                    );
+                    return 1;
+                }
+            }
         }
         eprintln!(
             "  Codex config check: protected Responses route accepted, WebSockets and request compression disabled"
@@ -967,6 +1115,53 @@ mod tests {
             plan.tool_args,
             ["--model", "synthetic-model", "exec", "safe prompt"]
         );
+    }
+
+    #[test]
+    fn codex_option_values_cannot_hide_an_unsafe_root_command() {
+        for args in [
+            vec!["codex", "--model", "exec", "cloud"],
+            vec!["codex", "--profile", "exec", "remote-control"],
+            vec!["codex", "--cd", "exec", "app-server"],
+        ] {
+            let error = plan(&args).unwrap_err();
+            assert!(
+                error.contains("bypass Promtect"),
+                "expected fail-closed root-command error for {args:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_unknown_root_commands_fail_closed() {
+        let error = plan(&["codex", "future-network-command"]).unwrap_err();
+
+        assert!(error.contains("bypass Promtect"), "{error}");
+    }
+
+    #[test]
+    fn codex_dry_runs_are_classified_without_provider_preflight() {
+        let args = vec![
+            "--model".to_string(),
+            "exec".to_string(),
+            "--help".to_string(),
+        ];
+
+        assert_eq!(inspect_codex_args(&args), Ok(CodexInvocation::DryRun));
+    }
+
+    #[test]
+    fn codex_rejects_openrouter_even_as_an_explicit_upstream() {
+        let error = plan(&[
+            "codex",
+            "--upstream",
+            "https://openrouter.ai/api/v1",
+            "exec",
+            "safe prompt",
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("OpenRouter is not supported"), "{error}");
     }
 
     #[test]
