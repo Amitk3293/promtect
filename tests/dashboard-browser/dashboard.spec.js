@@ -84,6 +84,8 @@ test("real 413 and 415 outcomes reach metrics and rendered request history", asy
   const blockedMetric = page.getByText("Requests blocked", { exact: true }).locator("..");
   await expect(blockedMetric.getByText("2", { exact: true })).toBeVisible();
   await expect(page.getByText("blocked", { exact: true })).toHaveCount(2);
+  await expect(page.getByText("No recent requests to chart yet.", { exact: true })).toBeVisible();
+  await expect(page.locator(".al-chart__col")).toHaveCount(0);
   await expect(page.getByText("No traffic yet", { exact: true })).toHaveCount(0);
 });
 

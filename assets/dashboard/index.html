@@ -1136,13 +1136,17 @@
       };
     }
 
-    // Bucket the recent feed by clock-hour: caught (masked>0) vs clean (masked===0).
+    // Bucket completed, forwarded requests by clock-hour: caught (masked>0) vs
+    // clean (masked===0). Blocked and failed requests have their own headline and
+    // request-history outcomes; treating their masked=0 summaries as clean would
+    // contradict those outcomes in this chart.
     // Oldest -> newest, capped at the 12 most-recent buckets.
     function deriveTimeline(recent) {
       if (!Array.isArray(recent) || !recent.length) return [];
       var HOUR = 3600 * 1000;
       var buckets = {};
       recent.forEach(function (r) {
+        if (r.blocked || r.interrupted || (Number(r.failures) || 0) > 0) return;
         var ts = Number(r.ts_ms) || 0;
         if (!ts) return;
         var key = Math.floor(ts / HOUR);
