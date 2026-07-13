@@ -353,36 +353,13 @@ fn inspect_codex_args(args: &[String]) -> Result<CodexInvocation, &str> {
         "--no-alt-screen",
     ];
 
+    if let Some(arg) = routing_codex_override(args) {
+        return Err(arg);
+    }
+
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
-        // Codex/Clap accepts separated, equals, and attached short forms. Reject
-        // every runtime TOML override instead of trying to keep a denylist in
-        // sync with Codex's evolving configuration schema.
-        if matches!(arg, "-c" | "--config")
-            || arg.starts_with("--config=")
-            || (arg.starts_with("-c") && arg.len() > 2)
-        {
-            return Err(arg);
-        }
-        if matches!(arg, "--oss" | "--local-provider") || arg.starts_with("--local-provider=") {
-            return Err(arg);
-        }
-        if matches!(arg, "--enable" | "--disable")
-            || arg.starts_with("--enable=")
-            || arg.starts_with("--disable=")
-        {
-            return Err(arg);
-        }
-        if matches!(
-            arg,
-            "--remote" | "--remote-auth-token-env" | "--remote-control"
-        ) || arg.starts_with("--remote=")
-            || arg.starts_with("--remote-auth-token-env=")
-        {
-            return Err(arg);
-        }
-
         if VALUE_OPTIONS.contains(&arg) {
             if args.get(i + 1).is_none() {
                 return Err(arg);
@@ -406,10 +383,18 @@ fn inspect_codex_args(args: &[String]) -> Result<CodexInvocation, &str> {
             return Ok(CodexInvocation::DryRun);
         }
         if matches!(arg, "exec" | "e") {
-            return Ok(CodexInvocation::Exec);
+            return Ok(if codex_subcommand_is_dry_run(&args[i + 1..]) {
+                CodexInvocation::DryRun
+            } else {
+                CodexInvocation::Exec
+            });
         }
         if arg == "review" {
-            return Ok(CodexInvocation::Review);
+            return Ok(if codex_subcommand_is_dry_run(&args[i + 1..]) {
+                CodexInvocation::DryRun
+            } else {
+                CodexInvocation::Review
+            });
         }
         if !arg.starts_with('-') && arg.chars().any(char::is_whitespace) {
             return Ok(CodexInvocation::Interactive);
@@ -421,6 +406,41 @@ fn inspect_codex_args(args: &[String]) -> Result<CodexInvocation, &str> {
         return Err(arg);
     }
     Ok(CodexInvocation::Interactive)
+}
+
+fn codex_subcommand_is_dry_run(args: &[String]) -> bool {
+    args.iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| matches!(arg, "--help" | "-h" | "--version" | "-V"))
+}
+
+/// Find any Codex option that can change routing, regardless of whether Clap
+/// accepts it before or after the root subcommand. A literal `--` ends option
+/// parsing, so later values are prompt data rather than global overrides.
+fn routing_codex_override(args: &[String]) -> Option<&str> {
+    args.iter()
+        .map(String::as_str)
+        .take_while(|arg| *arg != "--")
+        .find(|arg| {
+            // Codex/Clap accepts separated, equals, and attached short forms.
+            // Reject every runtime TOML override instead of trying to keep a
+            // denylist in sync with Codex's evolving configuration schema.
+            matches!(*arg, "-c" | "--config")
+                || arg.starts_with("--config=")
+                || (arg.starts_with("-c") && arg.len() > 2)
+                || matches!(*arg, "--oss" | "--local-provider")
+                || arg.starts_with("--local-provider=")
+                || matches!(*arg, "--enable" | "--disable")
+                || arg.starts_with("--enable=")
+                || arg.starts_with("--disable=")
+                || matches!(
+                    *arg,
+                    "--remote" | "--remote-auth-token-env" | "--remote-control"
+                )
+                || arg.starts_with("--remote=")
+                || arg.starts_with("--remote-auth-token-env=")
+        })
 }
 
 /// Return the first Codex argument that can select a transport outside the
@@ -461,45 +481,38 @@ fn codex_process_error(action: &str, error: std::io::Error) -> CodexPreflightErr
 }
 
 fn codex_config_args(base_url: &str, auth: CodexAuthSource) -> Vec<String> {
+    let provider_name = format!("promtect_guard_{}", uuid::Uuid::new_v4().simple());
+    codex_config_args_for_provider(base_url, auth, &provider_name)
+}
+
+fn codex_config_args_for_provider(
+    base_url: &str,
+    auth: CodexAuthSource,
+    provider_name: &str,
+) -> Vec<String> {
     // Keep the documented built-in override for current Codex compatibility,
     // but select a guard-owned provider whose complete definition cannot inherit
     // user routing. WebSockets and retries are disabled so one model call produces
     // one observable HTTP request through Promtect.
-    let mut args = vec![
+    let auth_fields = match auth {
+        CodexAuthSource::StoredApiKey => "requires_openai_auth=true".to_string(),
+        CodexAuthSource::OpenAiEnvironment | CodexAuthSource::CodexEnvironment => {
+            "env_key=\"OPENAI_API_KEY\",requires_openai_auth=false".to_string()
+        }
+    };
+    let provider = format!(
+        "model_providers.{provider_name}={{name=\"Promtect guard\",base_url=\"{base_url}\",wire_api=\"responses\",{auth_fields},supports_websockets=false,request_max_retries=0,stream_max_retries=0}}"
+    );
+    vec![
         "-c".to_string(),
-        "model_provider=\"promtect_guard\"".to_string(),
+        format!("model_provider=\"{provider_name}\""),
         "-c".to_string(),
         format!("openai_base_url=\"{base_url}\""),
         "-c".to_string(),
-        "model_providers.promtect_guard.name=\"Promtect guard\"".to_string(),
-        "-c".to_string(),
-        format!("model_providers.promtect_guard.base_url=\"{base_url}\""),
-        "-c".to_string(),
-        "model_providers.promtect_guard.wire_api=\"responses\"".to_string(),
-    ];
-    args.extend(match auth {
-        CodexAuthSource::StoredApiKey => vec![
-            "-c".to_string(),
-            "model_providers.promtect_guard.requires_openai_auth=true".to_string(),
-        ],
-        CodexAuthSource::OpenAiEnvironment | CodexAuthSource::CodexEnvironment => vec![
-            "-c".to_string(),
-            "model_providers.promtect_guard.env_key=\"OPENAI_API_KEY\"".to_string(),
-            "-c".to_string(),
-            "model_providers.promtect_guard.requires_openai_auth=false".to_string(),
-        ],
-    });
-    args.extend([
-        "-c".to_string(),
-        "model_providers.promtect_guard.supports_websockets=false".to_string(),
-        "-c".to_string(),
-        "model_providers.promtect_guard.request_max_retries=0".to_string(),
-        "-c".to_string(),
-        "model_providers.promtect_guard.stream_max_retries=0".to_string(),
+        provider,
         "--disable".to_string(),
         "enable_request_compression".to_string(),
-    ]);
-    args
+    ]
 }
 
 fn has_nonblank_env(key: &str) -> bool {
@@ -838,12 +851,19 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // Tripwire: if the proxy never saw a request, the tool bypassed it entirely
     // (e.g. it ignored the base-URL var) — secrets may have gone out unmasked.
     // Skip for invocations that intentionally make no API calls.
-    let is_dry_run = plan.tool_args.iter().any(|a| {
+    let is_dry_run = if plan.codex_fail_closed {
         matches!(
-            a.as_str(),
-            "--help" | "-h" | "--version" | "version" | "help"
+            inspect_codex_args(&plan.tool_args),
+            Ok(CodexInvocation::DryRun)
         )
-    });
+    } else {
+        plan.tool_args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "--help" | "-h" | "--version" | "version" | "help"
+            )
+        })
+    };
     if !is_dry_run {
         let req_count = requests.load(std::sync::atomic::Ordering::Relaxed);
         if req_count == 0 {
@@ -1016,9 +1036,10 @@ mod tests {
     #[test]
     fn codex_config_args_force_routing_and_disable_compression() {
         assert_eq!(
-            codex_config_args(
+            codex_config_args_for_provider(
                 "http://127.0.0.1:12345/v1",
                 CodexAuthSource::OpenAiEnvironment,
+                "promtect_guard",
             ),
             vec![
                 "-c",
@@ -1026,21 +1047,7 @@ mod tests {
                 "-c",
                 "openai_base_url=\"http://127.0.0.1:12345/v1\"",
                 "-c",
-                "model_providers.promtect_guard.name=\"Promtect guard\"",
-                "-c",
-                "model_providers.promtect_guard.base_url=\"http://127.0.0.1:12345/v1\"",
-                "-c",
-                "model_providers.promtect_guard.wire_api=\"responses\"",
-                "-c",
-                "model_providers.promtect_guard.env_key=\"OPENAI_API_KEY\"",
-                "-c",
-                "model_providers.promtect_guard.requires_openai_auth=false",
-                "-c",
-                "model_providers.promtect_guard.supports_websockets=false",
-                "-c",
-                "model_providers.promtect_guard.request_max_retries=0",
-                "-c",
-                "model_providers.promtect_guard.stream_max_retries=0",
+                "model_providers.promtect_guard={name=\"Promtect guard\",base_url=\"http://127.0.0.1:12345/v1\",wire_api=\"responses\",env_key=\"OPENAI_API_KEY\",requires_openai_auth=false,supports_websockets=false,request_max_retries=0,stream_max_retries=0}",
                 "--disable",
                 "enable_request_compression",
             ]
@@ -1053,9 +1060,25 @@ mod tests {
 
         assert!(
             args.iter()
-                .any(|arg| arg.ends_with("requires_openai_auth=true"))
+                .any(|arg| arg.contains("requires_openai_auth=true"))
         );
         assert!(!args.iter().any(|arg| arg.contains("env_key")));
+    }
+
+    #[test]
+    fn codex_provider_identity_is_fresh_for_each_child() {
+        let first = codex_config_args(
+            "http://127.0.0.1:12345/v1",
+            CodexAuthSource::OpenAiEnvironment,
+        );
+        let second = codex_config_args(
+            "http://127.0.0.1:12345/v1",
+            CodexAuthSource::OpenAiEnvironment,
+        );
+
+        assert!(first[1].starts_with("model_provider=\"promtect_guard_"));
+        assert!(second[1].starts_with("model_provider=\"promtect_guard_"));
+        assert_ne!(first[1], second[1]);
     }
 
     #[test]
@@ -1133,6 +1156,28 @@ mod tests {
     }
 
     #[test]
+    fn codex_global_routing_overrides_fail_closed_after_subcommands() {
+        for args in [
+            vec![
+                "codex",
+                "exec",
+                "safe prompt",
+                "-c",
+                "model_provider=\"openai\"",
+            ],
+            vec!["codex", "exec", "--oss", "safe prompt"],
+            vec!["codex", "review", "--enable", "web_search"],
+            vec!["codex", "review", "--local-provider=ollama"],
+        ] {
+            let error = plan(&args).unwrap_err();
+            assert!(
+                error.contains("bypass Promtect"),
+                "expected post-subcommand override rejection for {args:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn codex_unknown_root_commands_fail_closed() {
         let error = plan(&["codex", "future-network-command"]).unwrap_err();
 
@@ -1148,6 +1193,21 @@ mod tests {
         ];
 
         assert_eq!(inspect_codex_args(&args), Ok(CodexInvocation::DryRun));
+
+        for args in [
+            vec!["exec", "--help"],
+            vec!["exec", "--version"],
+            vec!["review", "--help"],
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(inspect_codex_args(&args), Ok(CodexInvocation::DryRun));
+        }
+
+        let prompt_help = ["exec", "--", "--help"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(inspect_codex_args(&prompt_help), Ok(CodexInvocation::Exec));
     }
 
     #[test]

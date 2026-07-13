@@ -321,6 +321,7 @@ class Handler(BaseHTTPRequestHandler):
             "body_bytes": len(raw),
             "accept_encoding_seen": self.headers.get("accept-encoding"),
             "content_encoding_seen": self.headers.get("content-encoding"),
+            "hostile_header_seen": self.headers.get("x-promtect-hostile") is not None,
             "plaintext_canary_seen": leaked,
             "sentinel_seen": sentinel_match is not None,
         }

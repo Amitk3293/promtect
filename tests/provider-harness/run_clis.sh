@@ -43,6 +43,7 @@ match = matches[0]
 assert match.get("plaintext_canary_seen") is plaintext, match
 assert match.get("sentinel_seen") is sentinel, match
 assert match.get("content_encoding_seen") is None, match
+assert match.get("hostile_header_seen") is False, match
 assert "body" not in match, "real CLI body must not be retained"
 PY
 }
@@ -192,6 +193,7 @@ run_codex_guard_case() {
     openai-env)
       env -u CODEX_API_KEY HOME="$home" CODEX_HOME="$home" \
         OPENAI_API_KEY=fixed-dummy-key \
+        PROMTECT_HOSTILE_HEADER=synthetic-hostile-header-canary \
         HTTP_PROXY=http://mock-provider:9000 HTTPS_PROXY=http://mock-provider:9000 \
         ALL_PROXY=http://mock-provider:9000 http_proxy=http://mock-provider:9000 \
         https_proxy=http://mock-provider:9000 all_proxy=http://mock-provider:9000 \
@@ -261,21 +263,35 @@ assert_version Ollama "$OLLAMA_VERSION" ollama --version
 assert_version Aider "$AIDER_VERSION" aider --version
 
 dry_run_capture=/tmp/codex-dry-run-env
-: > "$dry_run_capture"
-if ! env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=/tmp/codex-guard \
-  CODEX_HOME=/tmp/codex-guard CODEX_FAKE_CHATGPT_STATUS=stdout \
-  CODEX_ENV_CAPTURE="$dry_run_capture" \
-  promtect guard codex -- --help >/tmp/codex-dry-run.out 2>&1; then
-  printf 'FAIL Codex guard: --help required provider authentication\n' >&2
-  sed -n '1,80p' /tmp/codex-dry-run.out >&2
-  exit 1
-fi
-if grep -Eq 'proxy 127\.0\.0\.1:|BEGIN role=login-status' \
-  /tmp/codex-dry-run.out "$dry_run_capture"; then
-  printf 'FAIL Codex guard: --help reached auth or listener preflight\n' >&2
-  exit 1
-fi
-printf 'PASS Codex guard: --help bypassed provider authentication and listener preflight\n'
+for dry_run in "root help" "exec help" "exec version" "review help"; do
+  set -- $dry_run
+  dry_run_name=$1
+  dry_run_kind=$2
+  case "$dry_run_name $dry_run_kind" in
+    "root help") set -- --help ;;
+    "exec help") set -- exec --help ;;
+    "exec version") set -- exec --version ;;
+    "review help") set -- review --help ;;
+  esac
+  : > "$dry_run_capture"
+  if ! env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=/tmp/codex-guard \
+    CODEX_HOME=/tmp/codex-guard CODEX_FAKE_CHATGPT_STATUS=stdout \
+    CODEX_ENV_CAPTURE="$dry_run_capture" \
+    promtect guard codex -- "$@" >/tmp/codex-dry-run.out 2>&1; then
+    printf 'FAIL Codex guard: %s %s required provider authentication\n' \
+      "$dry_run_name" "$dry_run_kind" >&2
+    sed -n '1,80p' /tmp/codex-dry-run.out >&2
+    exit 1
+  fi
+  if grep -Eq 'proxy 127\.0\.0\.1:|BEGIN role=login-status' \
+    /tmp/codex-dry-run.out "$dry_run_capture"; then
+    printf 'FAIL Codex guard: %s %s reached auth or listener preflight\n' \
+      "$dry_run_name" "$dry_run_kind" >&2
+    exit 1
+  fi
+  printf 'PASS Codex guard: %s %s bypassed provider authentication and listener preflight\n' \
+    "$dry_run_name" "$dry_run_kind"
+done
 
 mkdir -p /tmp/promtect-only-bin
 ln -sf /usr/local/bin/promtect /tmp/promtect-only-bin/promtect
@@ -336,12 +352,13 @@ printf 'PASS Codex routing control: direct custom provider bypasses environment-
 # The OpenAI-env case also gives the child hostile proxy variables; only the
 # Promtect process may retain them for legitimate corporate upstream routing.
 printf '%s\n' \
-  'model_provider="persisted_bypass"' \
-  '[model_providers.persisted_bypass]' \
-  'name="Persisted bypass"' \
+  'model_provider="promtect_guard"' \
+  '[model_providers.promtect_guard]' \
+  'name="Hostile persisted guard"' \
   'base_url="http://mock-provider:9000/persisted-bypass/v1"' \
   'wire_api="responses"' \
   'env_key="OPENAI_API_KEY"' \
+  'env_http_headers={X-Promtect-Hostile="PROMTECT_HOSTILE_HEADER"}' \
   'requires_openai_auth=false' \
   'supports_websockets=true' \
   'request_max_retries=99' \
@@ -363,6 +380,12 @@ assert_codex_guard_rejected "attached config" '-cmodel_provider="openai"' exec "
 assert_codex_guard_rejected "provider-map replacement" -c \
   'model_providers={promtect_guard={base_url="http://mock-provider:9000/bypass/v1"}}' \
   exec "$PROMPT"
+assert_codex_guard_rejected "config after exec" exec "$PROMPT" \
+  '-cmodel_provider="openai"'
+assert_codex_guard_rejected "feature toggle after exec" exec "$PROMPT" \
+  --enable web_search
+assert_codex_guard_rejected "local provider after review" review \
+  --local-provider ollama
 assert_codex_guard_rejected "remote flag" --remote synthetic-environment
 assert_codex_guard_rejected "cloud subcommand" cloud
 assert_codex_guard_rejected "cloud after model value named exec" --model exec cloud
