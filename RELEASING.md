@@ -16,6 +16,10 @@ Before the first public release:
   `core-container-release` with required reviewers. The workflows also require
   exact typed confirmation; environment protection is the human authorization
   boundary.
+- Configure an active repository ruleset for `refs/tags/v*` that restricts tag
+  creation to release operators and prevents tag updates and deletion. The
+  workflows re-fetch and compare both the annotated tag object ID and commit
+  after every environment wait, but the ruleset is the preventive control.
 - Require the full staging suite and independent `/code-review` before promotion
   to `main`. A staging-to-main promotion must contain no unreviewed changes.
 - Keep release tags annotated. Signed tags are preferred when the release
@@ -78,16 +82,27 @@ SHA-256 sidecars and embedded source metadata, and produces a reviewable
 
 ## 4. Publish the verified Core archives
 
-After reviewing the candidate, rerun the workflow with:
+Candidate-only artifacts are useful rehearsal evidence, but they are not later
+promoted across workflow runs. To publish, dispatch a new workflow run with:
 
 - `publish`: `true`;
 - `publish_confirmation`: `publish vX.Y.Z`.
 
-The `core-release` environment reviewer must approve the job. Publication also
-fails while the Core repository is private. The job reverifies the promoted
-candidate, creates GitHub build-provenance attestations, uploads all archives and
-sidecars to one draft release, downloads and verifies that release, and only
-then makes it public. It refuses to replace an existing published release.
+That run builds and verifies its own candidate before the protected `core-release`
+job becomes eligible for approval. The reviewer must download
+`core-vX.Y.Z-verified` from that same run, compare its artifact digest with the
+verification job summary, inspect the archives, sidecars, embedded source SHA,
+and formula, and only then approve the environment. Reject the job if the
+candidate is not acceptable; never approve based on an artifact from another
+run.
+
+After approval, the job checks out the already validated commit, re-fetches the
+remote annotated tag, and requires both its tag object ID and target commit to
+remain unchanged. It downloads and reverifies the same-run artifact, creates
+GitHub build-provenance attestations, and validates an existing draft's exact
+target before any upload. It revalidates the tag, draft identity, downloaded
+assets, and target again before making the release public. It refuses to replace
+an existing published release.
 
 Do not delete or replace a published asset. If an artifact is wrong, fix the
 problem and publish a new patch version.
@@ -119,7 +134,13 @@ Docker environment before merging the formula. Finally repeat
 The GHCR image is not part of the Homebrew release and is never triggered by a
 tag. Dispatch `.github/workflows/docker-publish.yml` separately with the same
 tag and `publish container vX.Y.Z`; approve the `core-container-release`
-environment only when container distribution is intentionally in scope.
+environment only when container distribution is intentionally in scope. The
+job checks out the exact pre-approval commit and rejects a changed remote tag.
+Exact `X.Y.Z` and `vX.Y.Z` image tags are immutable: an existing tag aborts the
+run. The shared `X.Y` tag advances only when the incoming patch is newer than
+every immutable patch tag already published on that release line; all container
+publications are serialized to prevent two patch releases from racing. A failed
+or repeated publication requires a new patch version, never tag replacement.
 
 ## Versioning
 

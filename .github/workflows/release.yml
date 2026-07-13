@@ -36,6 +36,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       source_sha: ${{ steps.source.outputs.sha }}
+      tag_oid: ${{ steps.source.outputs.tag_oid }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -47,16 +48,21 @@ jobs:
           set -euo pipefail
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || { echo "tag must be a stable vX.Y.Z tag" >&2; exit 1; }
-          git fetch --force origin main "refs/tags/${TAG}:refs/tags/${TAG}"
+          main_ref="refs/remotes/origin/promtect-release-main"
+          git fetch --force origin \
+            "refs/heads/main:${main_ref}" \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
           [ "$(git cat-file -t "refs/tags/${TAG}")" = "tag" ] \
             || { echo "release tag must be annotated" >&2; exit 1; }
           sha="$(git rev-parse "${TAG}^{commit}")"
-          git merge-base --is-ancestor "$sha" origin/main \
+          git merge-base --is-ancestor "$sha" "$main_ref" \
             || { echo "tag is not contained in main" >&2; exit 1; }
           version="$(git show "${sha}:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
           [ "v${version}" = "$TAG" ] \
             || { echo "tag and Cargo.toml version differ" >&2; exit 1; }
+          tag_oid="$(git rev-parse "refs/tags/${TAG}")"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag_oid=$tag_oid" >> "$GITHUB_OUTPUT"
 
   readiness:
     needs: validate
@@ -117,6 +123,8 @@ jobs:
   verify:
     needs: [validate, build]
     runs-on: ubuntu-latest
+    outputs:
+      candidate_digest: ${{ steps.candidate.outputs.artifact-digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -132,13 +140,27 @@ jobs:
         env:
           PROMTECT_ASSET_DIR: dist
         run: bash scripts/update-formula.sh "$TAG" > dist/promtect.rb
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - id: candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: core-${{ inputs.tag }}-verified
           path: dist/*
           if-no-files-found: error
-          overwrite: true
           retention-days: 14
+      - name: Record candidate for the environment reviewer
+        env:
+          CANDIDATE_DIGEST: ${{ steps.candidate.outputs.artifact-digest }}
+        run: |
+          {
+            echo "### Core candidate awaiting publication review"
+            echo
+            echo "- Tag: \`$TAG\`"
+            echo "- Source: \`${{ needs.validate.outputs.source_sha }}\`"
+            echo "- Artifact: \`core-${TAG}-verified\`"
+            echo "- Artifact digest: \`$CANDIDATE_DIGEST\`"
+            echo
+            echo "Approve the core-release environment only after reviewing this artifact from this run."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     if: inputs.publish
@@ -149,10 +171,15 @@ jobs:
       attestations: write
       contents: write
       id-token: write
+    env:
+      SOURCE_SHA: ${{ needs.validate.outputs.source_sha }}
+      TAG_OID: ${{ needs.validate.outputs.tag_oid }}
+      CANDIDATE_DIGEST: ${{ needs.verify.outputs.candidate_digest }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
+          fetch-depth: 0
       - name: Require exact publication confirmation
         env:
           CONFIRMATION: ${{ inputs.publish_confirmation }}
@@ -162,12 +189,16 @@ jobs:
             || { echo "anonymous Core release requires a public repository" >&2; exit 1; }
           [ "$CONFIRMATION" = "publish $TAG" ] \
             || { echo "publication confirmation does not match tag" >&2; exit 1; }
+      - name: Revalidate reviewed tag after environment approval
+        run: bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: core-${{ inputs.tag }}-verified
           path: dist
-      - name: Reverify promoted candidate
-        run: bash scripts/verify-release-assets.sh "$TAG" dist
+      - name: Reverify same-run approved candidate
+        run: |
+          echo "approved candidate artifact digest: $CANDIDATE_DIGEST"
+          bash scripts/verify-release-assets.sh "$TAG" dist
       - name: Attest Core archives
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
@@ -178,49 +209,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if release_json="$(gh release view "$TAG" --json isDraft 2>/dev/null)"; then
-            is_draft="$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["isDraft"]).lower())' <<< "$release_json")"
-            if [ "$is_draft" != "true" ]; then
-              echo "published release already exists; refusing replacement" >&2
-              exit 1
-            fi
+
+          validate_draft_target() {
+            printf '%s\n' "$1" \
+              | python3 scripts/verify-draft-release.py "$TAG" "$SOURCE_SHA"
+          }
+
+          bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
+          if release_json="$(gh release view "$TAG" --json isDraft,tagName,targetCommitish 2>/dev/null)"; then
+            validate_draft_target "$release_json"
           else
             gh release create "$TAG" --verify-tag --draft \
               --target "$SOURCE_SHA" \
               --title "Promtect $TAG" --generate-notes
+            release_json="$(gh release view "$TAG" --json isDraft,tagName,targetCommitish)"
+            validate_draft_target "$release_json"
           fi
           gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
-          release_assets_json="$(gh release view "$TAG" --json isDraft,assets)"
-          RELEASE_ASSETS_JSON="$release_assets_json" python3 - "$TAG" <<'PY'
-          import json
-          import os
-          import sys
-
-          tag = sys.argv[1]
-          data = json.loads(os.environ["RELEASE_ASSETS_JSON"])
-          if not data["isDraft"]:
-              raise SystemExit("release stopped being a draft before verification")
-          targets = (
-              "aarch64-apple-darwin",
-              "x86_64-apple-darwin",
-              "aarch64-unknown-linux-gnu",
-              "x86_64-unknown-linux-gnu",
-          )
-          expected = {
-              name
-              for target in targets
-              for name in (
-                  f"promtect-{tag}-{target}.tar.gz",
-                  f"promtect-{tag}-{target}.tar.gz.sha256",
-              )
-          }
-          actual = [asset["name"] for asset in data["assets"]]
-          if len(actual) != len(set(actual)) or set(actual) != expected:
-              raise SystemExit("draft release has an incomplete or unexpected asset set")
-          PY
+          release_assets_json="$(gh release view "$TAG" --json isDraft,assets,tagName,targetCommitish)"
+          printf '%s\n' "$release_assets_json" \
+            | python3 scripts/verify-draft-release.py \
+              "$TAG" "$SOURCE_SHA" --assets
           verify_dir="$(mktemp -d)"
           trap 'rm -rf "$verify_dir"' EXIT
           gh release download "$TAG" --dir "$verify_dir" \
             --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
           bash scripts/verify-release-assets.sh "$TAG" "$verify_dir"
+          bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
+          release_json="$(gh release view "$TAG" --json isDraft,tagName,targetCommitish)"
+          validate_draft_target "$release_json"
           gh release edit "$TAG" --draft=false

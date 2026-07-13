@@ -17,7 +17,9 @@ on:
         type: string
 
 concurrency:
-  group: core-container-${{ inputs.tag }}
+  # Serialize every Core container publication. A per-tag lock could let two
+  # patch releases race and move the shared X.Y tag backwards.
+  group: core-container-release
   cancel-in-progress: false
 
 env:
@@ -31,12 +33,16 @@ jobs:
   # The build-push job depends on this so no image ships from a broken tree.
   test:
     runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      tag_oid: ${{ steps.source.outputs.tag_oid }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           ref: ${{ inputs.tag }}
           fetch-depth: 0
       - name: Validate reviewed main tag and confirmation
+        id: source
         env:
           CONFIRMATION: ${{ inputs.publish_confirmation }}
           REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
@@ -45,11 +51,19 @@ jobs:
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [ "$REPOSITORY_VISIBILITY" = "public" ]
           [ "$CONFIRMATION" = "publish container $TAG" ]
+          main_ref="refs/remotes/origin/promtect-release-main"
+          git fetch --force origin \
+            "refs/heads/main:${main_ref}" \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
           [ "$(git cat-file -t "refs/tags/${TAG}")" = "tag" ]
-          git fetch origin main
-          git merge-base --is-ancestor HEAD origin/main
-          version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
+          sha="$(git rev-parse "${TAG}^{commit}")"
+          git merge-base --is-ancestor "$sha" "$main_ref"
+          version="$(git show "${sha}:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
           [ "v${version}" = "$TAG" ]
+          git checkout --detach "$sha"
+          tag_oid="$(git rev-parse "refs/tags/${TAG}")"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag_oid=$tag_oid" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
@@ -69,16 +83,40 @@ jobs:
       packages: write
     # Only publish after the test suite passes.
     needs: test
+    env:
+      SOURCE_SHA: ${{ needs.test.outputs.source_sha }}
+      TAG_OID: ${{ needs.test.outputs.tag_oid }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.tag }}
+          ref: ${{ needs.test.outputs.source_sha }}
+          fetch-depth: 0
+      - name: Revalidate reviewed tag after environment approval
+        run: bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Refuse immutable replacement or minor-tag regression
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          versions="$(mktemp)"
+          errors="$(mktemp)"
+          trap 'rm -f "$versions" "$errors"' EXIT
+          endpoint="/users/${GITHUB_REPOSITORY_OWNER}/packages/container/promtect/versions?per_page=100"
+          if ! gh api --paginate --slurp "$endpoint" > "$versions" 2> "$errors"; then
+            if grep -q 'HTTP 404' "$errors"; then
+              printf '[]\n' > "$versions"
+            else
+              cat "$errors" >&2
+              exit 1
+            fi
+          fi
+          python3 scripts/check-ghcr-tags.py "$TAG" "$versions"
       - id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
@@ -87,6 +125,9 @@ jobs:
             type=semver,pattern={{version}},value=${{ inputs.tag }}
             type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
             type=raw,value=${{ inputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.test.outputs.source_sha }}
+            org.opencontainers.image.version=${{ inputs.tag }}
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .

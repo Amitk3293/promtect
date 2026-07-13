@@ -81,8 +81,9 @@ bind proxy/dashboard to a non-loopback address — off-loopback bind exits 1 wit
   build.rs, Cargo.toml); docs-only commits don't bump. Bump major/minor by hand if warranted.
 - **Branch flow:** `feature/*` → PR → `staging` (integration, CI must be green) → PR → `main`
   (released) → tag `vX.Y.Z`. Never push `main` directly. See BRANCHING.md / RELEASING.md.
-- **Release:** tag on `main` triggers `release.yml` (binaries: macOS aarch64/x86_64, Linux
-  x86_64/aarch64) + Homebrew tap update via `scripts/update-formula.sh`.
+- **Release:** an annotated, protected `main` tag does not publish by itself. Manually run
+  `release.yml`; its same-run candidate must pass environment review before GitHub Release
+  publication. GHCR and the Homebrew tap are separate reviewed flows. See RELEASING.md.
 - CI (`.github/workflows/ci.yml`): fmt, clippy, test, smoke, cargo-audit on Linux + macOS.
 
 ## Reference docs
