@@ -115,6 +115,24 @@ fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Mat
     matches
 }
 
+/// Return whether a structurally valid hit is contained by one minted sentinel.
+///
+/// `minted_sentinel_spans` yields sorted, non-overlapping ranges because it is
+/// backed by `Regex::find_iter`. Locate the last sentinel beginning at or before
+/// the hit instead of scanning every sentinel for every detector match. This
+/// keeps residual filtering O(matches × log(sentinels)) for large paid requests.
+fn is_within_minted_sentinel(
+    hit_start: usize,
+    hit_end: usize,
+    sentinel_spans: &[std::ops::Range<usize>],
+) -> bool {
+    let insertion = sentinel_spans.partition_point(|span| span.start <= hit_start);
+    insertion
+        .checked_sub(1)
+        .and_then(|index| sentinel_spans.get(index))
+        .is_some_and(|span| hit_end <= span.end)
+}
+
 /// Re-run the exact active request detector chain over a masked body.
 ///
 /// The detector receives the complete masked body, preserving anchored and
@@ -139,10 +157,8 @@ fn scan_for_residual_leaks(
                 && masked
                     .get(hit.start..hit.end)
                     .is_some_and(|value| value == hit.value.as_str());
-            let is_minted_sentinel_content = has_exact_span
-                && sentinel_spans
-                    .iter()
-                    .any(|span| span.start <= hit.start && hit.end <= span.end);
+            let is_minted_sentinel_content =
+                has_exact_span && is_within_minted_sentinel(hit.start, hit.end, &sentinel_spans);
             !is_minted_sentinel_content
         })
         .collect()
@@ -379,9 +395,10 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             // were detected, the masked body is identical to the input and a second
             // scan would find the same nothing (wasted work on every clean request).
             if hit_count > 0 {
-                // Re-run detectors with sentinels stripped so their kind:HEX content
-                // can't false-positive. A surviving match means masking missed it —
-                // block rather than forward plaintext secrets.
+                // Re-run the active detectors over the complete masked body, then
+                // suppress only structurally valid matches wholly inside exact
+                // sentinels minted by this request. Any other surviving match means
+                // masking missed it, so block rather than forward plaintext secrets.
                 let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect, &vault);
                 if !leaks.is_empty() {
                     let leak_kinds: Vec<&str> = {
@@ -946,6 +963,63 @@ mod tests {
         assert!(
             super::scan_for_residual_leaks(&masked, &active, &vault).is_empty(),
             "custom matches wholly inside sentinel syntax must not become residual leaks"
+        );
+    }
+
+    #[test]
+    fn minted_span_binary_lookup_matches_linear_oracle_at_scale() {
+        let spans: Vec<std::ops::Range<usize>> = (0..10_000)
+            .map(|index| {
+                let start = index * 64;
+                start..start + 48
+            })
+            .collect();
+
+        let mut hits = Vec::with_capacity(spans.len() * 3 + 2);
+        for span in &spans {
+            hits.push((span.start, span.end));
+            hits.push((span.start + 7, span.end - 7));
+            hits.push((span.end - 1, span.end + 1));
+        }
+        hits.push((0, 0));
+        hits.push((spans.last().unwrap().end + 1, spans.last().unwrap().end + 2));
+
+        for (start, end) in hits {
+            let expected = spans
+                .iter()
+                .any(|span| span.start <= start && end <= span.end);
+            assert_eq!(
+                super::is_within_minted_sentinel(start, end, &spans),
+                expected,
+                "binary containment disagreed for {start}..{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_scan_suppresses_many_request_minted_sentinel_matches() {
+        let vault = crate::vault::Vault::new();
+        let masked = (0..1_024)
+            .map(|index| vault.sentinel_for("custom", &format!("secret-{index}")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            candidate
+                .match_indices("promtect")
+                .map(|(start, value)| {
+                    super::detect::Match::new(
+                        "custom",
+                        value.to_owned(),
+                        start,
+                        start + value.len(),
+                    )
+                })
+                .collect()
+        });
+
+        assert!(
+            super::scan_for_residual_leaks(&masked, &Some(detector), &vault).is_empty(),
+            "matches wholly inside every request-minted sentinel must be suppressed"
         );
     }
 
