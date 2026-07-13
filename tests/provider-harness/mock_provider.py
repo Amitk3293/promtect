@@ -259,8 +259,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        source = "real-cli" if parsed.path.startswith("/cli/") else "protocol-fixture"
-        logical_path = parsed.path.removeprefix("/cli") if source == "real-cli" else parsed.path
+        if parsed.path.startswith("/cli/"):
+            source = "real-cli"
+            logical_path = parsed.path.removeprefix("/cli")
+        elif parsed.path.startswith("/codex-base-url-control/"):
+            source = "codex-base-url-control"
+            logical_path = parsed.path.removeprefix("/codex-base-url-control")
+        else:
+            source = "protocol-fixture"
+            logical_path = parsed.path
         length = int(self.headers.get("content-length", "0"))
         raw = self.rfile.read(length)
         text = raw.decode("utf-8", errors="replace")
@@ -329,11 +336,7 @@ class Handler(BaseHTTPRequestHandler):
 
         sentinel = sentinel_match.group(0)
         token = mutate_sentinel(sentinel) if scenario == "mutated" else sentinel
-        body = (
-            cli_response_body(protocol, token)
-            if source == "real-cli"
-            else response_body(protocol, token)
-        )
+        body = cli_response_body(protocol, token) if source != "protocol-fixture" else response_body(protocol, token)
         content_type = (
             "application/x-ndjson"
             if protocol in {"ollama-ndjson", "ollama-chat-ndjson"}

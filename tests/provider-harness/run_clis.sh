@@ -9,6 +9,60 @@ SECRET=AKIAIOSFODNN7EXAMPLE
 PROMPT="Return this fixed synthetic canary exactly once: ${SECRET}"
 PROXY=http://promtect-cli:8790
 
+observer_count() {
+  python3 -c 'import json,urllib.request; print(len(json.load(urllib.request.urlopen("http://mock-provider:9000/__observations", timeout=5))))'
+}
+
+assert_codex_observation_window() {
+  start=$1
+  end=$2
+  source=$3
+  plaintext=$4
+  sentinel=$5
+  python3 - "$start" "$end" "$source" "$plaintext" "$sentinel" <<'PY'
+import json
+import sys
+import urllib.request
+
+start, end = map(int, sys.argv[1:3])
+source, plaintext, sentinel = sys.argv[3], sys.argv[4] == "true", sys.argv[5] == "true"
+with urllib.request.urlopen("http://mock-provider:9000/__observations", timeout=5) as response:
+    observations = json.load(response)
+window = observations[start:end]
+matches = [
+    item
+    for item in window
+    if item.get("source") == source and item.get("path") == "/v1/responses"
+]
+assert len(matches) == 1, (
+    f"expected exactly one Codex Responses observation from {source}, got {matches!r}; "
+    f"window={window!r}"
+)
+match = matches[0]
+assert match.get("plaintext_canary_seen") is plaintext, match
+assert match.get("sentinel_seen") is sentinel, match
+assert "body" not in match, "real CLI body must not be retained"
+PY
+}
+
+run_codex_base_url_control() {
+  base_url=$1
+  output_file=$2
+  HOME=/tmp/codex-base-url CODEX_HOME=/tmp/codex-base-url \
+    CODEX_API_KEY=fixed-dummy-key OPENAI_BASE_URL="${PROXY}/v1" \
+    codex exec --skip-git-repo-check --sandbox read-only -C /synthetic \
+      -c 'model_provider="promtect-routing-control"' \
+      -c 'model_providers.promtect-routing-control.name="Promtect routing control"' \
+      -c "model_providers.promtect-routing-control.base_url=\"${base_url}\"" \
+      -c 'model_providers.promtect-routing-control.wire_api="responses"' \
+      -c 'model_providers.promtect-routing-control.env_key="CODEX_API_KEY"' \
+      -c 'model_providers.promtect-routing-control.requires_openai_auth=false' \
+      -c 'model_providers.promtect-routing-control.supports_websockets=false' \
+      -c 'model_providers.promtect-routing-control.request_max_retries=0' \
+      -c 'model_providers.promtect-routing-control.stream_max_retries=0' \
+      "$PROMPT" > "$output_file" 2>&1
+}
+
 assert_version() {
   name=$1
   expected=$2
@@ -36,29 +90,37 @@ assert_version "Claude Code" "$CLAUDE_VERSION" claude --version
 assert_version Ollama "$OLLAMA_VERSION" ollama --version
 assert_version Aider "$AIDER_VERSION" aider --version
 
-mkdir -p /tmp/codex /tmp/claude /tmp/ollama /tmp/aider
+mkdir -p /tmp/codex-base-url /tmp/claude /tmp/ollama /tmp/aider
 
-# Official custom-provider control. Codex 0.144.3 does not read
-# OPENAI_BASE_URL, so the protected control explicitly selects a Responses
-# provider and disables its WebSocket transport until guard wiring is fixed in
-# #87.
-if ! HOME=/tmp/codex CODEX_HOME=/tmp/codex CODEX_API_KEY=fixed-dummy-key \
-  codex exec --skip-git-repo-check --sandbox read-only -C /synthetic \
-    -c 'model_provider="promtect"' \
-    -c 'model_providers.promtect.name="Promtect harness"' \
-    -c "model_providers.promtect.base_url=\"${PROXY}/v1\"" \
-    -c 'model_providers.promtect.wire_api="responses"' \
-    -c 'model_providers.promtect.env_key="CODEX_API_KEY"' \
-    -c 'model_providers.promtect.requires_openai_auth=false' \
-    -c 'model_providers.promtect.supports_websockets=false' \
-    -c 'model_providers.promtect.request_max_retries=0' \
-    -c 'model_providers.promtect.stream_max_retries=0' \
-    "$PROMPT" > /tmp/codex.out 2>&1; then
-  printf 'FAIL CLI control: Codex exited nonzero\n' >&2
-  sed -n '1,120p' /tmp/codex.out >&2
+# Codex A/B routing control. The two invocations share the same home, auth,
+# environment, prompt, and flags; only the documented custom-provider base_url
+# changes. OPENAI_BASE_URL points at Promtect in both arms, reproducing the
+# current guard environment without relying on external network failure.
+ab_before=$(observer_count)
+if ! run_codex_base_url_control "${PROXY}/v1" /tmp/codex-protected.out; then
+  printf 'FAIL Codex A/B protected arm: Codex exited nonzero\n' >&2
+  sed -n '1,120p' /tmp/codex-protected.out >&2
   exit 1
 fi
-assert_output_restored Codex /tmp/codex.out
+ab_protected_after=$(observer_count)
+assert_codex_observation_window "$ab_before" "$ab_protected_after" real-cli false true
+assert_output_restored "Codex A/B protected arm" /tmp/codex-protected.out
+
+if run_codex_base_url_control \
+  http://mock-provider:9000/codex-base-url-control/v1 \
+  /tmp/codex-direct.out; then
+  printf 'FAIL Codex A/B direct arm: mock tripwire unexpectedly accepted plaintext\n' >&2
+  exit 1
+fi
+ab_direct_after=$(observer_count)
+assert_codex_observation_window \
+  "$ab_protected_after" "$ab_direct_after" codex-base-url-control true false
+if ! grep -Fq 'unsafe harness request rejected' /tmp/codex-direct.out; then
+  printf 'FAIL Codex A/B direct arm: nonzero exit was not the mock tripwire response\n' >&2
+  sed -n '1,120p' /tmp/codex-direct.out >&2
+  exit 1
+fi
+printf 'KNOWN GAP #87: custom-provider base_url bypassed the guard environment; mock rejected plaintext\n'
 
 HOME=/tmp/claude CLAUDE_CONFIG_DIR=/tmp/claude \
   ANTHROPIC_BASE_URL="$PROXY" ANTHROPIC_API_KEY=fixed-dummy-key \
@@ -89,28 +151,6 @@ if ! HOME=/tmp/aider OPENAI_API_KEY=fixed-dummy-key \
   exit 1
 fi
 assert_output_restored Aider /tmp/aider.out
-
-observer_count() {
-  python3 -c 'import json,urllib.request; print(len(json.load(urllib.request.urlopen("http://mock-provider:9000/__observations", timeout=5))))'
-}
-
-# Deterministic evidence for #87: current Codex ignores OPENAI_BASE_URL. The
-# internal-only network makes the attempted default route unreachable; success
-# or an observer request would invalidate the known-gap evidence.
-before=$(observer_count)
-if HOME=/tmp/codex-gap CODEX_HOME=/tmp/codex-gap CODEX_API_KEY=fixed-dummy-key \
-  OPENAI_BASE_URL="${PROXY}/v1" \
-  codex exec --skip-git-repo-check --sandbox read-only -C /synthetic \
-    "$PROMPT" > /tmp/codex-gap.out 2>&1; then
-  printf 'FAIL known-gap evidence: Codex unexpectedly honored OPENAI_BASE_URL\n' >&2
-  exit 1
-fi
-after=$(observer_count)
-if [ "$before" != "$after" ]; then
-  printf 'FAIL known-gap evidence: Codex OPENAI_BASE_URL run reached the observer\n' >&2
-  exit 1
-fi
-printf 'KNOWN GAP #87: Codex ignored OPENAI_BASE_URL; internal network blocked the bypass\n'
 
 # Negative regression for the Aider precedence concern in #87. This reproduces
 # guard's injected OpenAI variables plus a stale AIDER_OPENAI_API_BASE. Current

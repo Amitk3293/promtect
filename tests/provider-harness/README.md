@@ -24,10 +24,13 @@ it never retains a CLI request body.
 | Ollama | `0.31.2` | `ollama --version` | [release](https://github.com/ollama/ollama/releases/tag/v0.31.2) |
 | Aider | `0.86.2` | `aider --version` | [PyPI](https://pypi.org/project/aider-chat/0.86.2/) |
 
-The multi-architecture Ollama tarball comes from the exact release URL and its
-reported version is asserted at runtime. Claude's npm installer is pinned for a
-deterministic container even though current documentation recommends the native
-installer.
+The harness pins every base-image index digest, commits npm integrity metadata
+and the complete Python dependency resolution, and verifies each Ollama Linux
+archive against the architecture-specific SHA-256 published with v0.31.2 before
+extracting its standalone CLI binary. Apt packages still resolve from the Debian
+repository at build time, so the build is not claimed to be byte-for-byte
+deterministic. Claude's npm installer remains version-pinned even though current
+documentation recommends the native installer.
 
 ## Protocol and failure expectations
 
@@ -60,9 +63,14 @@ CLI-precedence `--openai-api-base`.
 Those explicit controls do not hide the automatic `guard` gap tracked by
 [#87](https://github.com/Amitk3293/promtect/issues/87):
 
-- Codex 0.144.3 does not read `OPENAI_BASE_URL`; current `guard codex` sets only
-  that environment variable, so it can bypass Promtect before the zero-request
-  tripwire warns.
+- Codex 0.144.3 routes a custom provider using its documented `base_url`.
+  Current `guard codex` sets only `OPENAI_BASE_URL`, which does not override an
+  existing direct custom-provider URL. The harness runs a controlled A/B pair
+  with identical home, auth, environment, prompt, and flags. The protected URL
+  produces a masked request and restored response; the direct URL sends the
+  canary to an internal tripwire, which records only metadata and returns 422.
+  The direct run must fail specifically from that 422, so setup or auth errors
+  cannot satisfy the known-gap assertion.
 
 The harness also adversarially sets a stale `AIDER_OPENAI_API_BASE` while
 providing the two variables current `guard aider` injects. Aider 0.86.2's
