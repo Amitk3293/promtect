@@ -64,3 +64,10 @@ jobs:
           tool: cargo-llvm-cov
       - name: Coverage summary (report-only)
         run: cargo llvm-cov --workspace --summary-only
+
+  provider-harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Docker provider protocols and pinned CLIs
+        run: sh tests/provider-harness/run.sh

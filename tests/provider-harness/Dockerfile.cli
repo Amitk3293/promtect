@@ -1,0 +1,36 @@
+FROM node:22.18.0-bookworm-slim
+
+ARG TARGETARCH
+ARG CODEX_VERSION=0.144.3
+ARG CLAUDE_VERSION=2.1.207
+ARG OLLAMA_VERSION=0.31.2
+ARG AIDER_VERSION=0.86.2
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+ && apt-get install --yes --no-install-recommends ca-certificates curl git python3 python3-pip zstd \
+ && rm -rf /var/lib/apt/lists/* \
+ && npm install --global \
+      "@openai/codex@${CODEX_VERSION}" \
+      "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
+ && pip3 install --break-system-packages "aider-chat==${AIDER_VERSION}" \
+ && case "${TARGETARCH}" in \
+      amd64) ollama_arch=amd64 ;; \
+      arm64) ollama_arch=arm64 ;; \
+      *) echo "unsupported Docker architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl --fail --silent --show-error --location \
+      "https://github.com/ollama/ollama/releases/download/v${OLLAMA_VERSION}/ollama-linux-${ollama_arch}.tar.zst" \
+      | tar --zstd --extract --directory /usr \
+ && useradd --create-home --uid 10001 harness \
+ && mkdir --parents /harness /synthetic \
+ && chown -R harness:harness /harness /synthetic
+
+WORKDIR /harness
+COPY mock_provider.py run_protocols.py verify_cli_observations.py run_clis.sh ./
+
+USER harness
+WORKDIR /synthetic

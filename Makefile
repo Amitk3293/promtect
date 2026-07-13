@@ -1,6 +1,6 @@
 PORT ?= 8790
 
-.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test up down clean
+.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test provider-harness up down clean
 
 build:
 	cargo build --release
@@ -40,6 +40,11 @@ docker-run:
 # Docker-only test gate (fmt + clippy + cargo test). Used while GH Actions CI is capped.
 docker-test:
 	docker-compose -f docker-compose.test.yml run --rm test
+
+# Credential-free provider protocol validation. Every component (Promtect,
+# mock providers, and assertions) runs inside an internal Docker network.
+provider-harness:
+	sh tests/provider-harness/run.sh
 
 up:
 	docker-compose up -d || docker compose up -d
