@@ -1094,6 +1094,9 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         || Audit::to_file(&audit_path),
         |scope| Audit::to_file_scoped(&audit_path, scope.clone()),
     );
+    if claude_notice_token.is_some() {
+        audit.prepare();
+    }
     let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = Ctx {
         upstream: plan.upstream.clone(),
@@ -1562,6 +1565,24 @@ mod tests {
         );
 
         assert!(super::take_claude_notice(&state).is_none());
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_notice_starts_after_repairing_a_truncated_prior_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-truncated-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, br#"{"incomplete":true"#).expect("write truncated audit tail");
+        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
+        audit.prepare();
+        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        audit.record_request("request-new", 1, &["aws_key"], 100, 120);
+
+        let notice = super::take_claude_notice(&state).expect("new repaired-session notice");
+        assert_eq!(notice.masked, 1);
+        assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
         std::fs::remove_file(path).ok();
     }
 

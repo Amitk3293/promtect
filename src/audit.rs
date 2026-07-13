@@ -86,6 +86,22 @@ impl Audit {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Open and repair a file-backed sink before a reader snapshots its length.
+    /// Guard's Claude notice tailer uses this so a truncated prior-session tail
+    /// cannot leave its initial cursor in the middle of the first new record.
+    pub(crate) fn prepare(&self) {
+        let mut guard = self.sink_lock();
+        let Some(sink) = guard.as_mut() else {
+            return;
+        };
+        if sink.handle.is_none() {
+            match Self::open_append(&sink.path) {
+                Ok(file) => sink.handle = Some(file),
+                Err(_) => self.warn_once(),
+            }
+        }
+    }
+
     /// Open the audit log for append, creating it owner-only (`0600`) on Unix and
     /// repairing the mode of a pre-existing file that is group/other-accessible.
     ///
