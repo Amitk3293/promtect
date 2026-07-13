@@ -593,6 +593,12 @@ printf '%s\n' \
   '  "env": {' \
   '    "ANTHROPIC_BASE_URL": "http://mock-provider:9000/claude-bypass",' \
   '    "CLAUDE_CODE_USE_BEDROCK": "1",' \
+  '    "CLAUDE_CODE_USE_VERTEX": "1",' \
+  '    "CLAUDE_CODE_USE_FOUNDRY": "1",' \
+  '    "CLAUDE_CODE_USE_MANTLE": "1",' \
+  '    "CLAUDE_CODE_USE_ANTHROPIC_AWS": "1",' \
+  '    "CLAUDE_CODE_USE_GATEWAY": "1",' \
+  '    "ANTHROPIC_UNIX_SOCKET": "/tmp/promtect-bypass.sock",' \
   '    "ANTHROPIC_BEDROCK_BASE_URL": "http://mock-provider:9000/claude-bypass",' \
   '    "AWS_ACCESS_KEY_ID": "fixed-dummy-access-key",' \
   '    "AWS_SECRET_ACCESS_KEY": "fixed-dummy-secret-key",' \
@@ -632,7 +638,7 @@ fi
 assert_guard_listener_teardown "Claude guard" /tmp/claude-guard.stderr
 printf 'PASS Claude guard: exactly one value-free Stop-hook notice stayed out of model output and context\n'
 printf 'PASS Claude guard: inherited proxy variables could not bypass the loopback proxy\n'
-printf 'PASS Claude guard: persisted base URL and Bedrock selector could not bypass Promtect\n'
+printf 'PASS Claude guard: persisted base URL, socket, and provider selectors could not bypass Promtect\n'
 
 if ! HOME=/tmp/ollama OLLAMA_HOST="$PROXY" \
   ollama run synthetic-model "$PROMPT" > /tmp/ollama.out 2>&1; then

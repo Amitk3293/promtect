@@ -63,6 +63,7 @@ const CLAUDE_PROVIDER_SELECTORS: &[&str] = &[
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_GATEWAY",
 ];
 const CLAUDE_NOTICE_ROUTE: &str = "/_promtect/hooks/{token}";
 const CLAUDE_NOTICE_MAX_DELTA_BYTES: u64 = 1024 * 1024;
@@ -71,6 +72,7 @@ const CLAUDE_NOTICE_MAX_RECORDS: usize = 4096;
 const CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES: usize = 256;
 const CLAUDE_NOTICE_MAX_DETECTOR_BYTES: usize = 64;
 const CLAUDE_NOTICE_MAX_DETECTORS: usize = 128;
+const CLAUDE_NOTICE_DEGRADED_MESSAGE: &str = "🛡 Promtect could not safely summarize this turn’s protection metadata. No sensitive values are included; check the local dashboard and guard summary.";
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
     args.get(i + 1)
@@ -349,54 +351,128 @@ fn conflicting_claude_override(args: &[String]) -> Option<&str> {
     })
 }
 
-fn claude_settings_args(base_url: &str, notice_url: &str) -> [String; 2] {
+fn claude_settings_json(base_url: &str, notice_url: &str) -> String {
     let mut env = serde_json::Map::new();
     env.insert(CLAUDE_BASE_VAR.to_string(), serde_json::json!(base_url));
     for selector in CLAUDE_PROVIDER_SELECTORS {
-        // Claude documents these selectors as enabled by `1`. An explicit `0`
-        // overrides hostile persisted settings without relying on inherited env.
+        // Current Claude transports recognize these selectors as enabled by `1`.
+        // An explicit `0` overrides hostile persisted settings without relying on
+        // inherited environment state; the pinned real-CLI harness verifies this.
         env.insert((*selector).to_string(), serde_json::json!("0"));
     }
-    [
-        "--settings".to_string(),
-        serde_json::json!({
-            "env": env,
-            "hooks": {
-                "Stop": [{
-                    "hooks": [{
-                        "type": "http",
-                        "url": notice_url,
-                        "timeout": 5
-                    }]
+    env.insert("ANTHROPIC_UNIX_SOCKET".to_string(), serde_json::json!(""));
+    serde_json::json!({
+        "env": env,
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "http",
+                    "url": notice_url,
+                    "timeout": 5
                 }]
+            }]
+        }
+    })
+    .to_string()
+}
+
+struct ClaudeSettingsFile {
+    directory: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+impl ClaudeSettingsFile {
+    fn create(base_url: &str, notice_url: &str) -> std::io::Result<Self> {
+        let directory =
+            std::env::temp_dir().join(format!("promtect-claude-{}", uuid::Uuid::new_v4().simple()));
+        let mut directory_builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            directory_builder.mode(0o700);
+        }
+        directory_builder.create(&directory)?;
+
+        let path = directory.join("settings.json");
+        let result = (|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
             }
-        })
-        .to_string(),
-    ]
+            let mut file = options.open(&path)?;
+            use std::io::Write;
+            file.write_all(claude_settings_json(base_url, notice_url).as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            std::fs::remove_file(&path).ok();
+            std::fs::remove_dir(&directory).ok();
+            return Err(error);
+        }
+
+        Ok(Self { directory, path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for ClaudeSettingsFile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.path).ok();
+        std::fs::remove_dir(&self.directory).ok();
+    }
 }
 
 #[derive(Clone)]
 struct ClaudeNoticeState {
     audit_path: Arc<std::path::PathBuf>,
+    audit: Option<Arc<Audit>>,
     cursor: Arc<std::sync::Mutex<u64>>,
+    reading: Arc<std::sync::atomic::AtomicBool>,
     token: Arc<str>,
     request_prefix: Arc<str>,
     strict: bool,
 }
 
 impl ClaudeNoticeState {
-    fn new(audit_path: impl Into<std::path::PathBuf>, token: String, strict: bool) -> Self {
+    fn new(
+        audit_path: impl Into<std::path::PathBuf>,
+        token: String,
+        request_scope: &str,
+        strict: bool,
+    ) -> Self {
         let audit_path = audit_path.into();
         let cursor = std::fs::metadata(&audit_path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         Self {
             audit_path: Arc::new(audit_path),
+            audit: None,
             cursor: Arc::new(std::sync::Mutex::new(cursor)),
-            request_prefix: format!("{token}:").into(),
+            reading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_prefix: format!("{request_scope}:").into(),
             token: token.into(),
             strict,
         }
+    }
+
+    fn with_audit(mut self, audit: Arc<Audit>) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+}
+
+struct ClaudeNoticeReadPermit(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for ClaudeNoticeReadPermit {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -434,10 +510,10 @@ fn take_claude_notice(state: &ClaudeNoticeState) -> ClaudeNoticeRead {
         .cursor
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut file = match std::fs::File::open(state.audit_path.as_path()) {
+    let mut file = match Audit::open_read(state.audit_path.as_path()) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ClaudeNoticeRead::Empty;
+            return ClaudeNoticeRead::Degraded;
         }
         Err(_) => return ClaudeNoticeRead::Degraded,
     };
@@ -821,11 +897,7 @@ fn validate_claude_auth_status(bytes: &[u8]) -> Result<(), String> {
             .get("subscriptionType")
             .and_then(serde_json::Value::as_str)
         {
-            Some("max")
-                if status
-                    .get("organizationType")
-                    .is_none_or(serde_json::Value::is_null) =>
-            {
+            Some("max") if status.get("organizationType") == Some(&serde_json::Value::Null) => {
                 Ok(())
             }
             _ => Err(
@@ -922,10 +994,53 @@ async fn claude_notice_hook(
     if token != state.token.as_ref() {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({})));
     }
+    if state
+        .audit
+        .as_ref()
+        .is_some_and(|audit| !audit.is_healthy())
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "systemMessage": CLAUDE_NOTICE_DEGRADED_MESSAGE
+            })),
+        );
+    }
+    if state
+        .reading
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "systemMessage": CLAUDE_NOTICE_DEGRADED_MESSAGE
+            })),
+        );
+    }
     let strict = state.strict;
-    let read = tokio::task::spawn_blocking(move || take_claude_notice(&state))
-        .await
-        .unwrap_or(ClaudeNoticeRead::Degraded);
+    let reading = state.reading.clone();
+    let read_state = state.clone();
+    let read = tokio::task::spawn_blocking(move || {
+        let _permit = ClaudeNoticeReadPermit(reading);
+        take_claude_notice(&read_state)
+    })
+    .await
+    .unwrap_or(ClaudeNoticeRead::Degraded);
+    let read = if state
+        .audit
+        .as_ref()
+        .is_some_and(|audit| !audit.is_healthy())
+    {
+        ClaudeNoticeRead::Degraded
+    } else {
+        read
+    };
     let body = match read {
         ClaudeNoticeRead::Empty => serde_json::json!({}),
         ClaudeNoticeRead::Notice(notice) => {
@@ -934,7 +1049,7 @@ async fn claude_notice_hook(
             })
         }
         ClaudeNoticeRead::Degraded => serde_json::json!({
-            "systemMessage": "🛡 Promtect could not safely summarize this turn’s protection metadata. No sensitive values are included; check the local dashboard and guard summary."
+            "systemMessage": CLAUDE_NOTICE_DEGRADED_MESSAGE
         }),
     };
     (StatusCode::OK, Json(body))
@@ -1372,17 +1487,30 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     let claude_notice_token = plan
         .claude_fail_closed
         .then(|| uuid::Uuid::new_v4().simple().to_string());
-    let audit = claude_notice_token.as_ref().map_or_else(
+    let claude_audit_scope = plan
+        .claude_fail_closed
+        .then(|| uuid::Uuid::new_v4().simple().to_string());
+    let audit = claude_audit_scope.as_ref().map_or_else(
         || Audit::to_file(&audit_path),
         |scope| Audit::to_file_scoped(&audit_path, scope.clone()),
     );
+    let audit = Arc::new(audit);
     if claude_notice_token.is_some() {
-        audit.prepare();
+        let audit_to_prepare = audit.clone();
+        match tokio::task::spawn_blocking(move || audit_to_prepare.prepare()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                eprintln!(
+                    "promtect guard: refusing to start Claude because the audit path is unsafe or unavailable"
+                );
+                return 1;
+            }
+        }
     }
     let requests = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ctx = Ctx {
         upstream: plan.upstream.clone(),
-        audit: Arc::new(audit),
+        audit: audit.clone(),
         client: crate::net::http_client(),
         max_body_bytes: proxy::DEFAULT_MAX_BODY_BYTES,
         restore: plan.restore,
@@ -1426,12 +1554,17 @@ pub async fn guard(plan: GuardPlan) -> i32 {
 
     let (app, claude_notice_url) = if plan.claude_fail_closed {
         let token = claude_notice_token.expect("Claude notice token must exist");
-        let notice_url = format!("{base_url}/_promtect/hooks/{token}");
+        let notice_path = CLAUDE_NOTICE_ROUTE.replace("{token}", &token);
+        let notice_url = format!("{base_url}{notice_path}");
         let notice_state = ClaudeNoticeState::new(
             std::path::PathBuf::from(&audit_path_for_dash),
             token,
+            claude_audit_scope
+                .as_deref()
+                .expect("Claude audit scope must exist"),
             !plan.restore,
-        );
+        )
+        .with_audit(audit.clone());
         let notice_router = Router::new()
             .route(CLAUDE_NOTICE_ROUTE, post(claude_notice_hook))
             .with_state(notice_state);
@@ -1509,6 +1642,30 @@ pub async fn guard(plan: GuardPlan) -> i32 {
     // Inherit the full parent env (so the user's API keys flow through, forwarded
     // untouched), then override the tool's base-URL var to point at the proxy.
     // kill_on_drop ensures the child can't be orphaned if this future is dropped.
+    let claude_settings_file = if plan.claude_fail_closed {
+        let Some(notice_url) = claude_notice_url.as_deref() else {
+            proxy_task.abort();
+            if let Some(task) = dashboard_task {
+                task.abort();
+            }
+            eprintln!("promtect guard: could not create Claude protection settings");
+            return 1;
+        };
+        match ClaudeSettingsFile::create(&base_url, notice_url) {
+            Ok(file) => Some(file),
+            Err(_) => {
+                proxy_task.abort();
+                if let Some(task) = dashboard_task {
+                    task.abort();
+                }
+                eprintln!("promtect guard: could not create owner-only Claude protection settings");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     let mut cmd = tokio::process::Command::new(&plan.bin);
     if let Some(auth) = codex_auth {
         configure_codex_command(&mut cmd, auth);
@@ -1519,11 +1676,13 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         // inherited proxy routes so the guard-owned base URL cannot be sent to a
         // different proxy before reaching Promtect.
         configure_guard_child_network_env(&mut cmd);
+        cmd.env_remove("ANTHROPIC_UNIX_SOCKET")
+            .env_remove("CLAUDE_CODE_USE_GATEWAY");
         // Claude settings.json `env` values override the child process
         // environment. Inline settings win over user/project settings. The
         // preflight above separately rejects higher-precedence managed profiles.
-        if let Some(notice_url) = claude_notice_url.as_deref() {
-            cmd.args(claude_settings_args(&base_url, notice_url));
+        if let Some(settings_file) = claude_settings_file.as_ref() {
+            cmd.arg("--settings").arg(settings_file.path());
         }
     }
     cmd.args(&plan.tool_args)
@@ -1578,8 +1737,14 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         } else {
             // Value-free end-of-session summary, now that the TUI has released the
             // terminal: the useful Promtect signal without disturbing the session.
-            let after = crate::metrics::aggregate(std::path::Path::new(&audit_path_for_dash));
-            print_guard_summary(&baseline, &after);
+            if plan.claude_fail_closed && !audit.is_healthy() {
+                eprintln!(
+                    "promtect guard: this session's protection metadata is incomplete because the audit log became unavailable; masking continued, but no zero-event claim is possible"
+                );
+            } else {
+                let after = crate::metrics::aggregate(std::path::Path::new(&audit_path_for_dash));
+                print_guard_summary(&baseline, &after);
+            }
         }
     }
 
@@ -1729,27 +1894,64 @@ mod tests {
     }
 
     #[test]
-    fn claude_inline_settings_force_guard_owned_routing() {
-        let args = claude_settings_args(
+    fn claude_private_settings_force_guard_owned_routing() {
+        let settings_json = claude_settings_json(
             "http://127.0.0.1:12345",
             "http://127.0.0.1:12345/_promtect/hooks/test-token",
         );
-        assert_eq!(args[0], "--settings");
         let settings: serde_json::Value =
-            serde_json::from_str(&args[1]).expect("inline Claude settings must be JSON");
+            serde_json::from_str(&settings_json).expect("Claude settings must be JSON");
         assert_eq!(
             settings["env"]["ANTHROPIC_BASE_URL"],
             "http://127.0.0.1:12345"
         );
+        for selector in CLAUDE_PROVIDER_SELECTORS {
+            assert_eq!(settings["env"][*selector], "0");
+        }
         assert_eq!(settings["hooks"]["Stop"][0]["hooks"][0]["type"], "http");
         assert_eq!(
             settings["hooks"]["Stop"][0]["hooks"][0]["url"],
             "http://127.0.0.1:12345/_promtect/hooks/test-token"
         );
         assert!(
-            !args[1].contains("additionalContext") && !args[1].contains("prompt"),
+            !settings_json.contains("additionalContext") && !settings_json.contains("prompt"),
             "the user-only notice must never become model context or a prompt"
         );
+    }
+
+    #[test]
+    fn claude_settings_file_is_owner_only_and_removed_on_drop() {
+        let settings = ClaudeSettingsFile::create(
+            "http://127.0.0.1:12345",
+            "http://127.0.0.1:12345/_promtect/hooks/test-token",
+        )
+        .expect("create private Claude settings");
+        let directory = settings.directory.clone();
+        let path = settings.path().to_path_buf();
+        assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&directory)
+                    .expect("settings directory metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("settings file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        drop(settings);
+        assert!(!path.exists());
+        assert!(!directory.exists());
     }
 
     #[test]
@@ -1787,7 +1989,8 @@ mod tests {
             "promtect-claude-notice-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), true);
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", true);
         let other_guard =
             crate::audit::Audit::to_file_scoped(path.clone(), "other-guard".to_string());
         other_guard.record_request("request-other", 9, &["jwt"], 100, 120);
@@ -1831,7 +2034,8 @@ mod tests {
             "promtect-claude-notice-failed-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
         let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
         audit.record_request("request-blocked", 1, &["aws_key"], 100, 120);
         audit.record(
@@ -1863,8 +2067,9 @@ mod tests {
         ));
         std::fs::write(&path, br#"{"incomplete":true"#).expect("write truncated audit tail");
         let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-        audit.prepare();
-        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        audit.prepare().expect("prepare truncated audit tail");
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
         audit.record_request("request-new", 1, &["aws_key"], 100, 120);
 
         let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
@@ -1881,7 +2086,8 @@ mod tests {
             "promtect-claude-notice-large-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
         let mut oversized = vec![b'x'; (super::CLAUDE_NOTICE_MAX_DELTA_BYTES + 1) as usize];
         *oversized.last_mut().expect("non-empty oversized delta") = b'\n';
         std::fs::write(&path, oversized).expect("write oversized audit delta");
@@ -1911,7 +2117,8 @@ mod tests {
             "promtect-claude-notice-record-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
         let mut record = vec![b'x'; (super::CLAUDE_NOTICE_MAX_RECORD_BYTES + 1) as usize];
         record.push(b'\n');
         std::fs::write(&path, record).expect("write oversized audit record");
@@ -1935,7 +2142,8 @@ mod tests {
             "promtect-claude-notice-records-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
         let records = "{}\n".repeat(super::CLAUDE_NOTICE_MAX_RECORDS + 1);
         std::fs::write(&path, records).expect("write excessive audit records");
 
@@ -1952,34 +2160,110 @@ mod tests {
         std::fs::remove_file(path).ok();
     }
 
+    #[test]
+    fn claude_notice_field_bounds_degrade_value_free_then_recover() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-fields-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
+        let too_many_detectors = (0..=super::CLAUDE_NOTICE_MAX_DETECTORS)
+            .map(|index| format!("detector_{index}"))
+            .collect::<Vec<_>>();
+        let invalid_records = [
+            serde_json::json!({
+                "action": "request",
+                "request_id": format!(
+                    "test-token:{}",
+                    "a".repeat(super::CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES)
+                ),
+                "masked": 1,
+                "detectors": ["aws_key"]
+            }),
+            serde_json::json!({
+                "action": "request",
+                "request_id": "test-token:invalid-character",
+                "masked": 1,
+                "detectors": ["aws-key"]
+            }),
+            serde_json::json!({
+                "action": "request",
+                "request_id": "test-token:oversized-detector",
+                "masked": 1,
+                "detectors": ["a".repeat(super::CLAUDE_NOTICE_MAX_DETECTOR_BYTES + 1)]
+            }),
+            serde_json::json!({
+                "action": "request",
+                "request_id": "test-token:too-many-detectors",
+                "masked": 1,
+                "detectors": too_many_detectors
+            }),
+            serde_json::json!({
+                "action": "request",
+                "request_id": "test-token:non-string-detector",
+                "masked": 1,
+                "detectors": [42]
+            }),
+        ];
+
+        for (index, record) in invalid_records.into_iter().enumerate() {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .expect("open hostile audit fixture");
+            writeln!(file, "{record}").expect("append hostile audit fixture");
+            drop(file);
+            assert_eq!(
+                super::take_claude_notice(&state),
+                super::ClaudeNoticeRead::Degraded
+            );
+
+            let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
+            audit.record_request(&format!("recovery-{index}"), 1, &["aws_key"], 100, 120);
+            let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
+                panic!("expected recovery after hostile audit field {index}");
+            };
+            assert_eq!(notice.masked, 1);
+            assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
+        }
+        std::fs::remove_file(path).ok();
+    }
+
     #[tokio::test(flavor = "current_thread")]
-    async fn claude_notice_hook_does_not_block_the_async_runtime() {
+    async fn claude_notice_hook_allows_only_one_blocking_reader() {
         let path = std::env::temp_dir().join(format!(
             "promtect-claude-notice-responsive-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let state = super::ClaudeNoticeState::new(&path, "test-token".to_string(), false);
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
         let cursor = state.cursor.clone();
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
             let _guard = cursor.lock().expect("hold notice cursor");
             locked_tx.send(()).expect("signal held cursor");
-            std::thread::sleep(Duration::from_millis(400));
+            release_rx.recv().expect("release notice cursor");
         });
         locked_rx.recv().expect("wait for held cursor");
 
         let hook = tokio::spawn(super::claude_notice_hook(
-            State(state),
-            Path("test-token".to_string()),
+            State(state.clone()),
+            Path("hook-token".to_string()),
         ));
-        let started = std::time::Instant::now();
-        let probe = tokio::spawn(async { tokio::task::yield_now().await });
-        probe.await.expect("concurrent runtime probe");
-        assert!(
-            started.elapsed() < Duration::from_millis(150),
-            "the Stop hook must not block unrelated async work"
-        );
+        while !state.reading.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        let (status, Json(body)) =
+            super::claude_notice_hook(State(state), Path("hook-token".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["systemMessage"], super::CLAUDE_NOTICE_DEGRADED_MESSAGE);
 
+        release_tx.send(()).expect("release notice cursor");
         holder.join().expect("release notice cursor");
         let (status, _) = hook.await.expect("notice hook task");
         assert_eq!(status, StatusCode::OK);
@@ -2071,6 +2355,7 @@ mod tests {
         for unsupported in [
             br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"team","apiProvider":"firstParty"}"#.as_slice(),
             br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"enterprise","apiProvider":"firstParty"}"#.as_slice(),
+            br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"firstParty"}"#.as_slice(),
             br#"{"loggedIn":true,"authMethod":"api_key","subscriptionType":null,"apiProvider":"firstParty"}"#.as_slice(),
             br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"gateway"}"#.as_slice(),
             br#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#.as_slice(),

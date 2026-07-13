@@ -57,8 +57,11 @@ promtect selftest        # → promtect selftest: PASS — no leak
   before targeting a different upstream; Promtect cannot identify token ownership.
 - `guard claude` removes inherited HTTP proxy variables from the Claude child so
   its loopback Promtect URL cannot be routed through another proxy first. Known
-  detected endpoint- or server-managed settings are rejected before Claude starts;
+  endpoint- or server-managed settings are rejected before Claude starts;
   use the manual proxy or an unmanaged individual Max profile.
+- The unmanaged-profile check is a launch-time preflight, not an operating-system
+  sandbox. Promtect cannot prevent a newly installed higher-precedence policy from
+  changing a running Claude process; stop Claude and restart the guard before continuing.
 - Promtect itself ignores implicit system proxy variables. Chain a trusted
   gateway explicitly with `--upstream` or `--headroom` so the destination is
   visible in the guard banner and risk classification.
