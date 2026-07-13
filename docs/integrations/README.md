@@ -1,9 +1,10 @@
 # Integrations
 
-Mask every secret before it reaches the model. Promtect runs as a local proxy:
-start it, point your AI tool's base URL at it, and each API key, token, and
-password in your requests is masked before it leaves your machine — then restored
-in the reply, or kept masked in strict mode. Pick your tool below.
+Mask recognized known-format secrets on a supported path. Promtect runs as a
+local proxy: start it, verify your AI tool routes through its base URL, and
+supported matches in uncompressed UTF-8 request bodies are replaced before the
+remaining prompt goes upstream. An unchanged sentinel can be restored in the
+reply, or kept masked in strict mode. Pick your tool below.
 
 | Tool | Guide | Mode |
 |------|-------|------|
@@ -19,9 +20,10 @@ in the reply, or kept masked in strict mode. Pick your tool below.
 | Chaining (Headroom / LiteLLM / corp proxy) | [chaining.md](chaining.md) | any + `PROMTECT_UPSTREAM` |
 | VS Code Copilot | [vscode-copilot.md](vscode-copilot.md) | not yet (needs CA) |
 
-Not listed? **Any** tool that lets you override its model-provider base URL works
-the same way: point it at `http://127.0.0.1:8790` and run `promtect` in the
-matching mode. See [harnesses.md](harnesses.md) for the pattern.
+Not listed? A tool with a provider base-URL override may be compatible, but the
+route must be verified before sending a real prompt. Point it at
+`http://127.0.0.1:8790`, run `promtect` in the matching mode, and use the
+controlled preflight in [harnesses.md](harnesses.md).
 
 ## How upstream selection works
 
