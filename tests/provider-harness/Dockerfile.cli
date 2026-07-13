@@ -18,8 +18,8 @@ RUN apt-get update \
  && apt-get install --yes --no-install-recommends ca-certificates curl git python3 python3-pip zstd \
  && rm -rf /var/lib/apt/lists/* \
  && npm ci --prefix /opt/provider-clis --omit=dev \
- && grep --fixed-strings --line-regexp "aider-chat==${AIDER_VERSION}" /tmp/requirements.lock \
- && pip3 install --break-system-packages --requirement /tmp/requirements.lock \
+ && grep --extended-regexp "^aider-chat==${AIDER_VERSION}[[:space:]]*\\\\$" /tmp/requirements.lock \
+ && pip3 install --break-system-packages --only-binary=:all: --require-hashes --requirement /tmp/requirements.lock \
  && case "${TARGETARCH}" in \
       amd64) ollama_arch=amd64; ollama_sha256="${OLLAMA_AMD64_SHA256}" ;; \
       arm64) ollama_arch=arm64; ollama_sha256="${OLLAMA_ARM64_SHA256}" ;; \

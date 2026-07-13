@@ -27,10 +27,64 @@ it never retains a CLI request body.
 The harness pins every base-image index digest, commits npm integrity metadata
 and the complete Python dependency resolution, and verifies each Ollama Linux
 archive against the architecture-specific SHA-256 published with v0.31.2 before
-extracting its standalone CLI binary. Apt packages still resolve from the Debian
-repository at build time, so the build is not claimed to be byte-for-byte
-deterministic. Claude's npm installer remains version-pinned even though current
-documentation recommends the native installer.
+extracting its standalone CLI binary. The Python lock permits only the exact
+CPython 3.11 wheels selected on Debian Bookworm for `linux/amd64` and
+`linux/arm64`; installation forces pip hash checking and rejects source
+distributions. Apt packages still resolve from the Debian repository at build
+time, so the build is not claimed to be byte-for-byte deterministic. Claude's
+npm installer remains version-pinned even though current documentation
+recommends the native installer.
+
+### Regenerating the Python lock
+
+Run these commands from the repository root. They resolve the direct pin in
+`requirements.in` independently in digest-pinned Python 3.11 Bookworm
+containers on both supported Linux architectures. The generator refuses to
+write a lock if the dependency names or versions differ between targets and
+records only the SHA-256 of the wheels actually selected on those targets.
+
+```sh
+rm -rf tests/provider-harness/.requirements-wheels
+mkdir -p tests/provider-harness/.requirements-wheels/amd64 \
+  tests/provider-harness/.requirements-wheels/arm64
+
+docker run --rm --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/tests/provider-harness:/work" -w /work \
+  python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+  python -m pip download --disable-pip-version-check --no-cache-dir \
+    --only-binary=:all: --dest .requirements-wheels/amd64 \
+    --requirement requirements.in
+
+docker run --rm --platform linux/arm64 \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/tests/provider-harness:/work" -w /work \
+  python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+  python -m pip download --disable-pip-version-check --no-cache-dir \
+    --only-binary=:all: --dest .requirements-wheels/arm64 \
+    --requirement requirements.in
+
+docker run --rm --platform linux/arm64 \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/tests/provider-harness:/work" -w /work \
+  python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+  python generate_requirements_lock.py .requirements-wheels/amd64 \
+    .requirements-wheels/arm64 requirements.lock
+
+for platform in linux/amd64 linux/arm64; do
+  docker run --rm --platform "$platform" \
+    -v "$PWD/tests/provider-harness:/work:ro" \
+    python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+    python -m pip install --disable-pip-version-check --no-cache-dir \
+      --only-binary=:all: --require-hashes --requirement /work/requirements.lock
+done
+
+rm -rf tests/provider-harness/.requirements-wheels
+```
+
+Review dependency-version changes before committing the regenerated lock. A
+newly published transitive dependency may legitimately change resolution, but
+it must never enter the harness without a visible lock diff and new hashes.
 
 ## Protocol and failure expectations
 
