@@ -1,6 +1,6 @@
 PORT ?= 8790
 
-.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test dashboard-browser-test provider-harness up down clean
+.PHONY: build test lint fmt run selftest smoke coverage coverage-html docker-build docker-run docker-test dashboard-browser-test provider-harness release-readiness-test up down clean
 
 build:
 	cargo build --release
@@ -48,6 +48,9 @@ provider-harness:
 
 dashboard-browser-test:
 	bash tests/dashboard-browser/run.sh
+
+release-readiness-test:
+	bash tests/release-readiness/run.sh
 
 up:
 	docker-compose up -d || docker compose up -d

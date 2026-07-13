@@ -1,39 +1,79 @@
 name: release
+run-name: Core release candidate ${{ inputs.tag }}${{ inputs.publish && ' (publish)' || '' }}
 
-# Builds release binaries for macOS (arm64 + x86_64) and Linux (x86_64 + arm64)
-# and attaches them to the GitHub Release for a tag. Triggered automatically on a
-# `v*` tag push, or manually (workflow_dispatch) to (re)build an existing tag
-# without re-pushing it.
-#
-# Third-party actions are pinned to immutable commit SHAs (matching ci.yml); the
-# trailing comment records the version. Uploads use the built-in `gh` CLI with the
-# automatic GITHUB_TOKEN — no third-party release action, no extra secret.
-
+# A tag never publishes by itself. A manual candidate run builds and verifies all
+# four targets first. Publication is a separate, environment-gated job and the
+# Homebrew tap is deliberately not mutated by this workflow.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (e.g. v0.1.0)"
+        description: "Existing reviewed main tag (vX.Y.Z)"
         required: true
+        type: string
+      publish:
+        description: "Publish the verified candidate to GitHub Releases"
+        required: true
+        default: false
+        type: boolean
+      publish_confirmation:
+        description: "When publishing: publish vX.Y.Z"
+        required: false
+        type: string
 
 permissions:
-  contents: write # create the release + upload assets
+  contents: read
 
-# Resolve the tag once: the dispatch input when run manually, else the pushed tag.
+concurrency:
+  group: core-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 env:
-  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  TAG: ${{ inputs.tag }}
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - name: Pin reviewed main source
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "tag must be a stable vX.Y.Z tag" >&2; exit 1; }
+          git fetch --force origin main "refs/tags/${TAG}:refs/tags/${TAG}"
+          [ "$(git cat-file -t "refs/tags/${TAG}")" = "tag" ] \
+            || { echo "release tag must be annotated" >&2; exit 1; }
+          sha="$(git rev-parse "${TAG}^{commit}")"
+          git merge-base --is-ancestor "$sha" origin/main \
+            || { echo "tag is not contained in main" >&2; exit 1; }
+          version="$(git show "${sha}:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
+          [ "v${version}" = "$TAG" ] \
+            || { echo "tag and Cargo.toml version differ" >&2; exit 1; }
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  readiness:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - name: Docker release packaging, install, and selftest gate
+        run: make release-readiness-test
+
   build:
+    needs: [validate, readiness]
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Both macOS targets build on Apple Silicon (macos-latest): aarch64 is
-          # native, x86_64 cross-compiles fine with Apple's clang. Avoids the
-          # scarce/deprecated Intel `macos-13` runner queue.
           - { os: macos-latest, target: aarch64-apple-darwin }
           - { os: macos-latest, target: x86_64-apple-darwin }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
@@ -42,75 +82,145 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.TAG }}
-      # Pin the toolchain to the same channel as rust-toolchain.toml so the cross
-      # targets below are installed for the toolchain the build actually uses.
-      # Without this, the action installs targets for `stable` while the toml
-      # override builds with the pinned version → "target may not be installed".
+          ref: ${{ needs.validate.outputs.source_sha }}
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # 1.96.0
         with:
-          toolchain: "1.96.0" # keep in sync with rust-toolchain.toml
+          toolchain: "1.96.0"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: ${{ matrix.target }}
-
-      # The aarch64 Linux target cross-compiles on an x86_64 runner, so it needs
-      # the matching cross-linker. Native targets (both macOS, x86_64 Linux) don't.
+          key: release-${{ matrix.target }}
       - name: Install aarch64 Linux cross-linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package
+      - name: Build locked Core binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package immutable candidate
         shell: bash
         run: |
-          dist="promtect-${TAG}-${{ matrix.target }}"
-          mkdir "$dist"
-          cp "target/${{ matrix.target }}/release/promtect" "$dist/"
-          cp README.md LICENSE NOTICE "$dist/" 2>/dev/null || true
-          # Archive the contents (binary at the root, no wrapper dir) so the
-          # Homebrew formula's `bin.install "promtect"` works without strip logic.
-          tar -C "$dist" -czf "${dist}.tar.gz" .
-          shasum -a 256 "${dist}.tar.gz" | tee "${dist}.tar.gz.sha256"
+          bash scripts/package-release.sh \
+            "$TAG" \
+            "${{ matrix.target }}" \
+            "target/${{ matrix.target }}/release/promtect" \
+            dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
 
-      - name: Publish to release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          # Create the release if it doesn't exist yet (first matrix job wins; the
-          # rest no-op). --clobber lets every job upload its own artifact safely.
-          gh release create "$TAG" --verify-tag --title "Promtect $TAG" --generate-notes \
-            || echo "release $TAG already exists — uploading assets"
-          gh release upload "$TAG" \
-            "promtect-${TAG}-${{ matrix.target }}.tar.gz" \
-            "promtect-${TAG}-${{ matrix.target }}.tar.gz.sha256" \
-            --clobber
-
-  tap-update:
-    needs: build
+  verify:
+    needs: [validate, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.TAG }}
-
-      - name: Update Homebrew tap
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: core-*
+          path: dist
+          merge-multiple: true
+      - name: Verify complete release set
+        run: bash scripts/verify-release-assets.sh "$TAG" dist
+      - name: Generate reviewable Homebrew candidate
         env:
-          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          PROMTECT_ASSET_DIR: dist
+        run: bash scripts/update-formula.sh "$TAG" > dist/promtect.rb
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: core-${{ inputs.tag }}-verified
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  publish:
+    if: inputs.publish
+    needs: [validate, verify]
+    runs-on: ubuntu-latest
+    environment: core-release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.validate.outputs.source_sha }}
+      - name: Require exact publication confirmation
+        env:
+          CONFIRMATION: ${{ inputs.publish_confirmation }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
         run: |
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/Amitk3293/homebrew-tap.git" tap
-          scripts/update-formula.sh "$TAG" > tap/Formula/promtect.rb
-          git -C tap config user.email "github-actions[bot]@users.noreply.github.com"
-          git -C tap config user.name "github-actions[bot]"
-          git -C tap add Formula/promtect.rb
-          # no-op if the formula is already up-to-date (e.g. workflow_dispatch re-run)
-          git -C tap diff --staged --quiet \
-            || git -C tap commit -m "promtect ${TAG}: formula auto-update"
-          git -C tap push
+          [ "$REPOSITORY_VISIBILITY" = "public" ] \
+            || { echo "anonymous Core release requires a public repository" >&2; exit 1; }
+          [ "$CONFIRMATION" = "publish $TAG" ] \
+            || { echo "publication confirmation does not match tag" >&2; exit 1; }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: core-${{ inputs.tag }}-verified
+          path: dist
+      - name: Reverify promoted candidate
+        run: bash scripts/verify-release-assets.sh "$TAG" dist
+      - name: Attest Core archives
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Publish one complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if release_json="$(gh release view "$TAG" --json isDraft 2>/dev/null)"; then
+            is_draft="$(python3 -c 'import json,sys; print(str(json.load(sys.stdin)["isDraft"]).lower())' <<< "$release_json")"
+            if [ "$is_draft" != "true" ]; then
+              echo "published release already exists; refusing replacement" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --verify-tag --draft \
+              --target "$SOURCE_SHA" \
+              --title "Promtect $TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+          release_assets_json="$(gh release view "$TAG" --json isDraft,assets)"
+          RELEASE_ASSETS_JSON="$release_assets_json" python3 - "$TAG" <<'PY'
+          import json
+          import os
+          import sys
+
+          tag = sys.argv[1]
+          data = json.loads(os.environ["RELEASE_ASSETS_JSON"])
+          if not data["isDraft"]:
+              raise SystemExit("release stopped being a draft before verification")
+          targets = (
+              "aarch64-apple-darwin",
+              "x86_64-apple-darwin",
+              "aarch64-unknown-linux-gnu",
+              "x86_64-unknown-linux-gnu",
+          )
+          expected = {
+              name
+              for target in targets
+              for name in (
+                  f"promtect-{tag}-{target}.tar.gz",
+                  f"promtect-{tag}-{target}.tar.gz.sha256",
+              )
+          }
+          actual = [asset["name"] for asset in data["assets"]]
+          if len(actual) != len(set(actual)) or set(actual) != expected:
+              raise SystemExit("draft release has an incomplete or unexpected asset set")
+          PY
+          verify_dir="$(mktemp -d)"
+          trap 'rm -rf "$verify_dir"' EXIT
+          gh release download "$TAG" --dir "$verify_dir" \
+            --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
+          bash scripts/verify-release-assets.sh "$TAG" "$verify_dir"
+          gh release edit "$TAG" --draft=false
