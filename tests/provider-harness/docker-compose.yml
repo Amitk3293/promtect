@@ -58,8 +58,8 @@ services:
 
   runner:
     build:
-      context: .
-      dockerfile: Dockerfile.cli
+      context: ../..
+      dockerfile: tests/provider-harness/Dockerfile.cli
     command: ["sh", "-c", "python3 /harness/run_protocols.py && sh /harness/run_clis.sh"]
     depends_on: [promtect, promtect-refusal, promtect-cli]
     networks: [provider-harness]
