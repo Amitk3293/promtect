@@ -291,6 +291,15 @@ including `Authorization` and `x-api-key`, are forwarded and never scanned.
 Non-identity `Content-Encoding` is rejected with HTTP 415 before DNS resolution or
 an upstream connection. Decompress the body before sending it through Promtect.
 
+Request scanning has bounded admission (`min(available CPU threads, 4)`, with at
+least one slot). When every slot is occupied, Promtect returns a value-free HTTP
+503 before retaining the body or connecting upstream; retry the request after
+capacity becomes available. An admitted request must deliver its complete body
+within 30 seconds. Otherwise Promtect returns a value-free HTTP 408, releases the
+slot, and never connects upstream. These rejections are recorded as
+`request_rejected` audit events with kinds `scan_capacity` and `body_timeout` and
+fixed non-secret markers.
+
 Full scope and trust assumptions: **[THREAT-MODEL.md](THREAT-MODEL.md)**.
 
 ## Know where you're sending

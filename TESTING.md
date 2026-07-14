@@ -50,6 +50,9 @@ They verify behavior that spans the full request/response pipeline.
 | 502 on upstream error | A dead upstream produces a clean 502, not a panic |
 | Stable sentinel | The same secret in the same request always maps to the same sentinel |
 | Body-size cap | A body over `max_body_bytes` returns 413 and never reaches the upstream; a body under the cap passes through normally |
+| Scan admission | Saturated detector capacity returns a value-free 503 before body retention or an upstream connection |
+| Slow request body | A partial body that exceeds the fixed 30-second deadline returns a value-free 408, releases its scan slot, and never reaches the upstream |
+| Async responsiveness | CPU-bound detector work runs outside Tokio's async workers while preserving fail-closed results |
 
 **Run:** `cargo test` (all L2) or `cargo test --test integration` / `cargo test --test proxy_integration` individually
 

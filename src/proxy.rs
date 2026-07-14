@@ -31,6 +31,25 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const UNSUPPORTED_CONTENT_ENCODING_MESSAGE: &str =
     "promtect: unsupported request Content-Encoding; send an identity-encoded body";
 const UNSUPPORTED_CONTENT_ENCODING_AUDIT_MARKER: &str = "«unsupported-content-encoding»";
+const SCAN_CAPACITY_MESSAGE: &str = "promtect: request scanning is at capacity; retry later";
+const SCAN_CAPACITY_AUDIT_MARKER: &str = "«scan-capacity-exhausted»";
+const REQUEST_BODY_TIMEOUT_MESSAGE: &str = "promtect: request body timed out";
+const REQUEST_BODY_TIMEOUT_AUDIT_MARKER: &str = "«request-body-timeout»";
+const REQUEST_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONCURRENT_SCANS: usize = 4;
+
+fn scan_slot_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, MAX_CONCURRENT_SCANS)
+}
+
+fn try_scan_permit(
+    scan_slots: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+    Arc::clone(scan_slots).try_acquire_owned()
+}
 
 /// Build a plain-text response without ever panicking. Used for Promtect's own
 /// error replies (413/415/502), where we fully control status and headers. The
@@ -102,6 +121,16 @@ pub struct Ctx {
     /// `None` in the public core; set by `promtect-pro` to flag secrets the model
     /// echoes back or generates. Observe-only — never alters the response bytes.
     pub output_scan: Option<crate::stream::ResponseScanner>,
+}
+
+/// Internal Axum state. Each running proxy owns one bounded scan budget; every
+/// clone of its router shares that budget. Keeping admission out of [`Ctx`]
+/// preserves the downstream composition API while preventing independent proxy
+/// instances from stealing each other's permits.
+#[derive(Clone)]
+struct AppState {
+    ctx: Ctx,
+    scan_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Whether a detector hit can be masked exactly from the text it inspected.
@@ -315,14 +344,28 @@ async fn prepare_body_async(
     ctx: Ctx,
     vault: Arc<Vault>,
     request_id: String,
+    scan_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<PreparedBody, tokio::task::JoinError> {
-    tokio::task::spawn_blocking(move || prepare_body(body_bytes, &ctx, &vault, &request_id)).await
+    tokio::task::spawn_blocking(move || {
+        let _scan_permit = scan_permit;
+        prepare_body(body_bytes, &ctx, &vault, &request_id)
+    })
+    .await
 }
 
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
 /// body, forwards to `upstream`, and restores secrets in the response.
 pub fn app(ctx: Ctx) -> Router {
-    Router::new().fallback(handle).with_state(ctx)
+    app_with_scan_slots(
+        ctx,
+        Arc::new(tokio::sync::Semaphore::new(scan_slot_limit())),
+    )
+}
+
+fn app_with_scan_slots(ctx: Ctx, scan_slots: Arc<tokio::sync::Semaphore>) -> Router {
+    Router::new()
+        .fallback(handle)
+        .with_state(AppState { ctx, scan_slots })
 }
 
 /// Resolve the upstream origin (scheme + host) from an explicit override or a
@@ -452,7 +495,8 @@ pub async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
+async fn handle(State(state): State<AppState>, req: Request) -> Response {
+    let AppState { ctx, scan_slots } = state;
     ctx.requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -476,6 +520,29 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
         return text_response(415, UNSUPPORTED_CONTENT_ENCODING_MESSAGE);
     }
 
+    // Admission happens before reading the body. Tokio's blocking pool has a
+    // high default limit and started blocking tasks cannot be cancelled, so an
+    // unbounded queue of maximum-size detector jobs would retain unbounded
+    // memory and CPU work. Saturation fails closed without touching the body or
+    // opening an upstream connection.
+    let scan_permit = match try_scan_permit(&scan_slots) {
+        Ok(permit) => permit,
+        Err(_) => {
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_rejected",
+                "scan_capacity",
+                SCAN_CAPACITY_AUDIT_MARKER,
+                &request_id,
+            );
+            eprintln!(
+                "[promtect] req {}: rejected because request scanning is at capacity",
+                &request_id[..8]
+            );
+            return text_response(503, SCAN_CAPACITY_MESSAGE);
+        }
+    };
+
     let method = req.method().clone();
     let uri = req.uri().clone();
 
@@ -483,9 +550,14 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // exceeds the limit, so we refuse oversized bodies with 413 instead of
     // silently forwarding an empty/truncated one (the old `.unwrap_or_default()`
     // behaviour) or buffering without bound.
-    let body_bytes = match axum::body::to_bytes(req.into_body(), ctx.max_body_bytes).await {
-        Ok(b) => b,
-        Err(_) => {
+    let body_bytes = match tokio::time::timeout(
+        REQUEST_BODY_TIMEOUT,
+        axum::body::to_bytes(req.into_body(), ctx.max_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
             ctx.audit.record_blocked_request(&request_id);
             ctx.audit.record(
                 "request_blocked",
@@ -501,6 +573,20 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
                 ),
             );
         }
+        Err(_) => {
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_rejected",
+                "body_timeout",
+                REQUEST_BODY_TIMEOUT_AUDIT_MARKER,
+                &request_id,
+            );
+            eprintln!(
+                "[promtect] req {}: rejected because the request body timed out",
+                &request_id[..8]
+            );
+            return text_response(408, REQUEST_BODY_TIMEOUT_MESSAGE);
+        }
     };
     // INVARIANT: one vault per request. The same vault masks the outbound body
     // and restores the inbound response, so only sentinels minted *for this
@@ -513,6 +599,7 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
         ctx.clone(),
         Arc::clone(&vault),
         request_id.clone(),
+        scan_permit,
     )
     .await;
     let forward_bytes = match prepared {
@@ -994,11 +1081,17 @@ mod tests {
             extra_detect: Some(extra),
             output_scan: None,
         };
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let scan_permit = Arc::clone(&scan_slots)
+            .acquire_owned()
+            .await
+            .expect("scan semaphore stays open");
         let prepare = super::prepare_body_async(
             bytes::Bytes::from_static(b"ordinary text"),
             ctx,
             Arc::new(crate::vault::Vault::new()),
             "test-request".to_owned(),
+            scan_permit,
         );
         let heartbeat = async {
             while !started.load(Ordering::SeqCst) {
@@ -1017,6 +1110,160 @@ mod tests {
             "the async timer must run while synchronous detection is active"
         );
         assert!(matches!(prepared, Ok(super::PreparedBody::Forward(_))));
+    }
+
+    #[tokio::test]
+    async fn saturated_scan_admission_fails_closed_before_body_or_upstream() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use tokio::time::timeout;
+
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let slot_count = u32::try_from(super::scan_slot_limit()).expect("small scan-slot cap");
+        let held_slots = timeout(
+            Duration::from_secs(2),
+            Arc::clone(&scan_slots).acquire_many_owned(slot_count),
+        )
+        .await
+        .expect("other tests release scan slots")
+        .expect("scan semaphore stays open");
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream counter");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let ctx = super::Ctx {
+            upstream: format!("http://{upstream_addr}"),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: None,
+            output_scan: None,
+        };
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let proxy_addr = proxy.local_addr().expect("proxy address");
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy, super::app_with_scan_slots(ctx, scan_slots))
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve proxy");
+        });
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/saturated"))
+            .body(canary)
+            .send()
+            .await
+            .expect("capacity response");
+        let status = response.status();
+        let response_body = response.text().await.expect("read capacity response");
+
+        let _ = shutdown.send(());
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("proxy shutdown timeout")
+            .expect("proxy task join");
+        drop(held_slots);
+
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_body, super::SCAN_CAPACITY_MESSAGE);
+        assert!(!response_body.contains(canary));
+        assert!(
+            timeout(Duration::from_millis(50), upstream.accept())
+                .await
+                .is_err(),
+            "saturated admission must not open an upstream connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_request_body_times_out_value_free_and_releases_admission() {
+        use futures_util::StreamExt as _;
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use tower::ServiceExt as _;
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream counter");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let upstream_connections = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&upstream_connections);
+        let (upstream_shutdown, mut upstream_shutdown_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut upstream_shutdown_rx => break,
+                    connection = upstream.accept() => {
+                        if connection.is_err() { break; }
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        let ctx = super::Ctx {
+            upstream: format!("http://{upstream_addr}"),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: None,
+            output_scan: None,
+        };
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let app_scan_slots = Arc::clone(&scan_slots);
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let partial_then_stalled = futures_util::stream::once(async move {
+            Ok::<_, Infallible>(bytes::Bytes::from_static(canary.as_bytes()))
+        })
+        .chain(futures_util::stream::pending());
+        let request = axum::http::Request::post("/slow")
+            .body(axum::body::Body::from_stream(partial_then_stalled))
+            .expect("build slow request");
+        let response_task = tokio::spawn(async move {
+            super::app_with_scan_slots(ctx, app_scan_slots)
+                .oneshot(request)
+                .await
+                .expect("slow body response")
+        });
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(super::REQUEST_BODY_TIMEOUT + Duration::from_secs(1)).await;
+        let response = response_task.await.expect("response task join");
+        let status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read timeout response");
+        let permit_after_timeout =
+            super::try_scan_permit(&scan_slots).expect("timeout releases scan slot");
+        drop(permit_after_timeout);
+        let _ = upstream_shutdown.send(());
+        upstream_task.await.expect("upstream task join");
+
+        assert_eq!(status, axum::http::StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response_body, super::REQUEST_BODY_TIMEOUT_MESSAGE);
+        assert!(
+            !response_body
+                .as_ref()
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+        );
+        assert_eq!(upstream_connections.load(Ordering::SeqCst), 0);
     }
 
     #[test]
