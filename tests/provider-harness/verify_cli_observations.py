@@ -14,7 +14,11 @@ OLLAMA_PROMPT_PATHS = {"/api/chat", "/api/generate"}
 with urllib.request.urlopen("http://mock-provider:9000/__observations", timeout=5) as response:
     observations = json.load(response)
 
-cli = [item for item in observations if item.get("source") == "real-cli"]
+cli = [
+    item
+    for item in observations
+    if item.get("source") in {"real-cli", "guard-claude"}
+]
 paths = {item["path"] for item in cli if item.get("sentinel_seen")}
 missing = EXPECTED_PROMPT_PATHS - paths
 assert not missing, f"real CLI requests missing from observer: {sorted(missing)}"

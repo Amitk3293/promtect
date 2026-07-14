@@ -15,12 +15,33 @@ AWS example canary `AKIAIOSFODNN7EXAMPLE` and fixed dummy authorization values.
 The real-CLI observer retains only path, byte count, SHA-256, and masking flags;
 it never retains a CLI request body.
 
+### Controlled interactive Claude rehearsal
+
+The default harness cannot render Claude's interactive prompt because its
+runtime network is intentionally internal. Exact Claude Code performs an
+`api.anthropic.com` startup request before displaying that prompt. To prove the
+user-visible Stop-hook notice, run the separate networked Docker gate:
+
+```sh
+tests/provider-harness/run-claude-interactive.sh
+```
+
+The script runs the official `claude auth login` flow inside Docker, stores the
+result only in a temporary owner-only named volume, and mounts that volume
+read-only into the rehearsal runner. A root-only initialization container sets
+the empty volume's ownership; login, Promtect, and the rehearsal remain the
+unprivileged `harness` user. Promtect receives no authentication override
+environment variable. The runner mounts no host files, uses only the fixed
+synthetic canaries, and destroys the credential volume and Compose stack on
+exit. This opt-in gate has external egress for Claude's login/startup checks;
+the deterministic default suite remains credential-free and internal-only.
+
 ## Pinned clients (retrieved 2026-07-13)
 
 | Client | Pin | Runtime check | Current source |
 |---|---:|---|---|
 | OpenAI Codex | `0.144.3` | `codex --version` | [release](https://github.com/openai/codex/releases/tag/rust-v0.144.3) |
-| Claude Code | `2.1.207` | `claude --version` | [setup](https://code.claude.com/docs/en/setup) |
+| Claude Code | `2.1.209` | `claude --version` | [setup](https://code.claude.com/docs/en/setup) |
 | Ollama | `0.31.2` | `ollama --version` | [release](https://github.com/ollama/ollama/releases/tag/v0.31.2) |
 | Aider | `0.86.2` | `aider --version` | [PyPI](https://pypi.org/project/aider-chat/0.86.2/) |
 

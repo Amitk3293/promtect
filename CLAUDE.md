@@ -52,7 +52,7 @@ Request flow:
 Supporting: `provider.rs` (`classify()` upstream risk, backs `PROMTECT_BLOCK_RISKY`),
 `guard.rs` (`plan_guard()` pure parse + `guard()` I/O; sets `proxy::set_quiet(true)`
 to suppress routine per-request notifications while wrapping a TUI, and prints a
-value-free session summary on exit by diffing `metrics::aggregate` before/after),
+value-free session summary from process-local counters on exit),
 `dashboard.rs`+`metrics.rs` (audit → HTML/JSON/Prometheus on :8799; the
 `output_secret` action is aggregated into `output_secrets_total` /
 `output_by_detector`), `playground.rs`, `net.rs` (client + loopback check).

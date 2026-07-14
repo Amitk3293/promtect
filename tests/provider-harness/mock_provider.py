@@ -14,6 +14,13 @@ from threading import Lock
 from urllib.parse import parse_qs, urlparse
 
 SYNTHETIC_SECRET = "AKIAIOSFODNN7EXAMPLE"
+SYNTHETIC_SECRETS = (
+    SYNTHETIC_SECRET,
+    "sk-ant-demo0000000000000000000000000000",
+    "ghp_000000000000000000000000000000000000",
+    "sk_test_000000000000000000000000",
+)
+PROMTECT_NOTICE_MARKER = "Promtect prevented an exposure"
 SENTINEL_RE = re.compile(r"«promtect:[a-z_]+:[0-9a-f]+»")
 PROMPT_PATHS = {
     "/v1/messages",
@@ -259,12 +266,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        absolute_form = bool(parsed.scheme and parsed.netloc)
         if parsed.path.startswith("/cli/"):
             source = "real-cli"
             logical_path = parsed.path.removeprefix("/cli")
         elif parsed.path.startswith("/guard-cli/"):
             source = "guard-codex"
             logical_path = parsed.path.removeprefix("/guard-cli")
+        elif parsed.path.startswith("/guard-claude/"):
+            source = "guard-claude"
+            logical_path = parsed.path.removeprefix("/guard-claude")
+        elif parsed.path.startswith("/claude-bypass/"):
+            source = "claude-bypass"
+            logical_path = parsed.path.removeprefix("/claude-bypass")
         elif parsed.path.startswith("/codex-base-url-control/"):
             source = "codex-base-url-control"
             logical_path = parsed.path.removeprefix("/codex-base-url-control")
@@ -275,7 +289,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         text = raw.decode("utf-8", errors="replace")
         sentinel_match = SENTINEL_RE.search(text)
-        leaked = SYNTHETIC_SECRET.encode() in raw
+        leaked = any(secret.encode() in raw for secret in SYNTHETIC_SECRETS)
 
         if logical_path not in PROMPT_PATHS | METADATA_PATHS:
             with observations_lock:
@@ -322,7 +336,9 @@ class Handler(BaseHTTPRequestHandler):
             "accept_encoding_seen": self.headers.get("accept-encoding"),
             "content_encoding_seen": self.headers.get("content-encoding"),
             "hostile_header_seen": self.headers.get("x-promtect-hostile") is not None,
+            "absolute_form_seen": absolute_form,
             "plaintext_canary_seen": leaked,
+            "promtect_notice_seen": PROMTECT_NOTICE_MARKER in text,
             "sentinel_seen": sentinel_match is not None,
         }
         if source == "protocol-fixture":
