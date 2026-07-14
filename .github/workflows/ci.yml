@@ -92,3 +92,12 @@ jobs:
         run: test "$(uname -m)" = "${{ matrix.uname }}"
       - name: Docker provider protocols and pinned CLIs
         run: sh tests/provider-harness/run.sh
+
+  release-readiness:
+    name: release-readiness (Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Package, install, selftest, and tamper gate
+        run: make release-readiness-test

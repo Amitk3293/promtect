@@ -102,8 +102,9 @@ body (a documented gap). Either way, rotate first.
 
 ## Uninstall / cleanup
 
-Stop the proxy and delete the binary (`brew uninstall promtect`, or remove the
-`cargo install` binary). The only state Promtect writes is `promtect-audit.jsonl`
+Stop the proxy and delete the binary (remove the local `cargo install` binary;
+after public launch, a Homebrew installation can use `brew uninstall promtect`).
+The only state Promtect writes is `promtect-audit.jsonl`
 in the working directory — delete it if you don't want the value-free history.
 No system trust store was modified (there's no CA), so there's nothing else to
 undo.

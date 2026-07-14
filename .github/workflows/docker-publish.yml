@@ -5,21 +5,72 @@ name: docker-publish
 # trailing comment records the version each SHA corresponds to; bump both together.
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing reviewed main tag (vX.Y.Z)"
+        required: true
+        type: string
+      publish_confirmation:
+        description: "publish container vX.Y.Z"
+        required: true
+        type: string
+
+concurrency:
+  # Serialize every Core container publication. A per-tag lock could let two
+  # patch releases race and move the shared X.Y tag backwards.
+  group: core-container-release
+  cancel-in-progress: false
+
+env:
+  TAG: ${{ inputs.tag }}
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   # Run the full test suite before publishing any image.
   # The build-push job depends on this so no image ships from a broken tree.
   test:
     runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+      tag_oid: ${{ steps.source.outputs.tag_oid }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Validate reviewed main tag and confirmation
+        id: source
+        env:
+          CONFIRMATION: ${{ inputs.publish_confirmation }}
+          REPOSITORY_VISIBILITY: ${{ github.event.repository.visibility }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = "refs/heads/main" ] \
+            || { echo "container workflow must be dispatched from main" >&2; exit 1; }
+          [ "$GITHUB_SHA" = "$WORKFLOW_SHA" ] \
+            || { echo "workflow source SHA does not match dispatched main SHA" >&2; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [ "$REPOSITORY_VISIBILITY" = "public" ]
+          [ "$CONFIRMATION" = "publish container $TAG" ]
+          main_ref="refs/remotes/origin/promtect-release-main"
+          git fetch --force origin \
+            "refs/heads/main:${main_ref}" \
+            "refs/tags/${TAG}:refs/tags/${TAG}"
+          [ "$(git cat-file -t "refs/tags/${TAG}")" = "tag" ]
+          sha="$(git rev-parse "${TAG}^{commit}")"
+          [ "$sha" = "$WORKFLOW_SHA" ] \
+            || { echo "container tag must point at the exact reviewed main workflow commit" >&2; exit 1; }
+          git merge-base --is-ancestor "$sha" "$main_ref"
+          version="$(git show "${sha}:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
+          [ "v${version}" = "$TAG" ]
+          git checkout --detach "$sha"
+          tag_oid="$(git rev-parse "refs/tags/${TAG}")"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag_oid=$tag_oid" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
@@ -31,12 +82,49 @@ jobs:
       - name: Test
         run: cargo test
 
-  build-push:
-    runs-on: ubuntu-latest
-    # Only publish after the test suite passes.
+  release-controls:
     needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.workflow_sha }}
+      - name: Fail closed unless release controls already exist
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
+          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
+          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
+          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
+        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
+
+  build-push:
+    runs-on: ubuntu-latest
+    environment: core-container-release
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    # Only publish after the test suite passes.
+    needs: [test, release-controls]
+    env:
+      SOURCE_SHA: ${{ needs.test.outputs.source_sha }}
+      TAG_OID: ${{ needs.test.outputs.tag_oid }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.test.outputs.source_sha }}
+          fetch-depth: 0
+      - name: Recheck controls after environment approval
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
+          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
+          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
+          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
+        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
+      - name: Revalidate reviewed tag after environment approval
+        run: bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -47,15 +135,168 @@ jobs:
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ghcr.io/amitk3293/promtect
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=ref,event=tag
-            type=sha
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref, '-') }}
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+          labels: |
+            org.opencontainers.image.revision=${{ needs.test.outputs.source_sha }}
+            org.opencontainers.image.version=${{ inputs.tag }}
+      - id: push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=ghcr.io/amitk3293/promtect,push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Resolve restart-safe publication digest
+        id: publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          artifact_name="core-container-${TAG}-${SOURCE_SHA}-digest"
+          gh api --method GET --paginate --slurp \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+            -f "name=$artifact_name" -f per_page=100 \
+            > "$root/artifacts.json"
+          artifact_id="$(python3 scripts/container-digest-state.py \
+            select-artifact "$root/artifacts.json" "$artifact_name" "$SOURCE_SHA")"
+          publication_digest="$CURRENT_DIGEST"
+          record_needed=true
+          if [ -n "$artifact_id" ]; then
+            mkdir "$root/prior"
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+              > "$root/prior.zip"
+            unzip -q "$root/prior.zip" -d "$root/prior"
+            publication_digest="$(python3 scripts/container-digest-state.py \
+              verify "$root/prior/container-digest.json" "$TAG" "$SOURCE_SHA")"
+            record_needed=false
+          fi
+          record="$RUNNER_TEMP/container-digest.json"
+          python3 scripts/container-digest-state.py create \
+            "$record" "$TAG" "$SOURCE_SHA" "$publication_digest"
+          {
+            echo "artifact_name=$artifact_name"
+            echo "digest=$publication_digest"
+            echo "record=$record"
+            echo "record_needed=$record_needed"
+          } >> "$GITHUB_OUTPUT"
+      - name: Persist digest before any customer-facing tag write
+        if: steps.publication.outputs.record_needed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.publication.outputs.artifact_name }}
+          path: ${{ steps.publication.outputs.record }}
+          if-no-files-found: error
+          retention-days: 90
+      - name: Smoke-test exact publication digest
+        env:
+          PUBLISH_DIGEST: ${{ steps.publication.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/amitk3293/promtect"
+          [ "$(docker run --rm "$image@$PUBLISH_DIGEST" --version)" = "promtect ${TAG#v}" ]
+          docker run --rm "$image@$PUBLISH_DIGEST" selftest | grep -q "PASS"
+      - name: Recheck tags, promote reviewed digest, and verify postcondition
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_DIGEST: ${{ steps.publication.outputs.digest }}
+        run: |
+          set -euo pipefail
+          versions="$(mktemp)"
+          errors="$(mktemp)"
+          registry_error="$(mktemp)"
+          state="$(mktemp)"
+          trap 'rm -f "$versions" "$errors" "$registry_error" "$state"' EXIT
+          endpoint="/users/${GITHUB_REPOSITORY_OWNER}/packages/container/promtect/versions?per_page=100"
+          fetch_versions() {
+            if ! gh api --paginate --slurp "$endpoint" > "$versions" 2> "$errors"; then
+              if grep -q 'HTTP 404' "$errors"; then
+                printf '[]\n' > "$versions"
+              else
+                cat "$errors" >&2
+                return 1
+              fi
+            fi
+          }
+
+          bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
+          fetch_versions
+          python3 scripts/check-ghcr-tags.py "$TAG" "$versions" \
+            --resume-digest "$PUBLISH_DIGEST" --state-output "$state"
+
+          version="${TAG#v}"
+          rolling="${version%.*}"
+          image="ghcr.io/amitk3293/promtect"
+          inspect_digest() {
+            docker buildx imagetools inspect "$1" --raw \
+              2> "$registry_error" | sha256sum | awk '{print "sha256:" $1}'
+          }
+          require_absent_or_same() {
+            local reference="$1"
+            local resolved
+            if resolved="$(inspect_digest "$reference")"; then
+              [ "$resolved" = "$PUBLISH_DIGEST" ] \
+                || { echo "GHCR tag already exists at another digest: $reference" >&2; return 1; }
+              echo "resuming same-digest GHCR tag: $reference"
+              return 0
+            fi
+            if ! grep -Eqi 'manifest unknown|not found|404' "$registry_error"; then
+              cat "$registry_error" >&2
+              echo "could not prove GHCR tag absence: $reference" >&2
+              return 1
+            fi
+          }
+          require_absent_or_same "$image:$version"
+          require_absent_or_same "$image:$TAG"
+
+          expected_rolling_digest="$(python3 - "$state" <<'PY'
+          import json
+          import sys
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              print(json.load(handle)["rolling_digest"] or "")
+          PY
+          )"
+          if actual_rolling_digest="$(inspect_digest "$image:$rolling")"; then
+            if [ -z "$expected_rolling_digest" ] \
+              || [ "$actual_rolling_digest" != "$expected_rolling_digest" ]; then
+              echo "GHCR API and registry disagree about $rolling" >&2
+              exit 1
+            fi
+          else
+            grep -Eqi 'manifest unknown|not found|404' "$registry_error" \
+              || { cat "$registry_error" >&2; exit 1; }
+            [ -z "$expected_rolling_digest" ] \
+              || { echo "GHCR registry is missing API-recorded $rolling" >&2; exit 1; }
+          fi
+
+          docker buildx imagetools create \
+            --prefer-index=false \
+            --tag "$image:$version" \
+            --tag "$image:$TAG" \
+            --tag "$image:$rolling" \
+            "$image@$PUBLISH_DIGEST"
+
+          verified=false
+          for _ in 1 2 3 4 5 6; do
+            fetch_versions
+            api_ok=false
+            registry_ok=true
+            if python3 scripts/check-ghcr-tags.py "$TAG" "$versions" \
+              --expected-digest "$PUBLISH_DIGEST"; then
+              api_ok=true
+            fi
+            for published_tag in "$version" "$TAG" "$rolling"; do
+              actual_digest="sha256:$(docker buildx imagetools inspect \
+                "$image:$published_tag" --raw | sha256sum | awk '{print $1}')" \
+                || registry_ok=false
+              [ "$actual_digest" = "$PUBLISH_DIGEST" ] || registry_ok=false
+            done
+            if [ "$api_ok" = true ] && [ "$registry_ok" = true ]; then
+              verified=true
+              break
+            fi
+            sleep 5
+          done
+          [ "$verified" = true ] \
+            || { echo "GHCR tags did not converge on the pushed digest" >&2; exit 1; }
+          bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
