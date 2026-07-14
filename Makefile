@@ -39,7 +39,14 @@ docker-run:
 
 # Docker-only test gate (fmt + clippy + cargo test). Used while GH Actions CI is capped.
 docker-test:
-	docker-compose -f docker-compose.test.yml run --rm test
+	@if docker compose version >/dev/null 2>&1; then \
+		docker compose -f docker-compose.test.yml run --build --rm test; \
+	elif command -v docker-compose >/dev/null 2>&1; then \
+		docker-compose -f docker-compose.test.yml run --build --rm test; \
+	else \
+		echo "Docker Compose is required (plugin or legacy binary)" >&2; \
+		exit 1; \
+	fi
 
 # Credential-free provider protocol validation. Every component (Promtect,
 # mock providers, and assertions) runs inside an internal Docker network.
