@@ -110,6 +110,10 @@ contains counts and detector names rather than request or response bodies.
 Pass `--no-dashboard` to start the proxy without it, or run `promtect dashboard`
 standalone to tail an existing audit log without starting a proxy.
 
+Audit aggregation is bounded and runs off the async request path. If the local
+dashboard is already at its aggregation limit or a scan fails, `/api/metrics`
+and `/metrics` return `503` explicitly instead of showing a false all-clear.
+
 The same counts are exposed for Prometheus at `/metrics`, including
 `promtect_output_secrets_total` for anything the Pro output scan caught in a
 model's reply. And `promtect guard` prints a one-line session summary when your
