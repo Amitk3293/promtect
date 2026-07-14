@@ -43,7 +43,7 @@ promtect selftest        # → promtect selftest: PASS — no leak
 ## Notes
 
 - `guard claude` currently supports a verified first-party, individual Claude
-  Max profile on the reviewed Claude Code 2.1.207 CLI contract only. It refuses
+  Max profile on the reviewed Claude Code 2.1.209 CLI contract only. It refuses
   unreviewed CLI versions, API-key, Pro, Team, Enterprise, gateway, remote,
   MDM, registry, file-based, drop-in, or unknown profiles before binding because
   Claude's managed settings outrank command-line routing and hooks. API-key users

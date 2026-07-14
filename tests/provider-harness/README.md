@@ -20,7 +20,7 @@ it never retains a CLI request body.
 | Client | Pin | Runtime check | Current source |
 |---|---:|---|---|
 | OpenAI Codex | `0.144.3` | `codex --version` | [release](https://github.com/openai/codex/releases/tag/rust-v0.144.3) |
-| Claude Code | `2.1.207` | `claude --version` | [setup](https://code.claude.com/docs/en/setup) |
+| Claude Code | `2.1.209` | `claude --version` | [setup](https://code.claude.com/docs/en/setup) |
 | Ollama | `0.31.2` | `ollama --version` | [release](https://github.com/ollama/ollama/releases/tag/v0.31.2) |
 | Aider | `0.86.2` | `aider --version` | [PyPI](https://pypi.org/project/aider-chat/0.86.2/) |
 

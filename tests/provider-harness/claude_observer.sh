@@ -7,7 +7,7 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
   fi
   case "${PROMTECT_CLAUDE_AUTH_STATUS_MODE:-valid}" in
     valid)
-      printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"firstParty","organizationType":null}'
+      printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"firstParty"}'
       exit 0
       ;;
     malformed)

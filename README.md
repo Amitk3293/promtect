@@ -200,7 +200,7 @@ point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 
 | Tool | Setup |
 |------|-------|
-| **Claude Code** | `promtect guard claude` for reviewed Claude Code 2.1.207 + individual Max + automatic notice; manual base-URL routing remains available for API-key use ([guide](docs/integrations/claude-code.md)) |
+| **Claude Code** | `promtect guard claude` for reviewed Claude Code 2.1.209 + individual Max + automatic notice; manual base-URL routing remains available for API-key use ([guide](docs/integrations/claude-code.md)) |
 | **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8790/v1` |
 | **OpenAI Codex CLI** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |
 | **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |

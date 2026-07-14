@@ -85,8 +85,9 @@ const CLAUDE_RUNTIME_OVERRIDE_VARS: &[&str] = &[
     "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
     "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
     "CLAUDE_CODE_HOST_CREDS_FILE",
+    "CLAUDE_CODE_PROCESS_WRAPPER",
 ];
-const CLAUDE_SUPPORTED_VERSION: &str = "2.1.207 (Claude Code)";
+const CLAUDE_SUPPORTED_VERSION: &str = "2.1.209 (Claude Code)";
 const CLAUDE_UNSUPPORTED_ROOT_COMMANDS: &[&str] = &[
     "agents",
     "auth",
@@ -1094,39 +1095,13 @@ fn validate_claude_os_policy() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn validate_claude_os_policy() -> Result<(), String> {
-    let system_root = std::env::var_os("SystemRoot")
-        .ok_or_else(|| "cannot locate the Windows system directory".to_string())?;
-    let reg = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("reg.exe");
-    for key in [
-        r"HKLM\SOFTWARE\Policies\ClaudeCode",
-        r"HKCU\SOFTWARE\Policies\ClaudeCode",
-    ] {
-        let output = std::process::Command::new(&reg)
-            .args(["query", key, "/v", "Settings"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .map_err(|error| format!("cannot verify Claude Windows policy at {key} ({error})"))?;
-        if output.status.success() {
-            return Err(format!(
-                "Windows-managed Claude settings are active at {key}; managed profiles are not supported by guard claude"
-            ));
-        }
-        let stderr = bounded_policy_probe_text(&output.stderr)?;
-        if output.status.code() != Some(1)
-            || !stderr.contains("unable to find the specified registry key or value")
-        {
-            return Err(format!(
-                "cannot verify whether Claude Windows policy is active at {key}"
-            ));
-        }
-    }
-    Ok(())
+    Err(
+        "guard claude is not supported on Windows because Promtect cannot yet verify Windows policy and descendant cleanup"
+            .to_string(),
+    )
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(target_os = "macos")]
 fn bounded_policy_probe_text(bytes: &[u8]) -> Result<String, String> {
     const MAX_POLICY_PROBE_BYTES: usize = 4096;
     if bytes.len() > MAX_POLICY_PROBE_BYTES {
@@ -1162,7 +1137,11 @@ fn validate_claude_auth_status(bytes: &[u8]) -> Result<(), String> {
             .get("subscriptionType")
             .and_then(serde_json::Value::as_str)
         {
-            Some("max") if status.get("organizationType") == Some(&serde_json::Value::Null) => {
+            Some("max")
+                if status
+                    .get("organizationType")
+                    .is_none_or(serde_json::Value::is_null) =>
+            {
                 Ok(())
             }
             _ => Err(
@@ -3252,11 +3231,19 @@ mod tests {
             "organizationType": null
         }"#;
         super::validate_claude_auth_status(max).expect("individual Max must be supported");
+        let current_max = br#"{
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "subscriptionType": "max",
+            "apiProvider": "firstParty"
+        }"#;
+        super::validate_claude_auth_status(current_max)
+            .expect("Claude 2.1.209 individual Max omits organizationType");
 
         for unsupported in [
             br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"team","apiProvider":"firstParty"}"#.as_slice(),
             br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"enterprise","apiProvider":"firstParty"}"#.as_slice(),
-            br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"firstParty"}"#.as_slice(),
+            br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"firstParty","organizationType":"team"}"#.as_slice(),
             br#"{"loggedIn":true,"authMethod":"api_key","subscriptionType":null,"apiProvider":"firstParty"}"#.as_slice(),
             br#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"gateway"}"#.as_slice(),
             br#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#.as_slice(),
