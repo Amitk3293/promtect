@@ -161,6 +161,7 @@ jobs:
           artifact_id="$(python3 scripts/container-digest-state.py \
             select-artifact "$root/artifacts.json" "$artifact_name" "$SOURCE_SHA")"
           publication_digest="$CURRENT_DIGEST"
+          record_needed=true
           if [ -n "$artifact_id" ]; then
             mkdir "$root/prior"
             gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
@@ -168,6 +169,7 @@ jobs:
             unzip -q "$root/prior.zip" -d "$root/prior"
             publication_digest="$(python3 scripts/container-digest-state.py \
               verify "$root/prior/container-digest.json" "$TAG" "$SOURCE_SHA")"
+            record_needed=false
           fi
           record="$RUNNER_TEMP/container-digest.json"
           python3 scripts/container-digest-state.py create \
@@ -176,14 +178,24 @@ jobs:
             echo "artifact_name=$artifact_name"
             echo "digest=$publication_digest"
             echo "record=$record"
+            echo "record_needed=$record_needed"
           } >> "$GITHUB_OUTPUT"
       - name: Persist digest before any customer-facing tag write
+        if: steps.publication.outputs.record_needed == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.publication.outputs.artifact_name }}
           path: ${{ steps.publication.outputs.record }}
           if-no-files-found: error
           retention-days: 90
+      - name: Smoke-test exact publication digest
+        env:
+          PUBLISH_DIGEST: ${{ steps.publication.outputs.digest }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/amitk3293/promtect"
+          [ "$(docker run --rm "$image@$PUBLISH_DIGEST" --version)" = "promtect ${TAG#v}" ]
+          docker run --rm "$image@$PUBLISH_DIGEST" selftest | grep -q "PASS"
       - name: Recheck tags, promote reviewed digest, and verify postcondition
         env:
           GH_TOKEN: ${{ github.token }}

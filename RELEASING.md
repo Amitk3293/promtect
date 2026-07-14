@@ -198,8 +198,9 @@ rejects a changed remote tag.
 The build first pushes content by digest without a customer-facing tag. Only
 after the build completes does the serialized job re-read grouped GHCR version
 records, refuse an existing exact tag at another digest, and prove the current `X.Y` tag belongs
-to the highest paired `X.Y.Z`/`vX.Y.Z` digest. It then promotes that reviewed
-digest to the two exact tags and rolling minor tag. A bounded postcondition
+to the highest paired `X.Y.Z`/`vX.Y.Z` digest. The exact resolved digest must
+return the expected version and pass `selftest` before any tag write. The job
+then promotes that reviewed digest to the two exact tags and rolling minor tag. A bounded postcondition
 requires both the package API and direct registry reads for all three tags to
 resolve to the pushed digest. Missing or deleted provenance fails closed rather
 than guessing from flattened tag history.

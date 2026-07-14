@@ -15,6 +15,25 @@ first="$root/first"
 second="$root/second"
 mkdir -p "$first" "$second"
 
+python3 <<'PY'
+from pathlib import Path
+
+readme = Path("README.md").read_text(encoding="utf-8")
+faq = Path("docs/faq.md").read_text(encoding="utf-8")
+licensing = Path("docs/licensing-faq.md").read_text(encoding="utf-8")
+assert "github/v/release" not in readme
+assert "install-brew" not in readme
+assert "Homebrew is therefore not a" in readme
+assert "supported acquisition path yet" in readme
+assert "# Launch path, not currently available: brew install" in readme
+assert "runtime-proven local Ollama path" in readme
+assert "guard claude                     # beta" in readme
+assert "guard codex                      # beta" in readme
+assert "after public launch, a Homebrew installation" in faq
+assert "During pre-launch the repository and distribution channels are" in licensing
+assert "intentionally private" in licensing
+PY
+
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
 cargo build --release --locked
 binary="$CARGO_TARGET_DIR/release/promtect"
@@ -802,6 +821,14 @@ assert "--expected-digest" in container
 assert "imagetools inspect" in container
 assert "Persist digest before any customer-facing tag write" in container
 assert "container-digest-state.py" in container
+assert "record_needed=false" in container
+assert "if: steps.publication.outputs.record_needed == 'true'" in container
+persist = container.index("Persist digest before any customer-facing tag write")
+smoke = container.index("Smoke-test exact publication digest")
+promote = container.index("Recheck tags, promote reviewed digest, and verify postcondition")
+assert persist < smoke < promote
+assert 'docker run --rm "$image@$PUBLISH_DIGEST" --version' in container
+assert 'docker run --rm "$image@$PUBLISH_DIGEST" selftest' in container
 for workflow in (release, container):
     assert '[ "$sha" = "$WORKFLOW_SHA" ]' in workflow
 for runner in ("macos-15", "macos-15-intel", "ubuntu-22.04", "ubuntu-22.04-arm"):

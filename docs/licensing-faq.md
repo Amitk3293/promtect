@@ -62,8 +62,9 @@ OEM terms.
 **Is this open source?**
 No, and we do not call it that. It is source-available and fair-code. OSI "open source" allows
 unrestricted commercial use, including reselling and hosting-as-a-service. The SUL does not.
-We chose this so the project can stay public, readable, and free for real use while remaining
-sustainable.
+We chose this so the project can be public, readable, and free for real use after launch while
+remaining sustainable. During pre-launch the repository and distribution channels are
+intentionally private.
 
 **Which code is actually covered?**
 Only the source in this repository, and only on the `main` branch. Content on other branches
@@ -81,6 +82,6 @@ sales@promtect.org.
 The same reason n8n and similar projects use it. Fully closed software loses the trust,
 transparency, and community that a security tool especially needs. Fully permissive open
 source lets a large vendor take the work, host it, and resell it without contributing back.
-The SUL keeps the core public and free for everyone who actually uses it, while keeping the
-business viable enough to keep building. The honest deal is: free for your work, paid only if
-you want to sell ours.
+The SUL is intended to keep Core publicly readable and free for everyone who actually uses it
+after launch, while keeping the business viable enough to keep building. The honest deal is:
+free for your work, paid only if you want to sell ours.

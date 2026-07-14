@@ -1,9 +1,7 @@
 # Promtect
 
 [![License: SUL (fair-code)](https://img.shields.io/badge/license-SUL%20fair--code-3b82f6)](LICENSE)
-[![Latest release](https://img.shields.io/github/v/release/Amitk3293/promtect?color=10b981&label=release)](https://github.com/Amitk3293/promtect/releases)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Install: Homebrew](https://img.shields.io/badge/install-brew-f59e0b)](https://github.com/Amitk3293/homebrew-tap)
 
 ### Keep recognized secrets out of supported AI-tool requests.
 
@@ -24,10 +22,17 @@ value-free.**
 
 <sub>Recorded with [`vhs`](https://github.com/charmbracelet/vhs) from [`docs/demo.tape`](docs/demo.tape), rebuild with `cargo build --release && vhs docs/demo.tape`.</sub>
 
-```sh
-brew install Amitk3293/tap/promtect            # or: cargo install --path .
+> **Pre-launch distribution status:** the Core repository, Homebrew tap, and
+> release artifacts are intentionally private. Homebrew is therefore not a
+> supported acquisition path yet; it becomes testable only when those assets
+> are deliberately made public at launch. Authorized evaluators can build the
+> reviewed `staging` source locally.
 
-promtect guard claude                          # one command: proxy up, claude pointed at it, secrets masked
+```sh
+cargo install --path .                         # from an authorized source checkout
+# Launch path, not currently available: brew install Amitk3293/tap/promtect
+
+promtect guard ollama run qwen2.5:0.5b         # runtime-proven local guard path
 echo "ship it with $AWS_KEY" | promtect mask   # or just see what would get masked
 ```
 
@@ -60,7 +65,7 @@ the configured upstream receives the request.**
 **What one slip costs you:** rotate every key in that file, force a redeploy, and write
 the note explaining why production credentials went to a third party, and the secret is
 already sitting in a log you'll never reach. **What it costs with Promtect:** nothing.
-`promtect guard claude`, and a recognized key on a verified supported path is
+route a supported tool through Promtect, and a recognized key on a verified supported path is
 masked before forwarding. Unsupported formats and bypassing clients remain your
 responsibility; review the [threat model](THREAT-MODEL.md).
 
@@ -127,9 +132,9 @@ and does not install a root certificate or change the system trust store.
 and tears it down on exit, no manual env-var wiring:
 
 ```sh
-promtect guard claude                     # unmanaged individual Claude Max → Anthropic
-promtect guard codex                      # Codex → OpenAI
-promtect guard ollama run deepseek-r1     # local Ollama, nothing leaves your box
+promtect guard ollama run qwen2.5:0.5b    # runtime-proven local Ollama path
+promtect guard claude                     # beta; requires supported direct Anthropic auth/routing
+promtect guard codex                      # beta; unsupported auth/routing fails before a prompt
 promtect guard ollama --cloud run gpt-oss:120b-cloud   # Ollama Cloud → masked → ollama.com
 promtect guard aider --model openai/gpt-5.5  # Aider → masked → OpenAI-compatible
 promtect guard claude --headroom          # chain Headroom: mask → compress → Anthropic
