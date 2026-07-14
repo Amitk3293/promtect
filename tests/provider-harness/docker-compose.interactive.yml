@@ -1,0 +1,13 @@
+services:
+  runner:
+    environment:
+      PROMTECT_CLAUDE_INTERACTIVE_REHEARSAL: "1"
+    volumes:
+      - claude-auth:/controlled-claude-auth:ro
+
+networks:
+  provider-harness:
+    internal: false
+
+volumes:
+  claude-auth:

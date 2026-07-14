@@ -40,4 +40,21 @@ if [ "${CODEX_FAKE_CHATGPT_STATUS-}" = stderr ] && [ "$role" = login-status ]; t
   exit 0
 fi
 
+if [ -n "${CODEX_FAKE_OVERSIZED_STATUS-}" ] && [ "$role" = login-status ]; then
+  stream=${CODEX_FAKE_OVERSIZED_STATUS}
+  case "$stream" in
+    stdout|stderr) ;;
+    *) printf 'unknown oversized status stream\n' >&2; exit 2 ;;
+  esac
+  exec python3 - "$stream" <<'PY'
+import sys
+import time
+
+stream = sys.stdout if sys.argv[1] == "stdout" else sys.stderr
+stream.write("x" * (64 * 1024 + 1))
+stream.flush()
+time.sleep(300)
+PY
+fi
+
 exec /opt/provider-clis/node_modules/.bin/codex "$@"

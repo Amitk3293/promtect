@@ -42,12 +42,69 @@ struct AuditTurnRequest {
 struct AuditTurnLedger {
     requests: BTreeMap<String, AuditTurnRequest>,
     unsuccessful: BTreeSet<String>,
+    detector_entries: usize,
+    degraded: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AuditTurnNotice {
     pub(crate) masked: u64,
     pub(crate) detectors: BTreeSet<String>,
+    pub(crate) degraded: bool,
+}
+
+pub(crate) const MAX_TURN_OUTCOMES: usize = 4096;
+const MAX_TURN_DETECTOR_ENTRIES: usize = 4096;
+
+impl AuditTurnLedger {
+    fn admit_entry(&mut self, already_present: bool) -> bool {
+        if self.degraded {
+            return false;
+        }
+        if !already_present
+            && self.requests.len().saturating_add(self.unsuccessful.len()) >= MAX_TURN_OUTCOMES
+        {
+            self.saturate();
+            return false;
+        }
+        true
+    }
+
+    fn saturate(&mut self) {
+        self.requests.clear();
+        self.unsuccessful.clear();
+        self.detector_entries = 0;
+        self.degraded = true;
+    }
+
+    fn record_request(&mut self, request_id: &str, masked: usize, detectors: &[&str]) {
+        if !self.admit_entry(self.requests.contains_key(request_id)) {
+            return;
+        }
+        let existing = self.requests.get(request_id);
+        let additions = detectors
+            .iter()
+            .filter(|detector| {
+                !existing.is_some_and(|request| request.detectors.contains(**detector))
+            })
+            .map(|detector| (*detector).to_string())
+            .collect::<BTreeSet<_>>();
+        let additions_len = additions.len();
+        if self.detector_entries.saturating_add(additions_len) > MAX_TURN_DETECTOR_ENTRIES {
+            self.saturate();
+            return;
+        }
+        let request = self.requests.entry(request_id.to_string()).or_default();
+        request.masked = request.masked.saturating_add(masked as u64);
+        request.detectors.extend(additions);
+        self.detector_entries = self.detector_entries.saturating_add(additions_len);
+    }
+
+    fn record_unsuccessful(&mut self, request_id: &str) {
+        if self.admit_entry(self.unsuccessful.contains(request_id)) {
+            self.unsuccessful.insert(request_id.to_string());
+        }
+    }
 }
 
 /// Append-only JSONL audit log. Records mask/unmask events — never secret values.
@@ -116,6 +173,17 @@ impl Audit {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn null_scoped(request_scope: String) -> Self {
+        Audit {
+            sink: Mutex::new(None),
+            request_scope: Some(request_scope.into()),
+            session_stats: Mutex::new(AuditSessionStats::default()),
+            turn_ledger: Some(Mutex::new(AuditTurnLedger::default())),
+            warned: AtomicBool::new(false),
+        }
+    }
+
     pub(crate) fn is_healthy(&self) -> bool {
         !self.warned.load(Ordering::Relaxed)
     }
@@ -159,6 +227,10 @@ impl Audit {
             std::mem::take(&mut *ledger)
         };
         let mut notice = AuditTurnNotice::default();
+        if ledger.degraded {
+            notice.degraded = true;
+            return notice;
+        }
         for (request_id, request) in ledger.requests {
             if ledger.unsuccessful.contains(&request_id) {
                 continue;
@@ -186,11 +258,9 @@ impl Audit {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Open and repair a file-backed sink before a reader snapshots its length.
-    /// Guard's Claude notice tailer uses this so a truncated prior-session tail
-    /// cannot leave its initial cursor in the middle of the first new record.
-    /// Unlike ordinary event writes, the caller receives open/validation errors
-    /// so a guard can reject an unsafe audit path before starting the provider.
+    /// Open, validate, and repair a file-backed sink before guard startup.
+    /// Unlike ordinary best-effort event writes, the caller receives errors so
+    /// guard can reject an unsafe audit path before starting the provider.
     pub(crate) fn prepare(&self) -> std::io::Result<()> {
         let mut guard = self.sink_lock();
         let Some(sink) = guard.as_mut() else {
@@ -225,6 +295,7 @@ impl Audit {
     /// Open an existing audit log for value-free readers without following a
     /// final-component symlink or accepting a non-regular/unowned target.
     /// Unlike the append path, this never creates, repairs, or changes the file.
+    #[cfg(any(not(unix), test))]
     pub(crate) fn open_read(path: &std::path::Path) -> std::io::Result<std::fs::File> {
         let mut opts = OpenOptions::new();
         opts.read(true);
@@ -539,13 +610,9 @@ impl Audit {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if blocked {
-                ledger.unsuccessful.insert(request_id.to_string());
+                ledger.record_unsuccessful(request_id);
             } else if masked > 0 {
-                let request = ledger.requests.entry(request_id.to_string()).or_default();
-                request.masked = request.masked.saturating_add(masked as u64);
-                request
-                    .detectors
-                    .extend(detectors.iter().map(|detector| (*detector).to_string()));
+                ledger.record_request(request_id, masked, detectors);
             }
         }
         let request_id = self.scoped_request_id(request_id);
@@ -577,8 +644,7 @@ impl Audit {
             turn_ledger
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .unsuccessful
-                .insert(request_id.to_string());
+                .record_unsuccessful(request_id);
         }
         {
             let mut stats = self
@@ -805,6 +871,41 @@ mod tests {
         assert!(standalone.turn_ledger.is_none());
         assert!(scoped.turn_ledger.is_some());
         remove_audit_fixture(&path);
+    }
+
+    #[test]
+    fn turn_ledger_saturates_value_free_and_recovers_after_drain() {
+        let audit = Audit::null_scoped("claude-session".to_string());
+        for index in 0..=MAX_TURN_OUTCOMES {
+            audit.record_request(&format!("request-{index}"), 1, &["aws_key"], 1, 1);
+        }
+
+        let saturated = audit.take_turn_notice();
+        assert!(saturated.degraded);
+        assert_eq!(saturated.masked, 0);
+        assert!(saturated.detectors.is_empty());
+
+        audit.record_request("recovered", 1, &["github_token"], 1, 1);
+        let recovered = audit.take_turn_notice();
+        assert!(!recovered.degraded);
+        assert_eq!(recovered.masked, 1);
+        assert_eq!(
+            recovered.detectors,
+            BTreeSet::from(["github_token".to_string()])
+        );
+    }
+
+    #[test]
+    fn turn_ledger_caps_detector_entries() {
+        let audit = Audit::null_scoped("claude-session".to_string());
+        for index in 0..=MAX_TURN_DETECTOR_ENTRIES {
+            let detector = format!("detector_{index}");
+            audit.record_request("request", 1, &[detector.as_str()], 1, 1);
+        }
+
+        let saturated = audit.take_turn_notice();
+        assert!(saturated.degraded);
+        assert!(saturated.detectors.is_empty());
     }
 
     #[test]

@@ -637,6 +637,39 @@ for status_stream in stdout stderr; do
   printf 'PASS Codex guard: ChatGPT status on %s rejected before bind or provider traffic\n' "$status_stream"
 done
 
+for status_stream in stdout stderr; do
+  oversized_output="/tmp/codex-oversized-${status_stream}.out"
+  oversized_pid="/tmp/codex-oversized-${status_stream}.pid"
+  rm -f "$oversized_output" "$oversized_pid"
+  oversized_before=$(observer_count)
+  if env -u OPENAI_API_KEY -u CODEX_API_KEY HOME=/tmp/codex-guard \
+    CODEX_HOME=/tmp/codex-guard CODEX_FAKE_OVERSIZED_STATUS="$status_stream" \
+    CODEX_PID_CAPTURE="$oversized_pid" \
+    promtect guard codex --upstream http://mock-provider:9000/guard-cli -- \
+      exec "$PROMPT" >"$oversized_output" 2>&1; then
+    printf 'FAIL Codex guard: oversized login status on %s authorized execution\n' \
+      "$status_stream" >&2
+    exit 1
+  fi
+  oversized_after=$(observer_count)
+  if [ "$oversized_before" != "$oversized_after" ] \
+    || ! grep -Fq 'Codex login status output exceeded its safety limit' "$oversized_output" \
+    || grep -Eq 'proxy 127\.0\.0\.1:|dashboard: http://127\.0\.0\.1:' "$oversized_output"; then
+    printf 'FAIL Codex guard: oversized login status on %s was not bounded before bind\n' \
+      "$status_stream" >&2
+    sed -n '1,80p' "$oversized_output" >&2
+    exit 1
+  fi
+  if [ ! -s "$oversized_pid" ]; then
+    printf 'FAIL Codex guard: oversized login status on %s did not capture its process\n' \
+      "$status_stream" >&2
+    exit 1
+  fi
+  assert_process_gone "Codex oversized $status_stream login status" "$(tail -n 1 "$oversized_pid")"
+  printf 'PASS Codex guard: oversized login status on %s was killed before bind or provider traffic\n' \
+    "$status_stream"
+done
+
 for comm in /proc/[0-9]*/comm; do
   process_name=
   if [ -r "$comm" ]; then
@@ -1066,6 +1099,26 @@ printf 'PASS Claude guard: two value-free Stop-hook notices stayed out of both m
 printf 'PASS Claude guard: live dashboard reported all four detector kinds and eight masks\n'
 printf 'PASS Claude guard: inherited proxy variables could not bypass the loopback proxy\n'
 printf 'PASS Claude guard: persisted base URL, socket, and provider selectors could not bypass Promtect\n'
+
+if [ "${PROMTECT_CLAUDE_INTERACTIVE_REHEARSAL:-0}" = "1" ]; then
+  controlled_credential=/controlled-claude-auth/.credentials.json
+  if [ ! -f "$controlled_credential" ] || [ -L "$controlled_credential" ]; then
+    printf '%s\n' \
+      'FAIL Claude guard interactive TUI: controlled stored credential is missing or unsafe' >&2
+    exit 1
+  fi
+  cp "$controlled_credential" /tmp/claude-guard/.credentials.json
+  chmod 0600 /tmp/claude-guard/.credentials.json
+  claude_tui_before=$(observer_count)
+  PROMTECT_CLAUDE_AUTH_STATUS_MODE=real \
+    python3 /harness/test_claude_notice_tui.py
+  claude_tui_after=$(observer_count)
+  assert_claude_single_observation_window "$claude_tui_before" "$claude_tui_after"
+  printf 'PASS Claude guard: interactive notice remained absent from provider/model context\n'
+else
+  printf '%s\n' \
+    'SKIP Claude guard interactive TUI: exact Claude performs an api.anthropic.com startup check before its prompt; the internal Docker network has neither that route nor controlled Max credentials. Run tests/provider-harness/run-claude-interactive.sh.'
+fi
 
 rm -f /tmp/claude-stream-signal.ready /tmp/claude-stream-signal.prefix \
   /tmp/claude-stream-signal-audit.jsonl /tmp/claude-stream-signal.stdout \

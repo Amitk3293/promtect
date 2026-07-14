@@ -18,8 +18,8 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, Read, Seek};
+use std::collections::BTreeSet;
+use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -105,12 +105,6 @@ const CLAUDE_UNSUPPORTED_ROOT_COMMANDS: &[&str] = &[
     "upgrade",
 ];
 const CLAUDE_NOTICE_ROUTE: &str = "/_promtect/hooks/{token}";
-const CLAUDE_NOTICE_MAX_DELTA_BYTES: u64 = 1024 * 1024;
-const CLAUDE_NOTICE_MAX_RECORD_BYTES: u64 = 16 * 1024;
-const CLAUDE_NOTICE_MAX_RECORDS: usize = 4096;
-const CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES: usize = 256;
-const CLAUDE_NOTICE_MAX_DETECTOR_BYTES: usize = 64;
-const CLAUDE_NOTICE_MAX_DETECTORS: usize = 128;
 const CLAUDE_NOTICE_DEGRADED_MESSAGE: &str = "🛡 Promtect could not safely summarize this turn’s protection metadata. No sensitive values are included; check the local dashboard and guard summary.";
 
 fn next_value<'a>(args: &'a [String], i: usize, flag: &str) -> Result<&'a str, String> {
@@ -620,40 +614,20 @@ impl Drop for ClaudeSettingsFile {
 
 #[derive(Clone)]
 struct ClaudeNoticeState {
-    audit_path: Arc<std::path::PathBuf>,
-    audit: Option<Arc<Audit>>,
-    cursor: Arc<std::sync::Mutex<u64>>,
+    audit: Arc<Audit>,
     reading: Arc<std::sync::atomic::AtomicBool>,
     token: Arc<str>,
-    request_prefix: Arc<str>,
     strict: bool,
 }
 
 impl ClaudeNoticeState {
-    fn new(
-        audit_path: impl Into<std::path::PathBuf>,
-        token: String,
-        request_scope: &str,
-        strict: bool,
-    ) -> Self {
-        let audit_path = audit_path.into();
-        let cursor = std::fs::metadata(&audit_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+    fn new(audit: Arc<Audit>, token: String, strict: bool) -> Self {
         Self {
-            audit_path: Arc::new(audit_path),
-            audit: None,
-            cursor: Arc::new(std::sync::Mutex::new(cursor)),
+            audit,
             reading: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            request_prefix: format!("{request_scope}:").into(),
             token: token.into(),
             strict,
         }
-    }
-
-    fn with_audit(mut self, audit: Arc<Audit>) -> Self {
-        self.audit = Some(audit);
-        self
     }
 }
 
@@ -676,194 +650,6 @@ enum ClaudeNoticeRead {
     Empty,
     Notice(ClaudeNotice),
     Degraded,
-}
-
-#[derive(Debug, Default)]
-struct RequestNotice {
-    masked: u64,
-    detectors: BTreeSet<String>,
-}
-
-fn valid_detector_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= CLAUDE_NOTICE_MAX_DETECTOR_BYTES
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
-}
-
-/// Read only complete audit records written since the previous Claude Stop hook.
-/// The result contains counts and detector kinds, never request bodies or values.
-fn take_claude_notice(state: &ClaudeNoticeState) -> ClaudeNoticeRead {
-    let mut cursor = state
-        .cursor
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut file = match Audit::open_read(state.audit_path.as_path()) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return ClaudeNoticeRead::Degraded;
-        }
-        Err(_) => return ClaudeNoticeRead::Degraded,
-    };
-    let len = match file.metadata() {
-        Ok(metadata) => metadata.len(),
-        Err(_) => return ClaudeNoticeRead::Degraded,
-    };
-    if *cursor > len {
-        // A same-inode copy-truncate invalidates the saved generation. Never
-        // silently turn that loss of evidence into a false zero-event result.
-        *cursor = len;
-        return ClaudeNoticeRead::Degraded;
-    }
-    let delta = len - *cursor;
-    if delta == 0 {
-        return ClaudeNoticeRead::Empty;
-    }
-    if delta > CLAUDE_NOTICE_MAX_DELTA_BYTES {
-        *cursor = len;
-        return ClaudeNoticeRead::Degraded;
-    }
-    if file.seek(std::io::SeekFrom::Start(*cursor)).is_err() {
-        return ClaudeNoticeRead::Degraded;
-    }
-
-    // Read only the snapshotted delta. Concurrent appends belong to the next hook,
-    // so a busy audit can never make this invocation chase a moving EOF.
-    let mut reader = std::io::BufReader::new(file.take(delta));
-    let mut line = Vec::new();
-    let mut requests: BTreeMap<String, RequestNotice> = BTreeMap::new();
-    let mut unsuccessful = BTreeSet::new();
-    let mut next_cursor = *cursor;
-    let mut records = 0usize;
-
-    loop {
-        line.clear();
-        let bytes = match reader
-            .by_ref()
-            .take(CLAUDE_NOTICE_MAX_RECORD_BYTES + 1)
-            .read_until(b'\n', &mut line)
-        {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                *cursor = len;
-                return ClaudeNoticeRead::Degraded;
-            }
-        };
-        if bytes == 0 {
-            break;
-        }
-        if bytes as u64 > CLAUDE_NOTICE_MAX_RECORD_BYTES {
-            *cursor = len;
-            return ClaudeNoticeRead::Degraded;
-        }
-        if !line.ends_with(b"\n") {
-            // A writer may still be completing this record. Leave it pending for
-            // the next hook instead of accepting a partial JSON object.
-            break;
-        }
-        records += 1;
-        if records > CLAUDE_NOTICE_MAX_RECORDS {
-            *cursor = len;
-            return ClaudeNoticeRead::Degraded;
-        }
-        next_cursor = next_cursor.saturating_add(bytes as u64);
-
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&line) else {
-            *cursor = len;
-            return ClaudeNoticeRead::Degraded;
-        };
-        let Some(action) = value.get("action").and_then(|field| field.as_str()) else {
-            *cursor = len;
-            return ClaudeNoticeRead::Degraded;
-        };
-        let Some(request_id) = value
-            .get("request_id")
-            .and_then(|field| field.as_str())
-            .filter(|request_id| !request_id.is_empty())
-        else {
-            *cursor = len;
-            return ClaudeNoticeRead::Degraded;
-        };
-        if request_id.len() > CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES {
-            *cursor = len;
-            return ClaudeNoticeRead::Degraded;
-        }
-        if !request_id.starts_with(state.request_prefix.as_ref()) {
-            continue;
-        }
-
-        match action {
-            "request" => {
-                let Some(masked) = value.get("masked").and_then(|field| field.as_u64()) else {
-                    *cursor = len;
-                    return ClaudeNoticeRead::Degraded;
-                };
-                let Some(blocked) = value.get("blocked").and_then(|field| field.as_bool()) else {
-                    *cursor = len;
-                    return ClaudeNoticeRead::Degraded;
-                };
-                let Some(detectors) = value.get("detectors").and_then(|field| field.as_array())
-                else {
-                    *cursor = len;
-                    return ClaudeNoticeRead::Degraded;
-                };
-                let mut validated_detectors = BTreeSet::new();
-                for detector in detectors {
-                    let Some(detector) = detector.as_str() else {
-                        *cursor = len;
-                        return ClaudeNoticeRead::Degraded;
-                    };
-                    if !valid_detector_name(detector) {
-                        *cursor = len;
-                        return ClaudeNoticeRead::Degraded;
-                    }
-                    validated_detectors.insert(detector.to_string());
-                    if validated_detectors.len() > CLAUDE_NOTICE_MAX_DETECTORS {
-                        *cursor = len;
-                        return ClaudeNoticeRead::Degraded;
-                    }
-                }
-                if masked > 0 && validated_detectors.is_empty() {
-                    *cursor = len;
-                    return ClaudeNoticeRead::Degraded;
-                }
-                if blocked {
-                    unsuccessful.insert(request_id.to_string());
-                    continue;
-                }
-                if masked == 0 {
-                    continue;
-                }
-                let entry = requests.entry(request_id.to_string()).or_default();
-                entry.masked = entry.masked.saturating_add(masked);
-                entry.detectors.extend(validated_detectors);
-            }
-            "request_blocked" | "request_rejected" | "request_failed" | "stream_interrupted" => {
-                unsuccessful.insert(request_id.to_string());
-            }
-            _ => {}
-        }
-    }
-    *cursor = next_cursor;
-
-    let mut notice = ClaudeNotice::default();
-    for (request_id, request) in requests {
-        if unsuccessful.contains(&request_id) {
-            continue;
-        }
-        notice.masked = notice.masked.saturating_add(request.masked);
-        notice.detectors.extend(request.detectors);
-        if notice.detectors.len() > CLAUDE_NOTICE_MAX_DETECTORS {
-            *cursor = len;
-            return ClaudeNoticeRead::Degraded;
-        }
-    }
-    if notice.masked > 0 {
-        ClaudeNoticeRead::Notice(notice)
-    } else {
-        ClaudeNoticeRead::Empty
-    }
 }
 
 fn detector_display_name(kind: &str) -> String {
@@ -1324,14 +1110,8 @@ async fn claude_notice_hook(
     if !constant_time_token_eq(token.as_bytes(), state.token.as_bytes()) {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({})));
     }
-    if state
-        .audit
-        .as_ref()
-        .is_some_and(|audit| !audit.is_healthy())
-    {
-        if let Some(audit) = state.audit.as_ref() {
-            audit.mark_unhealthy();
-        }
+    if !state.audit.is_healthy() {
+        state.audit.mark_unhealthy();
         return (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -1361,35 +1141,25 @@ async fn claude_notice_hook(
     let read_state = state.clone();
     let read = tokio::task::spawn_blocking(move || {
         let _permit = ClaudeNoticeReadPermit(reading);
-        let unhealthy = || {
-            read_state
-                .audit
-                .as_ref()
-                .is_some_and(|audit| !audit.is_healthy() || !audit.path_matches_handle())
-        };
+        let unhealthy =
+            || !read_state.audit.is_healthy() || !read_state.audit.path_matches_handle();
         if unhealthy() {
-            if let Some(audit) = read_state.audit.as_ref() {
-                audit.mark_unhealthy();
-            }
+            read_state.audit.mark_unhealthy();
             return ClaudeNoticeRead::Degraded;
         }
-        let read = if let Some(audit) = read_state.audit.as_ref() {
-            let notice = audit.take_turn_notice();
-            if notice.masked == 0 {
-                ClaudeNoticeRead::Empty
-            } else {
-                ClaudeNoticeRead::Notice(ClaudeNotice {
-                    masked: notice.masked,
-                    detectors: notice.detectors,
-                })
-            }
+        let notice = read_state.audit.take_turn_notice();
+        let read = if notice.degraded {
+            ClaudeNoticeRead::Degraded
+        } else if notice.masked == 0 {
+            ClaudeNoticeRead::Empty
         } else {
-            take_claude_notice(&read_state)
+            ClaudeNoticeRead::Notice(ClaudeNotice {
+                masked: notice.masked,
+                detectors: notice.detectors,
+            })
         };
         if unhealthy() {
-            if let Some(audit) = read_state.audit.as_ref() {
-                audit.mark_unhealthy();
-            }
+            read_state.audit.mark_unhealthy();
             ClaudeNoticeRead::Degraded
         } else {
             read
@@ -1666,6 +1436,84 @@ fn classify_stored_codex_auth(status: &str) -> Result<CodexAuthSource, &'static 
     Err("Codex guard requires API-key authentication")
 }
 
+async fn drain_bounded_output<R>(
+    mut reader: R,
+    max_bytes: usize,
+    overflow: tokio::sync::mpsc::Sender<()>,
+) -> std::io::Result<(Vec<u8>, bool)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut output = Vec::with_capacity(max_bytes.min(8192));
+    let mut buffer = [0u8; 8192];
+    let mut exceeded = false;
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok((output, exceeded));
+        }
+        if exceeded {
+            continue;
+        }
+        let remaining = max_bytes.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..read.min(remaining)]);
+        if read > remaining {
+            exceeded = true;
+            let _ = overflow.try_send(());
+        }
+    }
+}
+
+async fn capture_codex_auth_output(
+    mut child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), CodexPreflightError> {
+    const MAX_AUTH_STREAM_BYTES: usize = 64 * 1024;
+
+    let (overflow_tx, mut overflow_rx) = tokio::sync::mpsc::channel(1);
+    let stdout_task = tokio::spawn(drain_bounded_output(
+        stdout,
+        MAX_AUTH_STREAM_BYTES,
+        overflow_tx.clone(),
+    ));
+    let stderr_task = tokio::spawn(drain_bounded_output(
+        stderr,
+        MAX_AUTH_STREAM_BYTES,
+        overflow_tx,
+    ));
+
+    let status = tokio::select! {
+        status = child.wait() => status
+            .map_err(|error| codex_process_error("check Codex login status", error))?,
+        Some(()) = overflow_rx.recv() => {
+            child.kill().await.ok();
+            child.wait().await.ok();
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(CodexPreflightError::Rejected(
+                "Codex login status output exceeded its safety limit".to_string(),
+            ));
+        }
+    };
+    let (stdout, stdout_exceeded) = stdout_task
+        .await
+        .map_err(|_| CodexPreflightError::Rejected("Codex login status check failed".to_string()))?
+        .map_err(|error| codex_process_error("read Codex login status", error))?;
+    let (stderr, stderr_exceeded) = stderr_task
+        .await
+        .map_err(|_| CodexPreflightError::Rejected("Codex login status check failed".to_string()))?
+        .map_err(|error| codex_process_error("read Codex login status", error))?;
+    if stdout_exceeded || stderr_exceeded {
+        return Err(CodexPreflightError::Rejected(
+            "Codex login status output exceeded its safety limit".to_string(),
+        ));
+    }
+    Ok((status, stdout, stderr))
+}
+
 async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, CodexPreflightError> {
     // An explicit environment key selects the guard-owned environment-auth
     // provider. A separate stored ChatGPT session cannot power or reroute it.
@@ -1678,12 +1526,26 @@ async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, CodexPreflightE
 
     let mut cmd = tokio::process::Command::new(bin);
     configure_guard_child_network_env(&mut cmd);
-    cmd.args(["login", "status"]).kill_on_drop(true);
-    let output = tokio::time::timeout(Duration::from_secs(5), cmd.output())
-        .await
-        .map_err(|_| CodexPreflightError::Rejected("Codex login status timed out".to_string()))?
+    cmd.args(["login", "status"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
         .map_err(|error| codex_process_error("check Codex login status", error))?;
-    if !output.status.success() {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        CodexPreflightError::Rejected("Codex login status check failed".to_string())
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        CodexPreflightError::Rejected("Codex login status check failed".to_string())
+    })?;
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        capture_codex_auth_output(child, stdout, stderr),
+    )
+    .await
+    .map_err(|_| CodexPreflightError::Rejected("Codex login status timed out".to_string()))??;
+    if !output.0.success() {
         return Err(CodexPreflightError::Rejected(
             "Codex login status check failed".to_string(),
         ));
@@ -1691,8 +1553,8 @@ async fn verify_codex_auth(bin: &str) -> Result<CodexAuthSource, CodexPreflightE
     // Codex versions have emitted this value-free status on both stdout and
     // stderr. Inspect both, but never relay either stream: future versions may
     // add authentication details that must not reach Promtect's own logs.
-    let mut status = String::from_utf8_lossy(&output.stdout).into_owned();
-    status.push_str(&String::from_utf8_lossy(&output.stderr));
+    let mut status = String::from_utf8_lossy(&output.1).into_owned();
+    status.push_str(&String::from_utf8_lossy(&output.2));
     classify_stored_codex_auth(&status)
         .map_err(|error| CodexPreflightError::Rejected(error.to_string()))
 }
@@ -2169,15 +2031,7 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         let token = claude_notice_token.expect("Claude notice token must exist");
         let notice_path = CLAUDE_NOTICE_ROUTE.replace("{token}", &token);
         let notice_url = format!("{base_url}{notice_path}");
-        let notice_state = ClaudeNoticeState::new(
-            std::path::PathBuf::from(&audit_path_for_dash),
-            token,
-            claude_audit_scope
-                .as_deref()
-                .expect("Claude audit scope must exist"),
-            !plan.restore,
-        )
-        .with_audit(audit.clone());
+        let notice_state = ClaudeNoticeState::new(audit.clone(), token, !plan.restore);
         let notice_router = Router::new()
             .route(CLAUDE_NOTICE_ROUTE, post(claude_notice_hook))
             .with_state(notice_state);
@@ -2674,479 +2528,144 @@ mod tests {
         }
     }
 
-    #[test]
-    fn claude_notice_is_value_free_and_consumed_once() {
+    fn production_notice_state(audit: Arc<Audit>, strict: bool) -> ClaudeNoticeState {
+        ClaudeNoticeState::new(audit, "hook-token".to_string(), strict)
+    }
+
+    async fn invoke_production_notice(state: ClaudeNoticeState) -> serde_json::Value {
+        let (status, Json(body)) =
+            super::claude_notice_hook(State(state), Path("hook-token".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        body
+    }
+
+    #[tokio::test]
+    async fn claude_production_notice_reports_only_success_and_consumes_once() {
         let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-{}.jsonl",
+            "promtect-claude-ledger-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", true);
-        let other_guard =
-            crate::audit::Audit::to_file_scoped(path.clone(), "other-guard".to_string());
-        other_guard.record_request("request-other", 9, &["jwt"], 100, 120);
-        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-        audit.record_request(
-            "request-1",
-            4,
-            &["aws_key", "anthropic_key", "github_token", "stripe_key"],
-            100,
-            120,
-        );
+        let audit = Arc::new(crate::audit::Audit::to_file_scoped(
+            path.clone(),
+            "test-scope".to_string(),
+        ));
+        let state = production_notice_state(audit.clone(), true);
 
-        let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
-            panic!("expected pending notice");
-        };
-        assert_eq!(notice.masked, 4);
+        audit.record_request("clean", 0, &[], 100, 90);
         assert_eq!(
-            notice.detectors,
-            BTreeSet::from([
-                "anthropic_key".to_string(),
-                "aws_key".to_string(),
-                "github_token".to_string(),
-                "stripe_key".to_string(),
-            ])
+            invoke_production_notice(state.clone()).await,
+            serde_json::json!({})
         );
-        let message = super::format_claude_notice(&notice, true);
-        assert!(message.contains("masked 4 sensitive values"));
-        assert!(message.contains("AWS access key (`aws_key`)"));
-        assert!(message.contains("Strict mode: plaintext restoration off."));
-        assert!(!message.contains("AKIA"));
-        assert!(
-            super::take_claude_notice(&state) == super::ClaudeNoticeRead::Empty,
-            "a Stop hook must consume each notice exactly once"
-        );
-        std::fs::remove_file(path).ok();
-    }
 
-    #[test]
-    fn claude_notice_token_comparison_checks_complete_value() {
-        assert!(super::constant_time_token_eq(
-            b"fixed-hook-token",
-            b"fixed-hook-token"
-        ));
-        for candidate in [
-            b"fixed-hook-toke".as_slice(),
-            b"fixed-hook-token-extra".as_slice(),
-            b"xixed-hook-token".as_slice(),
-            b"fixed-hook-tokex".as_slice(),
-        ] {
-            assert!(!super::constant_time_token_eq(
-                candidate,
-                b"fixed-hook-token"
-            ));
-        }
-    }
+        audit.record_blocked_request("blocked");
+        assert_eq!(
+            invoke_production_notice(state.clone()).await,
+            serde_json::json!({})
+        );
 
-    #[test]
-    fn claude_notice_ignores_blocked_or_failed_requests() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-failed-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-        audit.record_request("request-blocked", 1, &["aws_key"], 100, 120);
-        audit.record(
-            "request_blocked",
-            "residual_secret",
-            "«residual-secret»",
-            "request-blocked",
+        audit.record_request("failed", 1, &["github_token"], 100, 90);
+        audit.record("request_failed", "upstream", "«request-failed»", "failed");
+        assert_eq!(
+            invoke_production_notice(state.clone()).await,
+            serde_json::json!({})
         );
-        audit.record_request("request-failed", 1, &["github_token"], 100, 120);
-        audit.record(
-            "request_failed",
-            "upstream",
-            "«upstream-request-failed»",
-            "request-failed",
-        );
-        audit.record_request("request-interrupted", 1, &["stripe_key"], 100, 120);
+
+        audit.record_request("interrupted", 1, &["stripe_key"], 100, 90);
         audit.record(
             "stream_interrupted",
             "upstream",
-            "«upstream-stream-interrupted»",
-            "request-interrupted",
+            "«stream-interrupted»",
+            "interrupted",
         );
-
         assert_eq!(
-            super::take_claude_notice(&state),
-            super::ClaudeNoticeRead::Empty
+            invoke_production_notice(state.clone()).await,
+            serde_json::json!({})
         );
-        std::fs::remove_file(path).ok();
-    }
 
-    #[test]
-    fn claude_notice_degrades_on_malformed_or_invalid_current_records_then_recovers() {
-        use std::io::Write;
-
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-corrupt-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let invalid_lines = [
-            "{not-json}".to_string(),
-            serde_json::json!({"request_id":"test-token:missing-action"}).to_string(),
-            serde_json::json!({"action":"request","masked":1}).to_string(),
-            serde_json::json!({
-                "action":"request",
-                "request_id":"test-token:wrong-masked",
-                "masked":"1",
-                "blocked":false,
-                "detectors":["aws_key"]
-            })
-            .to_string(),
-            serde_json::json!({
-                "action":"request",
-                "request_id":"test-token:zero-invalid-detector",
-                "masked":0,
-                "blocked":false,
-                "detectors":[42]
-            })
-            .to_string(),
-            serde_json::json!({
-                "action":"request",
-                "request_id":"test-token:blocked-invalid-detector",
-                "masked":1,
-                "blocked":true,
-                "detectors":[42]
-            })
-            .to_string(),
-        ];
-
-        for (index, invalid) in invalid_lines.into_iter().enumerate() {
-            let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-            audit.record_request(&format!("valid-before-{index}"), 1, &["aws_key"], 100, 90);
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("open audit corruption fixture");
-            writeln!(file, "{invalid}").expect("append corrupt audit record");
-            drop(file);
-
-            assert_eq!(
-                super::take_claude_notice(&state),
-                super::ClaudeNoticeRead::Degraded
-            );
-            let recovery =
-                crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-            recovery.record_request(&format!("recovery-{index}"), 1, &["github_token"], 100, 90);
-            let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
-                panic!("expected notice recovery after corruption case {index}");
-            };
-            assert_eq!(notice.masked, 1);
-            assert_eq!(
-                notice.detectors,
-                BTreeSet::from(["github_token".to_string()])
-            );
-        }
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn claude_notice_starts_after_repairing_a_truncated_prior_tail() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-truncated-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(&path, br#"{"incomplete":true"#).expect("write truncated audit tail");
-        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-        audit.prepare().expect("prepare truncated audit tail");
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        audit.record_request("request-new", 1, &["aws_key"], 100, 120);
-
-        let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
-            panic!("expected new repaired-session notice");
-        };
-        assert_eq!(notice.masked, 1);
-        assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
+        audit.record_request(
+            "success",
+            4,
+            &["aws_key", "anthropic_key", "github_token", "stripe_key"],
+            100,
+            90,
+        );
+        let body = invoke_production_notice(state.clone()).await;
+        let message = body["systemMessage"].as_str().expect("successful notice");
+        assert!(message.contains("masked 4 sensitive values"));
+        assert!(message.contains("AWS access key (`aws_key`)"));
+        assert!(message.contains("Strict mode: plaintext restoration off."));
+        assert!(!message.contains("AKIA") && !message.contains("«promtect:"));
+        assert_eq!(invoke_production_notice(state).await, serde_json::json!({}));
         std::fs::remove_file(path).ok();
     }
 
     #[tokio::test]
-    async fn claude_notice_survives_same_inode_truncate_and_regrow() {
-        use std::io::Write;
+    async fn claude_production_notice_degrades_when_ledger_saturates_then_recovers() {
+        let audit = Arc::new(crate::audit::Audit::null_scoped("test-scope".to_string()));
+        let state = production_notice_state(audit.clone(), false);
+        for index in 0..=crate::audit::MAX_TURN_OUTCOMES {
+            audit.record_request(&format!("request-{index}"), 1, &["aws_key"], 1, 1);
+        }
 
+        let degraded = invoke_production_notice(state.clone()).await;
+        assert_eq!(
+            degraded["systemMessage"],
+            super::CLAUDE_NOTICE_DEGRADED_MESSAGE
+        );
+        audit.record_request("recovered", 1, &["github_token"], 1, 1);
+        let recovered = invoke_production_notice(state).await;
+        assert!(
+            recovered["systemMessage"]
+                .as_str()
+                .expect("recovered notice")
+                .contains("GitHub token")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_production_notice_survives_same_inode_truncate() {
         let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-regrow-{}.jsonl",
+            "promtect-claude-ledger-truncate-{}.jsonl",
             uuid::Uuid::new_v4()
         ));
-        let historical = format!(
-            "{}\n",
-            serde_json::json!({
-                "action": "request",
-                "request_id": "historical:request",
-                "masked": 0,
-                "blocked": false,
-                "detectors": []
-            })
-        )
-        .repeat(64);
-        std::fs::write(&path, historical).expect("write historical audit");
         let audit = Arc::new(crate::audit::Audit::to_file_scoped(
             path.clone(),
-            "test-token".to_string(),
+            "test-scope".to_string(),
         ));
         audit.prepare().expect("prepare audit fixture");
-        let original_len = std::fs::metadata(&path).expect("audit metadata").len();
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false)
-                .with_audit(audit.clone());
-
+        let state = production_notice_state(audit.clone(), false);
         std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
             .open(&path)
             .expect("truncate same audit inode");
-        audit.record_request("request-new", 1, &["aws_key"], 100, 120);
-        let regrown_len = std::fs::metadata(&path).expect("regrown metadata").len();
-        assert!(regrown_len < original_len);
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open audit padding");
-        file.write_all(&vec![b' '; (original_len - regrown_len) as usize])
-            .expect("regrow audit to old cursor");
-        drop(file);
-        assert_eq!(
-            std::fs::metadata(&path).expect("audit metadata").len(),
-            original_len
-        );
+        audit.record_request("protected", 1, &["aws_key"], 1, 1);
 
-        let (status, Json(body)) =
-            super::claude_notice_hook(State(state), Path("hook-token".to_string())).await;
-        assert_eq!(status, StatusCode::OK);
-        let message = body["systemMessage"]
-            .as_str()
-            .expect("truncate-regrow turn must still produce a notice");
-        assert!(message.contains("masked 1 sensitive value"));
-        assert!(message.contains("AWS access key (`aws_key`)"));
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn claude_notice_large_delta_degrades_then_recovers() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-large-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let mut oversized = vec![b'x'; (super::CLAUDE_NOTICE_MAX_DELTA_BYTES + 1) as usize];
-        *oversized.last_mut().expect("non-empty oversized delta") = b'\n';
-        std::fs::write(&path, oversized).expect("write oversized audit delta");
-
-        assert_eq!(
-            super::take_claude_notice(&state),
-            super::ClaudeNoticeRead::Degraded
-        );
-        assert_eq!(
-            *state.cursor.lock().expect("notice cursor"),
-            super::CLAUDE_NOTICE_MAX_DELTA_BYTES + 1
-        );
-
-        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-        audit.record_request("request-recovery", 1, &["aws_key"], 100, 120);
-        let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
-            panic!("expected notice recovery after capped delta");
-        };
-        assert_eq!(notice.masked, 1);
-        assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn claude_notice_oversized_record_degrades_then_recovers() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-record-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let mut record = vec![b'x'; (super::CLAUDE_NOTICE_MAX_RECORD_BYTES + 1) as usize];
-        record.push(b'\n');
-        std::fs::write(&path, record).expect("write oversized audit record");
-
-        assert_eq!(
-            super::take_claude_notice(&state),
-            super::ClaudeNoticeRead::Degraded
-        );
-        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-        audit.record_request("request-recovery", 1, &["github_token"], 100, 120);
-        assert!(matches!(
-            super::take_claude_notice(&state),
-            super::ClaudeNoticeRead::Notice(_)
-        ));
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn claude_notice_record_limit_degrades_then_recovers() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-records-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let record = serde_json::json!({
-            "action": "ignored",
-            "request_id": "different-session:request"
-        })
-        .to_string()
-            + "\n";
-        let records = record.repeat(super::CLAUDE_NOTICE_MAX_RECORDS + 1);
-        std::fs::write(&path, records).expect("write excessive audit records");
-
-        assert_eq!(
-            super::take_claude_notice(&state),
-            super::ClaudeNoticeRead::Degraded
-        );
-        let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-        audit.record_request("request-recovery", 1, &["stripe_key"], 100, 120);
-        assert!(matches!(
-            super::take_claude_notice(&state),
-            super::ClaudeNoticeRead::Notice(_)
-        ));
-        std::fs::remove_file(path).ok();
-    }
-
-    #[test]
-    fn claude_notice_copy_truncate_degrades_instead_of_claiming_empty() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-copy-truncate-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::write(
-            &path,
-            b"{\"action\":\"ignored\",\"request_id\":\"prior:request\"}\n",
-        )
-        .expect("seed audit");
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        std::fs::write(&path, b"").expect("copy truncate audit");
-
-        assert_eq!(
-            super::take_claude_notice(&state),
-            super::ClaudeNoticeRead::Degraded
+        let body = invoke_production_notice(state).await;
+        assert!(
+            body["systemMessage"]
+                .as_str()
+                .expect("truncate-safe notice")
+                .contains("AWS access key")
         );
         std::fs::remove_file(path).ok();
     }
 
-    #[test]
-    fn claude_notice_field_bounds_degrade_value_free_then_recover() {
-        use std::io::Write;
-
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-fields-{}.jsonl",
-            uuid::Uuid::new_v4()
+    #[tokio::test]
+    async fn claude_notice_hook_rejects_a_concurrent_reader() {
+        let audit = Arc::new(crate::audit::Audit::to_file_scoped(
+            std::env::temp_dir().join(format!(
+                "promtect-claude-reader-{}.jsonl",
+                uuid::Uuid::new_v4()
+            )),
+            "test-scope".to_string(),
         ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let too_many_detectors = (0..=super::CLAUDE_NOTICE_MAX_DETECTORS)
-            .map(|index| format!("detector_{index}"))
-            .collect::<Vec<_>>();
-        let invalid_records = [
-            serde_json::json!({
-                "action": "request",
-                "request_id": format!(
-                    "test-token:{}",
-                    "a".repeat(super::CLAUDE_NOTICE_MAX_REQUEST_ID_BYTES)
-                ),
-                "masked": 1,
-                "detectors": ["aws_key"],
-                "blocked": false
-            }),
-            serde_json::json!({
-                "action": "request",
-                "request_id": "test-token:invalid-character",
-                "masked": 1,
-                "detectors": ["aws-key"],
-                "blocked": false
-            }),
-            serde_json::json!({
-                "action": "request",
-                "request_id": "test-token:oversized-detector",
-                "masked": 1,
-                "detectors": ["a".repeat(super::CLAUDE_NOTICE_MAX_DETECTOR_BYTES + 1)],
-                "blocked": false
-            }),
-            serde_json::json!({
-                "action": "request",
-                "request_id": "test-token:too-many-detectors",
-                "masked": 1,
-                "detectors": too_many_detectors,
-                "blocked": false
-            }),
-            serde_json::json!({
-                "action": "request",
-                "request_id": "test-token:non-string-detector",
-                "masked": 1,
-                "detectors": [42],
-                "blocked": false
-            }),
-        ];
-
-        for (index, record) in invalid_records.into_iter().enumerate() {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .expect("open hostile audit fixture");
-            writeln!(file, "{record}").expect("append hostile audit fixture");
-            drop(file);
-            assert_eq!(
-                super::take_claude_notice(&state),
-                super::ClaudeNoticeRead::Degraded
-            );
-
-            let audit = crate::audit::Audit::to_file_scoped(path.clone(), "test-token".to_string());
-            audit.record_request(&format!("recovery-{index}"), 1, &["aws_key"], 100, 120);
-            let super::ClaudeNoticeRead::Notice(notice) = super::take_claude_notice(&state) else {
-                panic!("expected recovery after hostile audit field {index}");
-            };
-            assert_eq!(notice.masked, 1);
-            assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
-        }
-        std::fs::remove_file(path).ok();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn claude_notice_hook_allows_only_one_blocking_reader() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-claude-notice-responsive-{}.jsonl",
-            uuid::Uuid::new_v4()
-        ));
-        let state =
-            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false);
-        let cursor = state.cursor.clone();
-        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let holder = std::thread::spawn(move || {
-            let _guard = cursor.lock().expect("hold notice cursor");
-            locked_tx.send(()).expect("signal held cursor");
-            release_rx.recv().expect("release notice cursor");
-        });
-        locked_rx.recv().expect("wait for held cursor");
-
-        let hook = tokio::spawn(super::claude_notice_hook(
-            State(state.clone()),
-            Path("hook-token".to_string()),
-        ));
-        while !state.reading.load(std::sync::atomic::Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-        let (status, Json(body)) =
-            super::claude_notice_hook(State(state), Path("hook-token".to_string())).await;
-        assert_eq!(status, StatusCode::OK);
+        let state = production_notice_state(audit, false);
+        state
+            .reading
+            .store(true, std::sync::atomic::Ordering::Release);
+        let body = invoke_production_notice(state).await;
         assert_eq!(body["systemMessage"], super::CLAUDE_NOTICE_DEGRADED_MESSAGE);
-
-        release_tx.send(()).expect("release notice cursor");
-        holder.join().expect("release notice cursor");
-        let (status, _) = hook.await.expect("notice hook task");
-        assert_eq!(status, StatusCode::OK);
     }
 
     #[test]

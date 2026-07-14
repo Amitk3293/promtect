@@ -49,8 +49,8 @@ and auto-generated notes also live on the
   stale dashboard from another process.
 - Claude guard removes inherited HTTP proxy routes, rejects detected managed or
   unsupported authentication profiles before bind, and scopes notices to the
-  current guard session. Notice audit reads now run off the async runtime with
-  strict byte, record, and field limits plus a value-free degraded response.
+  current guard session. A bounded process-local outcome ledger drives each
+  value-free notice and degrades safely if a turn exceeds its metadata limits.
 - Promtect no longer honors implicit system proxy variables for upstream traffic;
   gateways remain available through the explicit upstream/chaining configuration.
 - Guarded tools now run inside an owned Unix process group with terminal job-control

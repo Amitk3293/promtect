@@ -6,6 +6,9 @@ if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
     : > "$PROMTECT_CLAUDE_AUTH_STATUS_MARKER"
   fi
   case "${PROMTECT_CLAUDE_AUTH_STATUS_MODE:-valid}" in
+    real)
+      exec /opt/provider-clis/node_modules/.bin/claude "$@"
+      ;;
     valid)
       printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max","apiProvider":"firstParty"}'
       exit 0
