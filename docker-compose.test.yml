@@ -10,10 +10,11 @@
 # /usr/local/cargo/bin, so cargo/rustc stay available.
 services:
   test:
-    # Pin the multi-architecture image: the mutable `rust:1-bookworm` tag
-    # stopped including Clippy/rustfmt in July 2026 and broke this clean-clone
-    # gate before it could run any repository checks.
-    image: rust:1.96.0-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc
+    # Build the digest-pinned toolchain once so disposable test containers do
+    # not redownload Clippy/rustfmt on every run.
+    build:
+      context: .
+      dockerfile: Dockerfile.test
     working_dir: /build
     volumes:
       - .:/build
@@ -24,7 +25,7 @@ services:
     # NOTE: `bash -c`, NOT `bash -lc` — a login shell resets PATH and drops the
     # image's /usr/local/cargo/bin, which makes `cargo` "command not found".
     command: >
-      bash -c "rustup component add rustfmt clippy && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
+      bash -c "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test"
 
 volumes:
   promtect-cargo-registry:
