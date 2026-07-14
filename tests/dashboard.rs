@@ -137,6 +137,41 @@ async fn api_metrics_returns_200_with_correct_json() {
     std::fs::remove_file(&audit_path).ok();
 }
 
+/// A real audit read failure must make both metrics endpoints unavailable. A
+/// directory can be opened as a file descriptor on supported CI platforms, but
+/// attempting to read it fails, exercising the production I/O path rather than
+/// a synthetic panic.
+#[tokio::test]
+async fn audit_read_failure_returns_503_without_false_zero_metrics() {
+    let audit_directory = std::env::temp_dir().join(format!(
+        "promtect-dashboard-read-error-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&audit_directory).expect("create unreadable audit fixture");
+    let base = spawn_dashboard(audit_directory.clone()).await;
+
+    let api = reqwest::get(format!("{base}/api/metrics"))
+        .await
+        .expect("GET failed /api/metrics");
+    assert_eq!(api.status(), 503);
+    let api_body = api.text().await.expect("read failed API response");
+    assert!(api_body.contains("metrics temporarily unavailable"));
+    assert!(!api_body.contains("requests_total"));
+
+    let prometheus = reqwest::get(format!("{base}/metrics"))
+        .await
+        .expect("GET failed /metrics");
+    assert_eq!(prometheus.status(), 503);
+    let prometheus_body = prometheus
+        .text()
+        .await
+        .expect("read failed Prometheus response");
+    assert!(prometheus_body.contains("metrics temporarily unavailable"));
+    assert!(!prometheus_body.contains("promtect_requests_total"));
+
+    std::fs::remove_dir(&audit_directory).ok();
+}
+
 /// `GET /metrics` must return HTTP 200 with the Prometheus `Content-Type` and a
 /// body that contains the required metric names and a labelled detector line.
 #[tokio::test]
@@ -261,4 +296,118 @@ async fn api_metrics_reports_strict_restore_mode_truthfully() {
     std::fs::remove_file(&audit_path).ok();
 
     assert_eq!(json["restore_enabled"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn api_metrics_skips_oversized_records_and_keeps_recent_lifecycle() {
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-dashboard-bounded-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let mut f = std::io::BufWriter::new(
+        std::fs::File::create(&audit_path).expect("create bounded dashboard audit"),
+    );
+
+    for i in 0u64..100 {
+        writeln!(
+            f,
+            r#"{{"ts_ms":{i},"action":"request","request_id":"req-{i}","masked":1,"detectors":["aws_key"],"bytes_in":1,"bytes_out":1}}"#
+        )
+        .unwrap();
+        writeln!(f, r#"{{"action":"unmask","request_id":"req-{i}"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"action":"stream_interrupted","request_id":"req-{i}"}}"#
+        )
+        .unwrap();
+    }
+    let oversized = serde_json::json!({
+        "ts_ms": 1_000,
+        "action": "request",
+        "request_id": "must-be-skipped",
+        "masked": 0,
+        "detectors": [],
+        "bytes_in": 1,
+        "bytes_out": 1,
+        "padding": "x".repeat(64 * 1024),
+    });
+    writeln!(f, "{oversized}").unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let base = spawn_dashboard(audit_path.clone()).await;
+    let response = reqwest::get(format!("{base}/api/metrics"))
+        .await
+        .expect("GET bounded metrics");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.expect("read bounded metrics");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("parse bounded metrics");
+    std::fs::remove_file(&audit_path).ok();
+
+    assert_eq!(json["requests_total"].as_u64(), Some(100));
+    let recent = json["recent"].as_array().expect("recent array");
+    assert_eq!(recent.len(), 20);
+    assert_eq!(recent[0]["request_id"].as_str(), Some("req-99"));
+    assert_eq!(recent[19]["request_id"].as_str(), Some("req-80"));
+    assert_eq!(recent[0]["restored"].as_u64(), Some(1));
+    assert_eq!(recent[0]["failures"].as_u64(), Some(1));
+    assert_eq!(recent[0]["interrupted"].as_bool(), Some(true));
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn scan_failure_returns_503_and_recovers_when_path_becomes_readable() {
+    // Keep the basename short enough for macOS's Unix-domain socket path cap.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let audit_path = std::env::temp_dir().join(format!("pt-d-{}", &suffix[..8]));
+    let listener =
+        std::os::unix::net::UnixListener::bind(&audit_path).expect("create non-file audit path");
+    let base = spawn_dashboard(audit_path.clone()).await;
+
+    let api_failure = reqwest::get(format!("{base}/api/metrics"))
+        .await
+        .expect("GET failed JSON aggregation");
+    assert_eq!(api_failure.status(), 503);
+    let api_body = api_failure.text().await.expect("read failed JSON body");
+    assert!(api_body.contains("metrics temporarily unavailable"));
+    assert!(!api_body.contains("requests_total"));
+    assert!(!api_body.contains("requests_clean"));
+
+    let prometheus_failure = reqwest::get(format!("{base}/metrics"))
+        .await
+        .expect("GET failed Prometheus aggregation");
+    assert_eq!(prometheus_failure.status(), 503);
+    let prometheus_body = prometheus_failure
+        .text()
+        .await
+        .expect("read failed Prometheus body");
+    assert!(prometheus_body.contains("metrics temporarily unavailable"));
+    assert!(!prometheus_body.contains("promtect_requests_total"));
+
+    drop(listener);
+    std::fs::remove_file(&audit_path).expect("remove socket audit path");
+    let mut f = std::fs::File::create(&audit_path).expect("create recovered audit file");
+    writeln!(
+        f,
+        r#"{{"ts_ms":1,"action":"request","request_id":"recovered","masked":1,"detectors":["aws_key"],"bytes_in":1,"bytes_out":1}}"#
+    )
+    .unwrap();
+    writeln!(
+        f,
+        r#"{{"ts_ms":1,"action":"mask","detector":"aws_key","request_id":"recovered"}}"#
+    )
+    .unwrap();
+    drop(f);
+
+    let recovered = reqwest::get(format!("{base}/api/metrics"))
+        .await
+        .expect("GET recovered aggregation");
+    assert_eq!(recovered.status(), 200);
+    let recovered_body = recovered.text().await.expect("read recovered body");
+    let json: serde_json::Value =
+        serde_json::from_str(&recovered_body).expect("parse recovered metrics");
+    assert_eq!(json["requests_total"].as_u64(), Some(1));
+    assert_eq!(json["secrets_masked_total"].as_u64(), Some(1));
+
+    std::fs::remove_file(&audit_path).ok();
 }

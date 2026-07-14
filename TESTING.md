@@ -67,7 +67,10 @@ and the Linux CI gate runs this target on every pull request.
 ephemeral port and asserts `/api/metrics` (JSON), `/metrics` (Prometheus text), and
 `/` (the embedded offline UI) each respond correctly, and that a missing audit file
 yields zeroed metrics rather than an error. The metrics it serves are value-free
-(counts, detector names, byte totals — never a secret). **Run:** `cargo test --test dashboard`.
+(counts, detector names, byte totals — never a secret). Oversized records,
+high-cardinality lifecycle data, and busy/failed aggregation are regression-tested;
+unavailable aggregation returns `503` rather than a false zero snapshot. **Run:**
+`cargo test --test dashboard`.
 
 ---
 
