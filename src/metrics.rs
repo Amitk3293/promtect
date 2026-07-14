@@ -10,7 +10,7 @@
 
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read, Seek};
 
 /// Aggregated, value-free metrics over the audit log. Safe to expose publicly:
 /// it contains only counts, detector kind names, and byte totals — never secrets.
@@ -89,6 +89,17 @@ struct RequestEvents {
 /// How many recent-request summaries to keep in [`Metrics::recent`].
 const RECENT_CAP: usize = 20;
 
+/// Maximum bytes accepted for one audit JSON record. This matches the audit
+/// tail-recovery bound and prevents a planted line from causing an allocation
+/// proportional to the file size.
+const MAX_RECORD_BYTES: usize = 64 * 1024;
+
+/// Detector names are supplied by an untrusted audit file. Core and paid
+/// editions have far fewer real detector kinds than this, while the cap keeps a
+/// planted stream of unique, syntactically-valid names from growing the maps
+/// without bound.
+const DETECTOR_CARDINALITY_CAP: usize = 1024;
+
 /// True iff `name` is a safe Prometheus label value for `detector="..."`.
 ///
 /// # WHY (security)
@@ -106,6 +117,80 @@ fn is_valid_detector_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// Visit newline-delimited records without ever retaining more than `limit`
+/// bytes for one record. Oversized records are discarded through their newline;
+/// later valid records remain readable.
+fn for_each_bounded_record<R, F>(reader: &mut R, limit: usize, mut visit: F)
+where
+    R: BufRead,
+    F: FnMut(&[u8]),
+{
+    let mut record = Vec::with_capacity(limit.min(8 * 1024));
+    let mut oversized = false;
+
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            // Best-effort aggregation: preserve records already visited.
+            Err(_) => return,
+        };
+
+        if available.is_empty() {
+            if !oversized && !record.is_empty() {
+                visit(&record);
+            }
+            return;
+        }
+
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if !oversized && record.len().saturating_add(newline) <= limit {
+                record.extend_from_slice(&available[..newline]);
+                visit(&record);
+            }
+            reader.consume(newline + 1);
+            record.clear();
+            oversized = false;
+            continue;
+        }
+
+        let consumed = available.len();
+        if !oversized {
+            if record.len().saturating_add(consumed) <= limit {
+                record.extend_from_slice(available);
+            } else {
+                record.clear();
+                oversized = true;
+            }
+        }
+        reader.consume(consumed);
+    }
+}
+
+fn increment_detector(map: &mut BTreeMap<String, u64>, detector: &str) {
+    if let Some(count) = map.get_mut(detector) {
+        *count = count.saturating_add(1);
+    } else if map.len() < DETECTOR_CARDINALITY_CAP {
+        map.insert(detector.to_string(), 1);
+    }
+}
+
+fn retain_recent(recent: &mut Vec<RecentRequest>, candidate: RecentRequest) {
+    recent.push(candidate);
+    if recent.len() <= RECENT_CAP {
+        return;
+    }
+
+    // On equal timestamps discard the later-read candidate. This preserves the
+    // stable ordering produced by the previous sort-then-truncate behavior.
+    let mut oldest = 0;
+    for index in 1..recent.len() {
+        if recent[index].ts_ms <= recent[oldest].ts_ms {
+            oldest = index;
+        }
+    }
+    recent.remove(oldest);
 }
 
 /// Aggregate value-free metrics from an audit JSONL file.
@@ -129,155 +214,169 @@ fn is_valid_detector_name(name: &str) -> bool {
 /// This function never surfaces secret values. The audit log is designed to be
 /// value-free, and this aggregator only reads the numeric/string metadata fields.
 pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
-    let file = match std::fs::File::open(audit_path) {
+    let mut file = match std::fs::File::open(audit_path) {
         Ok(f) => f,
         // Missing or unreadable file is normal before the first request.
         Err(_) => return Metrics::default(),
     };
-    // WHY: buffered line-by-line read instead of read_to_string — the audit file
-    // is unbounded and attacker-influenceable in size; we must not allocate it
-    // whole. Each line is parsed and dropped before the next is read.
-    let reader = std::io::BufReader::new(file);
+    let snapshot_len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return Metrics::default(),
+    };
 
     let mut m = Metrics::default();
-    let mut request_events: BTreeMap<String, RequestEvents> = BTreeMap::new();
+    {
+        // Both passes use one open file descriptor and the same captured byte
+        // length. Concurrent appends cannot make lifecycle correlation describe
+        // a different snapshot than the headline totals.
+        let mut first_pass = std::io::BufReader::new((&mut file).take(snapshot_len));
+        for_each_bounded_record(&mut first_pass, MAX_RECORD_BYTES, |record| {
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(record) else {
+                // Skip malformed lines rather than failing the whole aggregation.
+                return;
+            };
 
-    for line in reader.lines() {
-        // A mid-stream I/O error (e.g. concurrent truncation) ends iteration; the
-        // counts gathered so far are still valid and returned.
-        let Ok(line) = line else {
-            break;
-        };
+            let Some(action) = val.get("action").and_then(|v| v.as_str()) else {
+                return;
+            };
 
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
-            // Skip malformed lines rather than failing the whole aggregation.
-            continue;
-        };
+            match action {
+                "request" => {
+                    m.requests_total = m.requests_total.saturating_add(1);
 
-        let Some(action) = val.get("action").and_then(|v| v.as_str()) else {
-            continue;
-        };
+                    let masked = val.get("masked").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let blocked = val
+                        .get("blocked")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if blocked {
+                        // Counted by the paired request_blocked/request_rejected event.
+                    } else if masked > 0 {
+                        m.requests_with_secrets = m.requests_with_secrets.saturating_add(1);
+                    } else {
+                        m.requests_clean = m.requests_clean.saturating_add(1);
+                    }
 
-        match action {
-            "request" => {
-                m.requests_total += 1;
+                    let bytes_in = val.get("bytes_in").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let bytes_out = val.get("bytes_out").and_then(|v| v.as_u64()).unwrap_or(0);
+                    m.bytes_in_total = m.bytes_in_total.saturating_add(bytes_in);
+                    m.bytes_out_total = m.bytes_out_total.saturating_add(bytes_out);
 
-                let masked = val.get("masked").and_then(|v| v.as_u64()).unwrap_or(0);
-                let blocked = val
-                    .get("blocked")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if blocked {
-                    // Counted by the paired request_blocked/request_rejected event.
-                } else if masked > 0 {
-                    m.requests_with_secrets += 1;
-                } else {
-                    m.requests_clean += 1;
+                    // Capture the value-free recent summary.
+                    let ts_ms = val.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let request_id = val
+                        .get("request_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let detectors: Vec<String> = val
+                        .get("detectors")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|d| d.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
+                    retain_recent(
+                        &mut m.recent,
+                        RecentRequest {
+                            ts_ms,
+                            request_id,
+                            masked,
+                            detectors,
+                            blocked,
+                            restored: 0,
+                            output_secrets: 0,
+                            failures: 0,
+                            interrupted: false,
+                        },
+                    );
                 }
-
-                let bytes_in = val.get("bytes_in").and_then(|v| v.as_u64()).unwrap_or(0);
-                let bytes_out = val.get("bytes_out").and_then(|v| v.as_u64()).unwrap_or(0);
-                m.bytes_in_total += bytes_in;
-                m.bytes_out_total += bytes_out;
-
-                // Capture the value-free recent summary.
-                let ts_ms = val.get("ts_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                let request_id = val
-                    .get("request_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let detectors: Vec<String> = val
-                    .get("detectors")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|d| d.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                m.recent.push(RecentRequest {
-                    ts_ms,
-                    request_id,
-                    masked,
-                    detectors,
-                    blocked,
-                    restored: 0,
-                    output_secrets: 0,
-                    failures: 0,
-                    interrupted: false,
-                });
-                // No interim cap: the final sort+truncate at the end of this
-                // function handles ordering correctly without O(N²) interim sorts.
+                "mask" => {
+                    m.secrets_masked_total = m.secrets_masked_total.saturating_add(1);
+                    // Detector name comes from the "detector" field of mask events.
+                    // It is untrusted (from the file): only count validated names so a
+                    // planted name cannot forge a Prometheus label line downstream.
+                    if let Some(det) = val.get("detector").and_then(|v| v.as_str())
+                        && is_valid_detector_name(det)
+                    {
+                        increment_detector(&mut m.by_detector, det);
+                    }
+                }
+                // Pro output scan: a secret found in the RESPONSE (model-echoed or
+                // generated). Same value-free shape as a mask event; counted into its
+                // own totals so the dashboard can distinguish inbound-reply leaks from
+                // outbound request masking.
+                "output_secret" => {
+                    m.output_secrets_total = m.output_secrets_total.saturating_add(1);
+                    if let Some(det) = val.get("detector").and_then(|v| v.as_str())
+                        && is_valid_detector_name(det)
+                    {
+                        increment_detector(&mut m.output_by_detector, det);
+                    }
+                }
+                "unmask" => {
+                    m.secrets_restored_total = m.secrets_restored_total.saturating_add(1);
+                }
+                "request_blocked" | "request_rejected" => {
+                    m.requests_blocked_total = m.requests_blocked_total.saturating_add(1);
+                }
+                "stream_interrupted" => {
+                    m.stream_interruptions_total = m.stream_interruptions_total.saturating_add(1);
+                    m.failures_total = m.failures_total.saturating_add(1);
+                }
+                "request_failed" | "unmask_miss" | "mask_skip" => {
+                    m.failures_total = m.failures_total.saturating_add(1);
+                }
+                _ => {}
             }
-            "mask" => {
-                m.secrets_masked_total += 1;
-                // Detector name comes from the "detector" field of mask events.
-                // It is untrusted (from the file): only count validated names so a
-                // planted name cannot forge a Prometheus label line downstream.
-                if let Some(det) = val.get("detector").and_then(|v| v.as_str())
-                    && is_valid_detector_name(det)
-                {
-                    *m.by_detector.entry(det.to_string()).or_default() += 1;
+        });
+    }
+
+    sort_recent_newest_first(&mut m.recent);
+
+    let mut request_events: BTreeMap<String, RequestEvents> = m
+        .recent
+        .iter()
+        .map(|request| (request.request_id.clone(), RequestEvents::default()))
+        .collect();
+
+    if file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+        let mut second_pass = std::io::BufReader::new(file.take(snapshot_len));
+        for_each_bounded_record(&mut second_pass, MAX_RECORD_BYTES, |record| {
+            let Ok(val) = serde_json::from_slice::<serde_json::Value>(record) else {
+                return;
+            };
+            let Some(action) = val.get("action").and_then(|value| value.as_str()) else {
+                return;
+            };
+            let Some(request_id) = val.get("request_id").and_then(|value| value.as_str()) else {
+                return;
+            };
+            let Some(events) = request_events.get_mut(request_id) else {
+                return;
+            };
+
+            match action {
+                "output_secret" => {
+                    events.output_secrets = events.output_secrets.saturating_add(1);
                 }
-            }
-            // Pro output scan: a secret found in the RESPONSE (model-echoed or
-            // generated). Same value-free shape as a mask event; counted into its
-            // own totals so the dashboard can distinguish inbound-reply leaks from
-            // outbound request masking.
-            "output_secret" => {
-                m.output_secrets_total += 1;
-                if let Some(det) = val.get("detector").and_then(|v| v.as_str())
-                    && is_valid_detector_name(det)
-                {
-                    *m.output_by_detector.entry(det.to_string()).or_default() += 1;
+                "unmask" => {
+                    events.restored = events.restored.saturating_add(1);
                 }
-                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
-                    request_events
-                        .entry(request_id.to_string())
-                        .or_default()
-                        .output_secrets += 1;
-                }
-            }
-            "unmask" => {
-                m.secrets_restored_total += 1;
-                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
-                    request_events
-                        .entry(request_id.to_string())
-                        .or_default()
-                        .restored += 1;
-                }
-            }
-            "request_blocked" | "request_rejected" => {
-                m.requests_blocked_total += 1;
-                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
-                    request_events
-                        .entry(request_id.to_string())
-                        .or_default()
-                        .blocked = true;
-                }
-            }
-            "stream_interrupted" => {
-                m.stream_interruptions_total += 1;
-                m.failures_total += 1;
-                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
-                    let events = request_events.entry(request_id.to_string()).or_default();
-                    events.failures += 1;
+                "request_blocked" | "request_rejected" => events.blocked = true,
+                "stream_interrupted" => {
+                    events.failures = events.failures.saturating_add(1);
                     events.interrupted = true;
                 }
-            }
-            "request_failed" | "unmask_miss" | "mask_skip" => {
-                m.failures_total += 1;
-                if let Some(request_id) = val.get("request_id").and_then(|v| v.as_str()) {
-                    request_events
-                        .entry(request_id.to_string())
-                        .or_default()
-                        .failures += 1;
+                "request_failed" | "unmask_miss" | "mask_skip" => {
+                    events.failures = events.failures.saturating_add(1);
                 }
+                _ => {}
             }
-            _ => {}
-        }
+        });
     }
 
     for recent in &mut m.recent {
@@ -289,11 +388,6 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
             recent.interrupted = events.interrupted;
         }
     }
-
-    // Final sort so the output is newest-first regardless of on-disk ordering.
-    // (The interim trims above only ran when over-cap; small files skip them.)
-    sort_recent_newest_first(&mut m.recent);
-    m.recent.truncate(RECENT_CAP);
 
     m
 }
@@ -675,6 +769,55 @@ mod tests {
         assert_eq!(m.requests_total, 3);
     }
 
+    /// An audit record is attacker-influenceable input. A single valid JSON
+    /// record above the parser's bound must be discarded without preventing
+    /// later, valid records from being aggregated.
+    #[test]
+    fn aggregate_skips_oversized_record_and_continues() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-metrics-oversized-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+
+        writeln!(
+            f,
+            r#"{{"ts_ms":1,"action":"request","request_id":"before","masked":0,"detectors":[],"bytes_in":1,"bytes_out":1}}"#
+        )
+        .unwrap();
+
+        let oversized = serde_json::json!({
+            "ts_ms": 2,
+            "action": "request",
+            "request_id": "oversized",
+            "masked": 0,
+            "detectors": [],
+            "bytes_in": 1,
+            "bytes_out": 1,
+            "padding": "x".repeat(64 * 1024),
+        });
+        writeln!(f, "{oversized}").unwrap();
+
+        writeln!(
+            f,
+            r#"{{"ts_ms":3,"action":"request","request_id":"after","masked":0,"detectors":[],"bytes_in":1,"bytes_out":1}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(m.requests_total, 2);
+        assert_eq!(
+            m.recent
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["after", "before"]
+        );
+    }
+
     // ── Prometheus output tests ──────────────────────────────────────────────
 
     #[test]
@@ -944,6 +1087,88 @@ mod tests {
         // Every line was counted, and recent is still capped.
         assert_eq!(m.requests_total, 50_000);
         assert_eq!(m.recent.len(), RECENT_CAP);
+    }
+
+    #[test]
+    fn aggregate_bounds_recent_lifecycle_state_under_high_cardinality() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-metrics-lifecycle-cardinality-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+        const REQUESTS: u64 = 2_000;
+
+        for i in 0..REQUESTS {
+            writeln!(
+                f,
+                r#"{{"ts_ms":{i},"action":"request","request_id":"req-{i}","masked":1,"detectors":["aws_key"],"bytes_in":1,"bytes_out":1}}"#
+            )
+            .unwrap();
+            writeln!(f, r#"{{"action":"unmask","request_id":"req-{i}"}}"#).unwrap();
+            writeln!(
+                f,
+                r#"{{"action":"output_secret","detector":"aws_key","request_id":"req-{i}"}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"action":"request_blocked","request_id":"req-{i}"}}"#
+            )
+            .unwrap();
+            writeln!(
+                f,
+                r#"{{"action":"stream_interrupted","request_id":"req-{i}"}}"#
+            )
+            .unwrap();
+        }
+        f.flush().unwrap();
+        drop(f);
+
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(m.requests_total, REQUESTS);
+        assert_eq!(m.secrets_restored_total, REQUESTS);
+        assert_eq!(m.output_secrets_total, REQUESTS);
+        assert_eq!(m.requests_blocked_total, REQUESTS);
+        assert_eq!(m.stream_interruptions_total, REQUESTS);
+        assert_eq!(m.failures_total, REQUESTS);
+        assert_eq!(m.recent.len(), RECENT_CAP);
+        assert_eq!(m.recent[0].request_id, "req-1999");
+        assert_eq!(m.recent[RECENT_CAP - 1].request_id, "req-1980");
+        assert!(m.recent.iter().all(|request| request.blocked
+            && request.interrupted
+            && request.restored == 1
+            && request.output_secrets == 1
+            && request.failures == 1));
+    }
+
+    #[test]
+    fn aggregate_caps_untrusted_detector_cardinality() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-metrics-detector-cardinality-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let mut f = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+
+        for i in 0..(DETECTOR_CARDINALITY_CAP + 100) {
+            writeln!(
+                f,
+                r#"{{"action":"mask","detector":"detector_{i}","request_id":"req"}}"#
+            )
+            .unwrap();
+        }
+        f.flush().unwrap();
+        drop(f);
+
+        let m = aggregate(&path);
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            m.secrets_masked_total,
+            (DETECTOR_CARDINALITY_CAP + 100) as u64
+        );
+        assert_eq!(m.by_detector.len(), DETECTOR_CARDINALITY_CAP);
     }
 
     #[test]

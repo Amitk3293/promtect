@@ -262,3 +262,59 @@ async fn api_metrics_reports_strict_restore_mode_truthfully() {
 
     assert_eq!(json["restore_enabled"].as_bool(), Some(false));
 }
+
+#[tokio::test]
+async fn api_metrics_skips_oversized_records_and_keeps_recent_lifecycle() {
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-dashboard-bounded-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let mut f = std::io::BufWriter::new(
+        std::fs::File::create(&audit_path).expect("create bounded dashboard audit"),
+    );
+
+    for i in 0u64..100 {
+        writeln!(
+            f,
+            r#"{{"ts_ms":{i},"action":"request","request_id":"req-{i}","masked":1,"detectors":["aws_key"],"bytes_in":1,"bytes_out":1}}"#
+        )
+        .unwrap();
+        writeln!(f, r#"{{"action":"unmask","request_id":"req-{i}"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"action":"stream_interrupted","request_id":"req-{i}"}}"#
+        )
+        .unwrap();
+    }
+    let oversized = serde_json::json!({
+        "ts_ms": 1_000,
+        "action": "request",
+        "request_id": "must-be-skipped",
+        "masked": 0,
+        "detectors": [],
+        "bytes_in": 1,
+        "bytes_out": 1,
+        "padding": "x".repeat(64 * 1024),
+    });
+    writeln!(f, "{oversized}").unwrap();
+    f.flush().unwrap();
+    drop(f);
+
+    let base = spawn_dashboard(audit_path.clone()).await;
+    let response = reqwest::get(format!("{base}/api/metrics"))
+        .await
+        .expect("GET bounded metrics");
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.expect("read bounded metrics");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("parse bounded metrics");
+    std::fs::remove_file(&audit_path).ok();
+
+    assert_eq!(json["requests_total"].as_u64(), Some(100));
+    let recent = json["recent"].as_array().expect("recent array");
+    assert_eq!(recent.len(), 20);
+    assert_eq!(recent[0]["request_id"].as_str(), Some("req-99"));
+    assert_eq!(recent[19]["request_id"].as_str(), Some("req-80"));
+    assert_eq!(recent[0]["restored"].as_u64(), Some(1));
+    assert_eq!(recent[0]["failures"].as_u64(), Some(1));
+    assert_eq!(recent[0]["interrupted"].as_bool(), Some(true));
+}
