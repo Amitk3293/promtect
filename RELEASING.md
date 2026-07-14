@@ -18,10 +18,14 @@ Before the first public release:
   boolean `true`, and **Allow administrators to bypass configured protection
   rules** must be disabled. The workflows also require exact typed confirmation;
   environment protection is the human authorization boundary.
-- Configure an active repository ruleset for `refs/tags/v*` that restricts tag
-  creation to release operators and prevents tag updates and deletion. The
+- Configure two active repository rulesets for `refs/tags/v*`. The first must
+  restrict creation and list only the approved release operators as `always`
+  bypass actors. The second must restrict updates and deletion with **no bypass
+  actors**. GitHub bypass is ruleset-wide, so combining creation and immutability
+  would also let creation operators bypass update/deletion protection. The
   workflows re-fetch and compare both the annotated tag object ID and commit
-  after every environment wait, but the ruleset is the preventive control.
+  after every environment wait, but the separate rulesets are the preventive
+  controls.
 - Require the full staging suite and independent `/code-review` before promotion
   to `main`. A staging-to-main promotion must contain no unreviewed changes.
 - Keep release tags annotated. Signed tags are preferred when the release
@@ -30,7 +34,7 @@ Before the first public release:
 - Add a read-only fine-grained `RELEASE_READINESS_TOKEN` Actions secret that can
   inspect environments and repository rulesets. Add repository variables
   `RELEASE_REVIEWERS` and `RELEASE_BYPASS_ACTORS` containing
-  the exact approved GitHub actor types and numeric IDs as comma-separated
+  the exact approved tag-creation operator types and numeric IDs as comma-separated
   `Type:id` entries (for example, `User:123` or `RepositoryRole:5`). The workflows
   compare both fields so a same-number actor of another type cannot satisfy the
   gate. They only issue GET requests with this token; control provisioning
@@ -46,8 +50,9 @@ Before the first public release:
   {"schema_version":1,"repository":"Amitk3293/promtect","source":"github-environment-settings-ui","evidence_reference":"https://github.com/Amitk3293/promtect/issues/ISSUE#issuecomment-COMMENT","evidence_sha256":"64-lowercase-hex-characters","recorded_by_reviewer_type":"User","recorded_by_reviewer_id":123,"recorded_at":"2026-07-13T19:00:00Z","expires_at":"2026-07-13T20:00:00Z","environments":{"core-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"},"core-container-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"}}}
   ```
 
-Both publication workflows verify every API-visible control before a protected
-environment is referenced, so a missing environment cannot be silently
+Both publication workflows verify the required API-visible controls described
+above before a protected environment is referenced, so a missing environment
+cannot be silently
 auto-created as the authorization boundary. They verify the same state again
 immediately after approval and before any release or package mutation. A future
 API administrator-bypass field must be the exact boolean `false`; any other
@@ -150,13 +155,15 @@ finish after a newer version and move GitHub's `latest` marker backwards.
 
 After approval, the job checks out the already validated commit, re-fetches the
 remote annotated tag, and requires both its tag object ID and target commit to
-remain unchanged. It downloads and reverifies the same-run artifact, creates
-GitHub build-provenance attestations, and normalizes an existing draft to a
-deterministic title and marker-bound body before any upload. It rejects
-unexpected draft assets, prerelease state, or metadata drift. It revalidates the
-tag, complete asset set, deterministic metadata, downloaded assets, and target
-again before making the release public and marking it as GitHub's latest stable
-release. It refuses to replace an existing published release.
+remain unchanged. It downloads and reverifies the same-run artifact and creates
+GitHub build-provenance attestations. An existing unpublished draft may have its
+title, body, and prerelease state normalized, but only after the preflight binds
+it to the reviewed tag/source and rejects a published release or unexpected
+assets. The normalized draft is then verified against deterministic metadata
+before upload. The job revalidates the tag, complete asset set, downloaded
+assets, and target again before making the release public and marking it as
+GitHub's latest stable release. It refuses to replace an existing published
+release.
 
 Do not delete or replace a published asset. If an artifact is wrong, fix the
 problem and publish a new patch version.

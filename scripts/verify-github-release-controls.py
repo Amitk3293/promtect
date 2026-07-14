@@ -221,54 +221,76 @@ def verify_environment(
         fail(f"{name} deployment access must be restricted to the main branch")
 
 
-def verify_tag_ruleset(
+def tag_ruleset_scope(ruleset: dict[str, Any]) -> set[str] | None:
+    if ruleset.get("target") != "tag" or ruleset.get("enforcement") != "active":
+        return None
+    conditions = ruleset.get("conditions")
+    ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
+    includes = ref_name.get("include") if isinstance(ref_name, dict) else None
+    excludes = ref_name.get("exclude") if isinstance(ref_name, dict) else None
+    if not isinstance(includes, list) or "refs/tags/v*" not in includes:
+        return None
+    if excludes != []:
+        return None
+    rules = ruleset.get("rules")
+    if not isinstance(rules, list):
+        return None
+    return {rule.get("type") for rule in rules if isinstance(rule, dict)}
+
+
+def verify_tag_rulesets(
     rulesets: list[dict[str, Any]], expected_bypass_actors: set[tuple[str, int]]
 ) -> None:
-    required_rules = {"creation", "update", "deletion"}
+    creation_verified = False
+    immutability_verified = False
     for ruleset in rulesets:
-        if ruleset.get("target") != "tag" or ruleset.get("enforcement") != "active":
+        rule_types = tag_ruleset_scope(ruleset)
+        if rule_types is None:
             continue
-        conditions = ruleset.get("conditions")
-        ref_name = conditions.get("ref_name") if isinstance(conditions, dict) else None
-        includes = ref_name.get("include") if isinstance(ref_name, dict) else None
-        excludes = ref_name.get("exclude") if isinstance(ref_name, dict) else None
-        if not isinstance(includes, list) or "refs/tags/v*" not in includes:
-            continue
-        if excludes != []:
-            continue
-        rules = ruleset.get("rules")
-        if not isinstance(rules, list):
-            continue
-        rule_types = {
-            rule.get("type") for rule in rules if isinstance(rule, dict)
-        }
         bypass_actors = ruleset.get("bypass_actors")
-        if not isinstance(bypass_actors, list) or not bypass_actors:
+        if not isinstance(bypass_actors, list):
             continue
-        if len(bypass_actors) != len(expected_bypass_actors):
-            continue
-        if not all(
-            isinstance(actor, dict)
-            and isinstance(actor.get("actor_id"), int)
-            and actor.get("actor_type")
-            in {"Integration", "RepositoryRole", "Team", "User"}
-            and actor.get("bypass_mode") == "always"
-            for actor in bypass_actors
+
+        if (
+            "creation" in rule_types
+            and "update" not in rule_types
+            and "deletion" not in rule_types
+            and len(bypass_actors) == len(expected_bypass_actors)
+            and all(
+                isinstance(actor, dict)
+                and isinstance(actor.get("actor_id"), int)
+                and actor.get("actor_type")
+                in {"Integration", "RepositoryRole", "Team", "User"}
+                and actor.get("bypass_mode") == "always"
+                for actor in bypass_actors
+            )
         ):
-            continue
-        actual_actors = {
-            (actor.get("actor_type"), actor.get("actor_id"))
-            for actor in bypass_actors
-            if isinstance(actor.get("actor_id"), int)
-        }
-        if actual_actors != expected_bypass_actors:
-            continue
-        if required_rules.issubset(rule_types):
-            return
-    fail(
-        "no active refs/tags/v* ruleset blocks creation, updates, and deletion "
-        "for everyone except explicit always-bypass release operators"
-    )
+            actual_actors = {
+                (actor.get("actor_type"), actor.get("actor_id"))
+                for actor in bypass_actors
+                if isinstance(actor.get("actor_id"), int)
+            }
+            creation_verified = (
+                creation_verified or actual_actors == expected_bypass_actors
+            )
+
+        if (
+            {"update", "deletion"}.issubset(rule_types)
+            and "creation" not in rule_types
+            and bypass_actors == []
+        ):
+            immutability_verified = True
+
+    if not creation_verified:
+        fail(
+            "no active refs/tags/v* creation-only ruleset permits exactly the "
+            "approved always-bypass release operators"
+        )
+    if not immutability_verified:
+        fail(
+            "no separate active refs/tags/v* ruleset blocks tag updates and "
+            "deletion without bypass actors"
+        )
 
 
 parser = argparse.ArgumentParser()
@@ -286,7 +308,7 @@ args = parser.parse_args()
 
 expected_bypass_actors = parse_actor_set(
     args.expected_bypass_actors,
-    "expected release-operator bypass actors",
+    "expected tag-creation operator bypass actors",
     {"Integration", "RepositoryRole", "Team", "User"},
 )
 expected_reviewers = parse_actor_set(
@@ -326,5 +348,8 @@ verify_environment(
     args.repository,
     now,
 )
-verify_tag_ruleset(load_rulesets(args.rulesets), expected_bypass_actors)
-print("release controls verified: environments, reviewers, main-only access, tag ruleset")
+verify_tag_rulesets(load_rulesets(args.rulesets), expected_bypass_actors)
+print(
+    "release controls verified: environments, reviewers, main-only access, "
+    "tag creation and immutable-tag rulesets"
+)

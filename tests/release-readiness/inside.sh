@@ -489,8 +489,15 @@ cat > "$root/tag-rulesets.json" <<'JSON'
     "target": "tag",
     "enforcement": "active",
     "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
-    "rules": [{"type":"creation"},{"type":"update"},{"type":"deletion"}],
+    "rules": [{"type":"creation"}],
     "bypass_actors": [{"actor_id":42,"actor_type":"RepositoryRole","bypass_mode":"always"}]
+  },
+  {
+    "target": "tag",
+    "enforcement": "active",
+    "conditions": {"ref_name": {"include": ["refs/tags/v*"], "exclude": []}},
+    "rules": [{"type":"update"},{"type":"deletion"}],
+    "bypass_actors": []
   }
 ]
 JSON
@@ -543,6 +550,51 @@ if python3 scripts/verify-github-release-controls.py \
   echo "same-ID bypass actor of the wrong type passed verification" >&2
   exit 1
 fi
+
+python3 - "$root/tag-rulesets.json" "$root" <<'PY'
+import json
+import os
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    original = json.load(handle)
+
+combined = json.loads(json.dumps(original[0]))
+combined["rules"] = [
+    {"type": "creation"},
+    {"type": "update"},
+    {"type": "deletion"},
+]
+with open(os.path.join(sys.argv[2], "combined-tag-ruleset.json"), "w", encoding="utf-8") as handle:
+    json.dump([combined], handle)
+
+immutability_bypass = json.loads(json.dumps(original))
+immutability_bypass[1]["bypass_actors"] = json.loads(
+    json.dumps(immutability_bypass[0]["bypass_actors"])
+)
+with open(
+    os.path.join(sys.argv[2], "immutability-bypass-rulesets.json"),
+    "w",
+    encoding="utf-8",
+) as handle:
+    json.dump(immutability_bypass, handle)
+PY
+for unsafe_rulesets in combined-tag-ruleset immutability-bypass-rulesets; do
+  if python3 scripts/verify-github-release-controls.py \
+    --core-release "$root/core-release.json" \
+    --core-release-policies "$root/main-policy.json" \
+    --core-container-release "$root/core-container-release.json" \
+    --core-container-release-policies "$root/main-policy.json" \
+    --rulesets "$root/${unsafe_rulesets}.json" \
+    --expected-bypass-actors RepositoryRole:42 \
+    --expected-reviewers User:42 \
+    --repository Amitk3293/promtect \
+    --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+    --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
+    echo "unsafe tag ruleset layout ${unsafe_rulesets} passed verification" >&2
+    exit 1
+  fi
+done
 
 python3 - "$root/core-release.json" "$root" <<'PY'
 import json
@@ -819,6 +871,10 @@ assert "--resume-digest \"$PUBLISH_DIGEST\"" in container
 assert "require_absent_or_same" in container
 assert "--expected-digest" in container
 assert "imagetools inspect" in container
+create_aliases = container.index("docker buildx imagetools create")
+prefer_exact_digest = container.index("--prefer-index=false", create_aliases)
+first_alias = container.index('--tag "$image:$version"', create_aliases)
+assert create_aliases < prefer_exact_digest < first_alias
 assert "Persist digest before any customer-facing tag write" in container
 assert "container-digest-state.py" in container
 assert "record_needed=false" in container

@@ -270,6 +270,7 @@ jobs:
           fi
 
           docker buildx imagetools create \
+            --prefer-index=false \
             --tag "$image:$version" \
             --tag "$image:$TAG" \
             --tag "$image:$rolling" \
