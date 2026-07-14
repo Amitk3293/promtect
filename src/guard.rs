@@ -2345,6 +2345,59 @@ mod tests {
         assert!(require_foreground_guard(Pid::from_raw(1200), Pid::from_raw(1200)).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminal_checks_accept_ebadf_when_stdin_closes_after_runtime_start() {
+        const CHILD_ENV: &str = "PROMTECT_TEST_GUARD_EBADF_CHILD";
+        const TEST_NAME: &str =
+            "guard::tests::terminal_checks_accept_ebadf_when_stdin_closes_after_runtime_start";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("locate current test executable"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("run isolated EBADF child");
+            assert!(
+                output.status.success(),
+                "isolated EBADF child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build isolated Tokio runtime");
+        runtime.block_on(async {
+            tokio::task::yield_now().await;
+            // SAFETY: This process exists only for this regression. Closing its
+            // stdin immediately before both calls guarantees tcgetpgrp observes
+            // EBADF after Tokio has already initialized its runtime descriptors.
+            let closed = unsafe { nix::libc::close(nix::libc::STDIN_FILENO) };
+            assert_eq!(closed, 0, "close isolated child stdin");
+            // SAFETY: F_GETFD only inspects the numeric descriptor. The -1 plus
+            // EBADF assertion proves no runtime operation reopened fd 0.
+            let descriptor_state =
+                unsafe { nix::libc::fcntl(nix::libc::STDIN_FILENO, nix::libc::F_GETFD) };
+            assert_eq!(descriptor_state, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(nix::libc::EBADF)
+            );
+            assert!(preflight_guard_terminal().is_ok());
+            assert!(
+                GuardTerminalLease::acquire(std::process::id())
+                    .expect("EBADF is a headless terminal state")
+                    .is_none()
+            );
+        });
+    }
+
     #[test]
     fn stale_stub_detection() {
         // ephemeral ports → stale

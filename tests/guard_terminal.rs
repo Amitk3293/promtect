@@ -8,7 +8,7 @@ fn guard_exec_accepts_closed_stdin() {
     command.args([
         "guard",
         "--exec",
-        "/bin/true",
+        "true",
         "--base-var",
         "PROMTECT_TEST_BASE_URL",
         "--",
