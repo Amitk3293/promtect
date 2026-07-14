@@ -6,6 +6,7 @@ git config --global --add safe.directory /work
 
 version="$(awk -F '"' '/^version = "/ { print $2; exit }' Cargo.toml)"
 tag="v${version}"
+source_sha="$(git rev-parse HEAD)"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 output="${PROMTECT_RELEASE_TEST_OUTPUT:-$root}"
@@ -54,13 +55,31 @@ if bash scripts/package-release.sh "$tag" "$wrong_target" "$binary" "$root/wrong
 fi
 
 PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
-  bash scripts/verify-release-assets.sh "$tag" "$first"
+  bash scripts/verify-release-assets.sh "$tag" "$first" "$source_sha"
+if PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
+  bash scripts/verify-release-assets.sh \
+    "$tag" "$first" ffffffffffffffffffffffffffffffffffffffff \
+    >/dev/null 2>&1; then
+  echo "wrong validated source SHA passed release asset verification" >&2
+  exit 1
+fi
 PROMTECT_ASSET_DIR="$first" bash scripts/update-formula.sh "$tag" \
   > "$root/promtect.rb"
 grep -q "version \"${version}\"" "$root/promtect.rb"
 grep -q "license :cannot_represent" "$root/promtect.rb"
 if grep -qi "promtect-pro" "$root/promtect.rb"; then
   echo "formula references paid artifacts" >&2
+  exit 1
+fi
+if PROMTECT_ASSET_DIR="$first" \
+  bash scripts/update-formula.sh 'v1.2.3";system("unsafe")' \
+  >/dev/null 2>&1; then
+  echo "invalid formula tag passed validation" >&2
+  exit 1
+fi
+if PROMTECT_ASSET_DIR="$first" PROMTECT_REPO='owner/repo";system("unsafe")' \
+  bash scripts/update-formula.sh "$tag" >/dev/null 2>&1; then
+  echo "invalid formula repository passed validation" >&2
   exit 1
 fi
 
@@ -75,7 +94,8 @@ tampered="$root/tampered"
 cp -a "$first" "$tampered"
 printf 'tampered' >> "$tampered/promtect-${tag}-x86_64-unknown-linux-gnu.tar.gz"
 if PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
-  bash scripts/verify-release-assets.sh "$tag" "$tampered" >/dev/null 2>&1; then
+  bash scripts/verify-release-assets.sh \
+    "$tag" "$tampered" "$source_sha" >/dev/null 2>&1; then
   echo "tampered archive passed verification" >&2
   exit 1
 fi
@@ -106,7 +126,8 @@ PY
     > "promtect-${tag}-x86_64-unknown-linux-gnu.tar.gz.sha256"
 )
 if PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
-  bash scripts/verify-release-assets.sh "$tag" "$unsafe" >/dev/null 2>&1; then
+  bash scripts/verify-release-assets.sh \
+    "$tag" "$unsafe" "$source_sha" >/dev/null 2>&1; then
   echo "unsafe archive passed verification" >&2
   exit 1
 fi
@@ -163,6 +184,41 @@ if python3 scripts/check-ghcr-tags.py v1.2.4 "$root/ghcr-split-provenance.json" 
   echo "split GHCR rolling provenance passed verification" >&2
   exit 1
 fi
+
+cat > "$root/ghcr-partial-resume.json" <<JSON
+[[
+  {"name":"$digest_a","metadata":{"container":{"tags":["1.2.3","v1.2.3","1.2"]}}},
+  {"name":"$digest_b","metadata":{"container":{"tags":["1.2.4"]}}}
+]]
+JSON
+python3 scripts/check-ghcr-tags.py v1.2.4 "$root/ghcr-partial-resume.json" \
+  --resume-digest "$digest_b" --state-output "$root/ghcr-resume-state.json"
+python3 - "$root/ghcr-resume-state.json" "$digest_a" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    state = json.load(handle)
+assert state == {"rolling": "1.2", "rolling_digest": sys.argv[2]}
+PY
+if python3 scripts/check-ghcr-tags.py v1.2.4 "$root/ghcr-partial-resume.json" \
+  >/dev/null 2>&1; then
+  echo "partial GHCR publication passed without an exact resume digest" >&2
+  exit 1
+fi
+if python3 scripts/check-ghcr-tags.py v1.2.4 "$root/ghcr-partial-resume.json" \
+  --resume-digest "$digest_a" >/dev/null 2>&1; then
+  echo "partial GHCR publication resumed from the wrong digest" >&2
+  exit 1
+fi
+cat > "$root/ghcr-partial-rolling-resume.json" <<JSON
+[[
+  {"name":"$digest_a","metadata":{"container":{"tags":["1.2.3","v1.2.3"]}}},
+  {"name":"$digest_b","metadata":{"container":{"tags":["1.2.4","1.2"]}}}
+]]
+JSON
+python3 scripts/check-ghcr-tags.py v1.2.4 \
+  "$root/ghcr-partial-rolling-resume.json" --resume-digest "$digest_b"
 
 cat > "$root/ghcr-stale-rolling.json" <<JSON
 [[
@@ -349,6 +405,7 @@ cat > "$root/admin-bypass-evidence.json" <<'JSON'
   "source": "github-environment-settings-ui",
   "evidence_reference": "https://github.com/Amitk3293/promtect/issues/88#issuecomment-manual-gate",
   "evidence_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "recorded_by_reviewer_type": "User",
   "recorded_by_reviewer_id": 42,
   "recorded_at": "2026-07-13T19:00:00Z",
   "expires_at": "2026-07-13T20:00:00Z",
@@ -386,13 +443,49 @@ controls_args=(
   --core-container-release "$root/core-container-release.json"
   --core-container-release-policies "$root/main-policy.json"
   --rulesets "$root/tag-rulesets.json"
-  --expected-bypass-actor-ids 42
-  --expected-reviewer-ids 42
+  --expected-bypass-actors RepositoryRole:42
+  --expected-reviewers User:42
   --repository Amitk3293/promtect
   --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json"
   --now 2026-07-13T19:30:00Z
 )
 python3 scripts/verify-github-release-controls.py "${controls_args[@]}"
+
+sed 's/"type": "User"/"type": "Team"/' "$root/core-release.json" \
+  > "$root/wrong-reviewer-type-core.json"
+sed 's/core-release/core-container-release/' "$root/wrong-reviewer-type-core.json" \
+  > "$root/wrong-reviewer-type-container.json"
+if python3 scripts/verify-github-release-controls.py \
+  --core-release "$root/wrong-reviewer-type-core.json" \
+  --core-release-policies "$root/main-policy.json" \
+  --core-container-release "$root/wrong-reviewer-type-container.json" \
+  --core-container-release-policies "$root/main-policy.json" \
+  --rulesets "$root/tag-rulesets.json" \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
+  --repository Amitk3293/promtect \
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+  --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
+  echo "same-ID reviewer of the wrong actor type passed verification" >&2
+  exit 1
+fi
+
+sed 's/"actor_type":"RepositoryRole"/"actor_type":"User"/' \
+  "$root/tag-rulesets.json" > "$root/wrong-bypass-type.json"
+if python3 scripts/verify-github-release-controls.py \
+  --core-release "$root/core-release.json" \
+  --core-release-policies "$root/main-policy.json" \
+  --core-container-release "$root/core-container-release.json" \
+  --core-container-release-policies "$root/main-policy.json" \
+  --rulesets "$root/wrong-bypass-type.json" \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
+  --repository Amitk3293/promtect \
+  --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
+  --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
+  echo "same-ID bypass actor of the wrong type passed verification" >&2
+  exit 1
+fi
 
 python3 - "$root/core-release.json" "$root" <<'PY'
 import json
@@ -423,8 +516,8 @@ for self_review_variant in false missing null string; do
     --core-container-release "$root/core-container-release.json" \
     --core-container-release-policies "$root/main-policy.json" \
     --rulesets "$root/tag-rulesets.json" \
-    --expected-bypass-actor-ids 42 \
-    --expected-reviewer-ids 42 \
+    --expected-bypass-actors RepositoryRole:42 \
+    --expected-reviewers User:42 \
     --repository Amitk3293/promtect \
     --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
     --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
@@ -451,8 +544,8 @@ python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/programmatic-container.json" \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/tag-rulesets.json" \
-  --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
   --repository Amitk3293/promtect
 
 for admin_bypass_variant in true null string; do
@@ -474,8 +567,8 @@ PY
     --core-container-release "$root/programmatic-container.json" \
     --core-container-release-policies "$root/main-policy.json" \
     --rulesets "$root/tag-rulesets.json" \
-    --expected-bypass-actor-ids 42 \
-    --expected-reviewer-ids 42 \
+    --expected-bypass-actors RepositoryRole:42 \
+    --expected-reviewers User:42 \
     --repository Amitk3293/promtect >/dev/null 2>&1; then
     echo "administrator bypass ${admin_bypass_variant} passed verification" >&2
     exit 1
@@ -488,8 +581,8 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/core-container-release.json" \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/tag-rulesets.json" \
-  --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
   --repository Amitk3293/promtect \
   --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
   echo "missing manual administrator-bypass evidence passed verification" >&2
@@ -519,16 +612,21 @@ data["recorded_at"] = "2026-07-12T18:00:00Z"
 data["expires_at"] = "2026-07-12T19:00:00Z"
 with open(os.path.join(sys.argv[2], "manual-bypass-expired.json"), "w", encoding="utf-8") as handle:
     json.dump(data, handle)
+
+data = json.loads(json.dumps(original))
+data["recorded_by_reviewer_type"] = "Team"
+with open(os.path.join(sys.argv[2], "manual-bypass-reviewer-type.json"), "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
 PY
-for evidence_variant in enabled stale-config expired; do
+for evidence_variant in enabled stale-config expired reviewer-type; do
   if python3 scripts/verify-github-release-controls.py \
     --core-release "$root/core-release.json" \
     --core-release-policies "$root/main-policy.json" \
     --core-container-release "$root/core-container-release.json" \
     --core-container-release-policies "$root/main-policy.json" \
     --rulesets "$root/tag-rulesets.json" \
-    --expected-bypass-actor-ids 42 \
-    --expected-reviewer-ids 42 \
+    --expected-bypass-actors RepositoryRole:42 \
+    --expected-reviewers User:42 \
     --repository Amitk3293/promtect \
     --manual-admin-bypass-evidence "$root/manual-bypass-${evidence_variant}.json" \
     --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
@@ -553,8 +651,8 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/core-container-release.json" \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/tag-rulesets.json" \
-  --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
   --repository Amitk3293/promtect \
   --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
   --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
@@ -570,8 +668,8 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/core-container-release.json" \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/excluding-tag-ruleset.json" \
-  --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
   --repository Amitk3293/promtect \
   --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
   --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
@@ -587,8 +685,8 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/core-container-release.json" \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/tag-rulesets.json" \
-  --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
   --repository Amitk3293/promtect \
   --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
   --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
@@ -604,8 +702,8 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/core-container-release.json" \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/mutable-tag-ruleset.json" \
-  --expected-bypass-actor-ids 42 \
-  --expected-reviewer-ids 42 \
+  --expected-bypass-actors RepositoryRole:42 \
+  --expected-reviewers User:42 \
   --repository Amitk3293/promtect \
   --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
   --now 2026-07-13T19:30:00Z >/dev/null 2>&1; then
@@ -619,8 +717,8 @@ if python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/core-container-release.json" \
   --core-container-release-policies "$root/main-policy.json" \
   --rulesets "$root/tag-rulesets.json" \
-  --expected-bypass-actor-ids 99 \
-  --expected-reviewer-ids 42 \
+  --expected-bypass-actors RepositoryRole:99 \
+  --expected-reviewers User:42 \
   --repository Amitk3293/promtect \
   --manual-admin-bypass-evidence "$root/admin-bypass-evidence.json" \
   --now 2026-07-13T19:30:00Z \
@@ -650,6 +748,8 @@ assert release.index("release-controls:") < release.index("environment: core-rel
 assert container.index("release-controls:") < container.index(
     "environment: core-container-release"
 )
+assert "group: core-release-${{ inputs.tag }}" not in release
+assert "group: core-release\n" in release
 for workflow in (release, container):
     assert '"refs/heads/main"' in workflow
     assert "Recheck controls after environment approval" in workflow
@@ -658,9 +758,16 @@ assert "--normalization-candidate" in release
 assert "--assets-subset" in release
 assert "isDraft,isPrerelease,name,body,assets,tagName,targetCommitish" in release
 assert "push-by-digest=true" in container
-assert "require_absent" in container
+assert "--resume-digest \"$PUSHED_DIGEST\"" in container
+assert "require_absent_or_same" in container
 assert "--expected-digest" in container
 assert "imagetools inspect" in container
+for workflow in (release, container):
+    assert '[ "$sha" = "$WORKFLOW_SHA" ]' in workflow
+for runner in ("macos-15", "macos-15-intel", "ubuntu-22.04", "ubuntu-22.04-arm"):
+    assert f"os: {runner}" in release
+assert release.count("Smoke-test packaged native artifact") == 1
+assert '"$install_dir/promtect" selftest' in release
 PY
 
 remote="$root/tag-remote.git"

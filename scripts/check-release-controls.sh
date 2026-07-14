@@ -9,10 +9,10 @@ repository="${1:-${GITHUB_REPOSITORY:-}}"
   || fail "repository must be owner/name"
 [ -n "${GH_TOKEN:-}" ] \
   || fail "GH_TOKEN with read access to environments and rulesets is required"
-[ -n "${PROMTECT_RELEASE_BYPASS_ACTOR_IDS:-}" ] \
-  || fail "PROMTECT_RELEASE_BYPASS_ACTOR_IDS is required"
-[ -n "${PROMTECT_RELEASE_REVIEWER_IDS:-}" ] \
-  || fail "PROMTECT_RELEASE_REVIEWER_IDS is required"
+[ -n "${PROMTECT_RELEASE_BYPASS_ACTORS:-}" ] \
+  || fail "PROMTECT_RELEASE_BYPASS_ACTORS is required"
+[ -n "${PROMTECT_RELEASE_REVIEWERS:-}" ] \
+  || fail "PROMTECT_RELEASE_REVIEWERS is required"
 root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 evidence_args=()
@@ -76,7 +76,7 @@ python3 scripts/verify-github-release-controls.py \
   --core-container-release "$root/core-container-release.json" \
   --core-container-release-policies "$root/core-container-release-policies.json" \
   --rulesets "$root/rulesets.json" \
-  --expected-bypass-actor-ids "$PROMTECT_RELEASE_BYPASS_ACTOR_IDS" \
-  --expected-reviewer-ids "$PROMTECT_RELEASE_REVIEWER_IDS" \
+  --expected-bypass-actors "$PROMTECT_RELEASE_BYPASS_ACTORS" \
+  --expected-reviewers "$PROMTECT_RELEASE_REVIEWERS" \
   --repository "$repository" \
   "${evidence_args[@]}"

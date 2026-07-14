@@ -25,7 +25,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: core-release-${{ inputs.tag }}
+  # Serialize every Core release run. Per-tag locks would let two versions race
+  # and allow the older run to finish last and move GitHub's `latest` marker back.
+  group: core-release
   cancel-in-progress: false
 
 env:
@@ -63,6 +65,8 @@ jobs:
           [ "$(git cat-file -t "refs/tags/${TAG}")" = "tag" ] \
             || { echo "release tag must be annotated" >&2; exit 1; }
           sha="$(git rev-parse "${TAG}^{commit}")"
+          [ "$sha" = "$WORKFLOW_SHA" ] \
+            || { echo "release tag must point at the exact reviewed main workflow commit" >&2; exit 1; }
           git merge-base --is-ancestor "$sha" "$main_ref" \
             || { echo "tag is not contained in main" >&2; exit 1; }
           version="$(git show "${sha}:Cargo.toml" | awk -F '"' '/^version = "/ { print $2; exit }')"
@@ -85,8 +89,8 @@ jobs:
       - name: Fail closed unless release controls already exist
         env:
           GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
-          PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
-          PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
+          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
           PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
         run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
 
@@ -106,10 +110,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos-latest, target: x86_64-apple-darwin }
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15, target: aarch64-apple-darwin }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -122,12 +126,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: release-${{ matrix.target }}
-      - name: Install aarch64 Linux cross-linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
       - name: Build locked Core binary
         run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Package immutable candidate
@@ -138,6 +136,16 @@ jobs:
             "${{ matrix.target }}" \
             "target/${{ matrix.target }}/release/promtect" \
             dist
+      - name: Smoke-test packaged native artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          install_dir="$(mktemp -d)"
+          trap 'rm -rf "$install_dir"' EXIT
+          tar -xzf "dist/promtect-${TAG}-${{ matrix.target }}.tar.gz" \
+            -C "$install_dir"
+          [ "$("$install_dir/promtect" --version)" = "promtect ${TAG#v}" ]
+          "$install_dir/promtect" selftest | grep -q "PASS"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: core-${{ matrix.target }}
@@ -161,7 +169,9 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Verify complete release set
-        run: bash scripts/verify-release-assets.sh "$TAG" dist
+        run: |
+          bash scripts/verify-release-assets.sh \
+            "$TAG" dist "${{ needs.validate.outputs.source_sha }}"
       - name: Generate reviewable Homebrew candidate
         env:
           PROMTECT_ASSET_DIR: dist
@@ -209,8 +219,8 @@ jobs:
       - name: Recheck controls after environment approval
         env:
           GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
-          PROMTECT_RELEASE_BYPASS_ACTOR_IDS: ${{ vars.RELEASE_BYPASS_ACTOR_IDS }}
-          PROMTECT_RELEASE_REVIEWER_IDS: ${{ vars.RELEASE_REVIEWER_IDS }}
+          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
+          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
           PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
         run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
       - name: Require exact publication confirmation
@@ -231,7 +241,7 @@ jobs:
       - name: Reverify same-run approved candidate
         run: |
           echo "approved candidate artifact digest: $CANDIDATE_DIGEST"
-          bash scripts/verify-release-assets.sh "$TAG" dist
+          bash scripts/verify-release-assets.sh "$TAG" dist "$SOURCE_SHA"
       - name: Attest Core archives
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
@@ -288,7 +298,7 @@ jobs:
           trap 'rm -rf "$verify_dir"' EXIT
           gh release download "$TAG" --dir "$verify_dir" \
             --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
-          bash scripts/verify-release-assets.sh "$TAG" "$verify_dir"
+          bash scripts/verify-release-assets.sh "$TAG" "$verify_dir" "$SOURCE_SHA"
           bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
           gh release edit "$TAG" --draft \
             --target "$SOURCE_SHA" \

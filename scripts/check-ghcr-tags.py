@@ -16,8 +16,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument("tag")
 parser.add_argument("versions_path")
 parser.add_argument("--expected-digest")
+parser.add_argument("--resume-digest")
 parser.add_argument("--state-output", type=Path)
 args = parser.parse_args()
+
+if args.expected_digest is not None and args.resume_digest is not None:
+    fail("expected digest and resume digest are mutually exclusive")
 
 tag = args.tag
 match = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)", tag)
@@ -66,13 +70,19 @@ for record_tag, owners in owners_by_tag.items():
     if len(owners) != 1:
         fail(f"tag has multiple digest owners: {record_tag}")
 
+
+def normalize_digest(value: str, description: str) -> str:
+    normalized = value.removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{64}", normalized):
+        fail(f"{description} is invalid")
+    return normalized
+
+
 expected_digest = args.expected_digest
 if expected_digest is not None:
     if args.state_output is not None:
         fail("state output is only available during pre-publication verification")
-    normalized_expected = expected_digest.removeprefix("sha256:")
-    if not re.fullmatch(r"[0-9a-f]{64}", normalized_expected):
-        fail("expected pushed digest is invalid")
+    normalized_expected = normalize_digest(expected_digest, "expected pushed digest")
     pushed_tags = records_by_digest.get(normalized_expected)
     if pushed_tags is None:
         fail("pushed digest is absent from the package versions response")
@@ -90,15 +100,23 @@ if expected_digest is not None:
     print(f"GHCR push verified: {version}, {tag}, {rolling} -> sha256:{normalized_expected}")
     raise SystemExit(0)
 
+resume_digest = (
+    normalize_digest(args.resume_digest, "resume digest")
+    if args.resume_digest is not None
+    else None
+)
 for immutable in (version, tag):
-    if immutable in all_tags:
-        fail(f"immutable version tag already exists: {immutable}")
+    owners = owners_by_tag.get(immutable, [])
+    if not owners:
+        continue
+    if resume_digest is None or owners != [resume_digest]:
+        fail(f"immutable version tag already exists at another digest: {immutable}")
 
 if "latest" in all_tags:
     fail("deprecated latest tag still exists; remove it before publishing")
 
 same_line_patches: set[int] = set()
-for record_tags in records_by_digest.values():
+for digest, record_tags in records_by_digest.items():
     unprefixed: set[int] = set()
     prefixed: set[int] = set()
     for existing in record_tags:
@@ -107,6 +125,8 @@ for record_tags in records_by_digest.values():
             continue
         prefix, existing_major, existing_minor, existing_patch = existing_match.groups()
         if (int(existing_major), int(existing_minor)) != (major, minor):
+            continue
+        if int(existing_patch) == patch and digest == resume_digest:
             continue
         (prefixed if prefix else unprefixed).add(int(existing_patch))
     if unprefixed != prefixed:
@@ -126,20 +146,21 @@ if len(rolling_owners) > 1:
     fail(f"{rolling} has multiple digest owners")
 if rolling_owners:
     rolling_digest, rolling_tags = rolling_owners[0]
-    rolling_patches = {
-        int(existing_match.group(1))
-        for existing in rolling_tags
-        if (existing_match := re.fullmatch(rf"(?:v)?{major}\.{minor}\.(\d+)", existing))
-    }
-    if len(rolling_patches) != 1:
-        fail(f"cannot prove current {rolling} provenance from one immutable tag pair")
-    rolling_patch = next(iter(rolling_patches))
-    if not {f"{rolling}.{rolling_patch}", f"v{rolling}.{rolling_patch}"}.issubset(
-        rolling_tags
-    ):
-        fail(f"current {rolling} digest does not own its immutable tag pair")
-    if same_line_patches and rolling_patch != max(same_line_patches):
-        fail(f"{rolling} does not point to the highest immutable same-line patch")
+    if rolling_digest != resume_digest:
+        rolling_patches = {
+            int(existing_match.group(1))
+            for existing in rolling_tags
+            if (existing_match := re.fullmatch(rf"(?:v)?{major}\.{minor}\.(\d+)", existing))
+        }
+        if len(rolling_patches) != 1:
+            fail(f"cannot prove current {rolling} provenance from one immutable tag pair")
+        rolling_patch = next(iter(rolling_patches))
+        if not {f"{rolling}.{rolling_patch}", f"v{rolling}.{rolling_patch}"}.issubset(
+            rolling_tags
+        ):
+            fail(f"current {rolling} digest does not own its immutable tag pair")
+        if same_line_patches and rolling_patch != max(same_line_patches):
+            fail(f"{rolling} does not point to the highest immutable same-line patch")
 else:
     rolling_digest = None
 
@@ -158,4 +179,7 @@ if args.state_output is not None:
         encoding="utf-8",
     )
 
-print(f"GHCR tags safe to create: {version}, {tag}; {rolling} advances monotonically")
+message = f"GHCR tags safe to create: {version}, {tag}; {rolling} advances monotonically"
+if resume_digest is not None:
+    message += f"; same-digest resume sha256:{resume_digest} allowed"
+print(message)

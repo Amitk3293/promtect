@@ -13,6 +13,26 @@ def fail(message: str) -> None:
     raise SystemExit(f"release control verification error: {message}")
 
 
+def parse_actor_set(
+    value: str, description: str, allowed_types: set[str]
+) -> set[tuple[str, int]]:
+    actors: set[tuple[str, int]] = set()
+    for item in value.split(","):
+        parts = item.strip().split(":", 1)
+        if len(parts) != 2 or parts[0] not in allowed_types:
+            fail(f"{description} must use comma-separated Type:numeric-id entries")
+        actor_type, identifier_text = parts
+        if re.fullmatch(r"[1-9][0-9]*", identifier_text) is None:
+            fail(f"{description} contains an invalid numeric actor ID")
+        actor = (actor_type, int(identifier_text))
+        if actor in actors:
+            fail(f"{description} contains a duplicate actor")
+        actors.add(actor)
+    if not actors:
+        fail(f"at least one {description} entry is required")
+    return actors
+
+
 def load_object(path: Path, description: str) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -65,7 +85,7 @@ def verify_manual_admin_bypass_evidence(
     environment: dict[str, Any],
     evidence: dict[str, Any] | None,
     expected_repository: str,
-    expected_reviewer_ids: set[int],
+    expected_reviewers: set[tuple[str, int]],
     now: datetime,
 ) -> None:
     if evidence is None:
@@ -90,8 +110,11 @@ def verify_manual_admin_bypass_evidence(
         r"[0-9a-f]{64}", evidence_sha256
     ) is None:
         fail("manual administrator-bypass evidence SHA-256 is invalid")
-    reviewer_id = evidence.get("recorded_by_reviewer_id")
-    if reviewer_id not in expected_reviewer_ids:
+    reviewer = (
+        evidence.get("recorded_by_reviewer_type"),
+        evidence.get("recorded_by_reviewer_id"),
+    )
+    if reviewer not in expected_reviewers:
         fail("manual administrator-bypass evidence was recorded by an unapproved reviewer")
 
     recorded_at = parse_timestamp(evidence.get("recorded_at"), "evidence recorded_at")
@@ -121,7 +144,7 @@ def verify_environment(
     name: str,
     environment_path: Path,
     policies_path: Path,
-    expected_reviewer_ids: set[int],
+    expected_reviewers: set[tuple[str, int]],
     manual_admin_bypass_evidence: dict[str, Any] | None,
     expected_repository: str,
     now: datetime,
@@ -143,7 +166,7 @@ def verify_environment(
     reviewers = reviewer_rules[0].get("reviewers")
     if not isinstance(reviewers, list) or not reviewers:
         fail(f"{name} has no required reviewer")
-    if len(reviewers) != len(expected_reviewer_ids) or not all(
+    if len(reviewers) != len(expected_reviewers) or not all(
         isinstance(reviewer, dict)
         and reviewer.get("type") in {"User", "Team"}
         and isinstance(reviewer.get("reviewer"), dict)
@@ -151,14 +174,14 @@ def verify_environment(
         for reviewer in reviewers
     ):
         fail(f"{name} contains an invalid or duplicate required reviewer")
-    actual_reviewer_ids = {
-        reviewer.get("reviewer", {}).get("id")
+    actual_reviewers = {
+        (reviewer.get("type"), reviewer.get("reviewer", {}).get("id"))
         for reviewer in reviewers
         if isinstance(reviewer, dict)
         and isinstance(reviewer.get("reviewer"), dict)
         and isinstance(reviewer["reviewer"].get("id"), int)
     }
-    if actual_reviewer_ids != expected_reviewer_ids:
+    if actual_reviewers != expected_reviewers:
         fail(f"{name} required reviewers do not match the approved reviewer IDs")
     if reviewer_rules[0].get("prevent_self_review") is not True:
         fail(f"{name} must set prevent_self_review to boolean true")
@@ -173,7 +196,7 @@ def verify_environment(
             environment,
             manual_admin_bypass_evidence,
             expected_repository,
-            expected_reviewer_ids,
+            expected_reviewers,
             now,
         )
 
@@ -199,7 +222,7 @@ def verify_environment(
 
 
 def verify_tag_ruleset(
-    rulesets: list[dict[str, Any]], expected_bypass_actor_ids: set[int]
+    rulesets: list[dict[str, Any]], expected_bypass_actors: set[tuple[str, int]]
 ) -> None:
     required_rules = {"creation", "update", "deletion"}
     for ruleset in rulesets:
@@ -222,22 +245,23 @@ def verify_tag_ruleset(
         bypass_actors = ruleset.get("bypass_actors")
         if not isinstance(bypass_actors, list) or not bypass_actors:
             continue
-        if len(bypass_actors) != len(expected_bypass_actor_ids):
+        if len(bypass_actors) != len(expected_bypass_actors):
             continue
         if not all(
             isinstance(actor, dict)
             and isinstance(actor.get("actor_id"), int)
-            and isinstance(actor.get("actor_type"), str)
+            and actor.get("actor_type")
+            in {"Integration", "RepositoryRole", "Team", "User"}
             and actor.get("bypass_mode") == "always"
             for actor in bypass_actors
         ):
             continue
-        actual_actor_ids = {
-            actor.get("actor_id")
+        actual_actors = {
+            (actor.get("actor_type"), actor.get("actor_id"))
             for actor in bypass_actors
             if isinstance(actor.get("actor_id"), int)
         }
-        if actual_actor_ids != expected_bypass_actor_ids:
+        if actual_actors != expected_bypass_actors:
             continue
         if required_rules.issubset(rule_types):
             return
@@ -253,29 +277,23 @@ parser.add_argument("--core-release-policies", type=Path, required=True)
 parser.add_argument("--core-container-release", type=Path, required=True)
 parser.add_argument("--core-container-release-policies", type=Path, required=True)
 parser.add_argument("--rulesets", type=Path, required=True)
-parser.add_argument("--expected-bypass-actor-ids", required=True)
-parser.add_argument("--expected-reviewer-ids", required=True)
+parser.add_argument("--expected-bypass-actors", required=True)
+parser.add_argument("--expected-reviewers", required=True)
 parser.add_argument("--repository", required=True)
 parser.add_argument("--manual-admin-bypass-evidence", type=Path)
 parser.add_argument("--now")
 args = parser.parse_args()
 
-try:
-    expected_bypass_actor_ids = {
-        int(item) for item in args.expected_bypass_actor_ids.split(",") if item
-    }
-except ValueError:
-    fail("expected bypass actor IDs must be comma-separated integers")
-if not expected_bypass_actor_ids:
-    fail("at least one expected release-operator bypass actor ID is required")
-try:
-    expected_reviewer_ids = {
-        int(item) for item in args.expected_reviewer_ids.split(",") if item
-    }
-except ValueError:
-    fail("expected reviewer IDs must be comma-separated integers")
-if not expected_reviewer_ids:
-    fail("at least one expected release reviewer ID is required")
+expected_bypass_actors = parse_actor_set(
+    args.expected_bypass_actors,
+    "expected release-operator bypass actors",
+    {"Integration", "RepositoryRole", "Team", "User"},
+)
+expected_reviewers = parse_actor_set(
+    args.expected_reviewers,
+    "expected release reviewers",
+    {"Team", "User"},
+)
 if not args.repository or "/" not in args.repository:
     fail("repository must be owner/name")
 
@@ -294,7 +312,7 @@ verify_environment(
     "core-release",
     args.core_release,
     args.core_release_policies,
-    expected_reviewer_ids,
+    expected_reviewers,
     manual_admin_bypass_evidence,
     args.repository,
     now,
@@ -303,10 +321,10 @@ verify_environment(
     "core-container-release",
     args.core_container_release,
     args.core_container_release_policies,
-    expected_reviewer_ids,
+    expected_reviewers,
     manual_admin_bypass_evidence,
     args.repository,
     now,
 )
-verify_tag_ruleset(load_rulesets(args.rulesets), expected_bypass_actor_ids)
+verify_tag_ruleset(load_rulesets(args.rulesets), expected_bypass_actors)
 print("release controls verified: environments, reviewers, main-only access, tag ruleset")

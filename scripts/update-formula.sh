@@ -11,8 +11,12 @@
 set -euo pipefail
 
 tag="${1:?usage: update-formula.sh vX.Y.Z}"
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || { echo "tag must be a stable vX.Y.Z tag" >&2; exit 1; }
 ver="${tag#v}"
 repo="${PROMTECT_REPO:-Amitk3293/promtect}"
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+  || { echo "PROMTECT_REPO must be an owner/repository name" >&2; exit 1; }
 base="https://github.com/${repo}/releases/download/${tag}"
 
 # Pull the sha256 from a verified local candidate when PROMTECT_ASSET_DIR is

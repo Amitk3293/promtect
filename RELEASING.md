@@ -28,11 +28,13 @@ Before the first public release:
   operator has a configured signing identity; GitHub artifact attestations are
   mandatory for the four published archives.
 - Add a read-only fine-grained `RELEASE_READINESS_TOKEN` Actions secret that can
-  inspect environments and repository rulesets. Add comma-separated numeric
-  repository variables `RELEASE_REVIEWER_IDS` and
-  `RELEASE_BYPASS_ACTOR_IDS` containing exactly the approved GitHub reviewer and
-  tag-ruleset bypass actor IDs. The workflows only issue GET requests with this
-  token; control provisioning remains a manual administrator action.
+  inspect environments and repository rulesets. Add repository variables
+  `RELEASE_REVIEWERS` and `RELEASE_BYPASS_ACTORS` containing
+  the exact approved GitHub actor types and numeric IDs as comma-separated
+  `Type:id` entries (for example, `User:123` or `RepositoryRole:5`). The workflows
+  compare both fields so a same-number actor of another type cannot satisfy the
+  gate. They only issue GET requests with this token; control provisioning
+  remains a manual administrator action.
 - Record a fresh `RELEASE_ADMIN_BYPASS_EVIDENCE` repository variable when the
   GitHub environment API does not expose an administrator-bypass field. The
   compact JSON record must be valid for no more than 24 hours, be recorded by an
@@ -41,7 +43,7 @@ Before the first public release:
   recording plus its SHA-256:
 
   ```json
-  {"schema_version":1,"repository":"Amitk3293/promtect","source":"github-environment-settings-ui","evidence_reference":"https://github.com/Amitk3293/promtect/issues/ISSUE#issuecomment-COMMENT","evidence_sha256":"64-lowercase-hex-characters","recorded_by_reviewer_id":123,"recorded_at":"2026-07-13T19:00:00Z","expires_at":"2026-07-13T20:00:00Z","environments":{"core-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"},"core-container-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"}}}
+  {"schema_version":1,"repository":"Amitk3293/promtect","source":"github-environment-settings-ui","evidence_reference":"https://github.com/Amitk3293/promtect/issues/ISSUE#issuecomment-COMMENT","evidence_sha256":"64-lowercase-hex-characters","recorded_by_reviewer_type":"User","recorded_by_reviewer_id":123,"recorded_at":"2026-07-13T19:00:00Z","expires_at":"2026-07-13T20:00:00Z","environments":{"core-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"},"core-container-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"}}}
   ```
 
 Both publication workflows verify every API-visible control before a protected
@@ -107,17 +109,27 @@ Manually dispatch `.github/workflows/release.yml` with:
 - no publication confirmation.
 
 The workflow verifies that the tag version matches `Cargo.toml` and that the tag
-is contained in `main`. It runs the Docker readiness gate, then builds:
+points at the exact `main` commit containing the dispatched workflow. Older tags
+cannot reuse newer release governance or execute their own older verifier scripts.
+It runs the Docker readiness gate, then builds:
 
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 - `aarch64-unknown-linux-gnu`
 - `x86_64-unknown-linux-gnu`
 
-Each matrix job uploads only a candidate artifact. A single verification job
+Each target is built and executed on a pinned native runner before upload. The
+packaged binary must return the exact version and pass `selftest`. Linux builds
+currently declare their build-host compatibility floor through pinned runners:
+Ubuntu 22.04/glibc 2.35 for both x86-64 and ARM64. Lower
+floors require a separately tested build environment; they must not be claimed
+from header-only inspection.
+
+Each matrix job uploads only a smoke-tested candidate artifact. A single verification job
 downloads all four, rejects incomplete/mixed-source sets, validates immutable
-SHA-256 sidecars and embedded source metadata, and produces a reviewable
-`promtect.rb`. Nothing is released and the tap is not changed.
+SHA-256 sidecars, requires every embedded source SHA to equal the validated tag
+commit, and produces a reviewable `promtect.rb`. Nothing is released and the tap
+is not changed.
 
 ## 4. Publish the verified Core archives
 
@@ -133,7 +145,8 @@ job becomes eligible for approval. The reviewer must download
 verification job summary, inspect the archives, sidecars, embedded source SHA,
 and formula, and only then approve the environment. Reject the job if the
 candidate is not acceptable; never approve based on an artifact from another
-run.
+run. Core release runs are serialized across tags so an older version cannot
+finish after a newer version and move GitHub's `latest` marker backwards.
 
 After approval, the job checks out the already validated commit, re-fetches the
 remote annotated tag, and requires both its tag object ID and target commit to
@@ -164,6 +177,9 @@ Generate the formula from the published sidecars:
 scripts/update-formula.sh vX.Y.Z > promtect.rb
 ```
 
+The generator accepts only a stable `vX.Y.Z` tag and an `owner/repository`
+`PROMTECT_REPO` value before either is interpolated into formula text.
+
 Open a separate reviewed PR in `Amitk3293/homebrew-tap`; release CI never pushes
 the tap. Run `brew audit --strict`, `brew install --build-from-source`,
 `brew test`, `promtect --version`, and `promtect selftest` in a clean Homebrew
@@ -181,20 +197,26 @@ rejects a changed remote tag.
 
 The build first pushes content by digest without a customer-facing tag. Only
 after the build completes does the serialized job re-read grouped GHCR version
-records, refuse an existing exact tag, and prove the current `X.Y` tag belongs
+records, refuse an existing exact tag at another digest, and prove the current `X.Y` tag belongs
 to the highest paired `X.Y.Z`/`vX.Y.Z` digest. It then promotes that reviewed
 digest to the two exact tags and rolling minor tag. A bounded postcondition
 requires both the package API and direct registry reads for all three tags to
 resolve to the pushed digest. Missing or deleted provenance fails closed rather
 than guessing from flattened tag history.
 
+If a tag promotion is interrupted, a retry may resume only aliases that already
+resolve to the exact digest pushed by that retry. An absent alias is created, a
+same-digest alias is idempotently recreated, and any other digest fails closed.
+This makes a partial multi-tag write recoverable without permitting immutable
+version replacement.
+
 GHCR does not provide a permanent immutable-tag guarantee. These controls
 enforce non-replacement for this serialized workflow and detect publication
 drift at completion; a separate actor with package write access could still move
 or delete a tag later. Limit package writers, monitor tag-to-digest mappings,
-and treat signed attestations/digest pins as the durable identity. A failed or
-repeated publication requires a new patch version, never intentional tag
-replacement.
+and treat signed attestations/digest pins as the durable identity. A failure that
+cannot prove same-digest partial state requires a new patch version, never
+intentional tag replacement.
 
 The conventional container `latest` tag is deprecated and is never published or
 advanced. Consumers must pin `X.Y.Z`, `vX.Y.Z`, or deliberately track `X.Y`.

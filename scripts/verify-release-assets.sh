@@ -6,9 +6,12 @@ fail() { echo "release verification error: $1" >&2; exit 1; }
 
 tag="${1:-}"
 asset_dir="${2:-dist}"
+expected_source_sha="${3:-}"
 [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
   || fail "tag must be a stable vX.Y.Z tag"
 [ -d "$asset_dir" ] || fail "asset directory does not exist"
+[[ "$expected_source_sha" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "expected source SHA is invalid"
 
 version="${tag#v}"
 source_sha=""
@@ -114,6 +117,8 @@ PY
   [ "$manifest_tag" = "$tag" ] || fail "$archive tag mismatch"
   [ "$manifest_target" = "$target" ] || fail "$archive target mismatch"
   [[ "$manifest_sha" =~ ^[0-9a-f]{40}$ ]] || fail "$archive source SHA is invalid"
+  [ "$manifest_sha" = "$expected_source_sha" ] \
+    || fail "$archive source SHA does not match the validated release source"
   if [ -z "$source_sha" ]; then
     source_sha="$manifest_sha"
   else
