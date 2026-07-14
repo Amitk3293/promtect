@@ -817,7 +817,11 @@ assert_claude_runtime_override_rejected() {
   rm -f /tmp/claude-auth-status.called "$stderr_file"
   observations_before=$(observer_count)
   status=0
-  env "$runtime_var=" \
+  runtime_value=
+  if [ "$runtime_var" = CLAUDE_CODE_PROCESS_WRAPPER ]; then
+    runtime_value=fixed-synthetic-process-wrapper
+  fi
+  env "$runtime_var=$runtime_value" \
     HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
     PROMTECT_CLAUDE_AUTH_STATUS_MARKER=/tmp/claude-auth-status.called \
     PROMTECT_AUDIT=/tmp/claude-runtime-reject-audit.jsonl \
@@ -866,7 +870,8 @@ for runtime_var in \
   CLAUDE_CODE_MOCK_REMOTE_SETTINGS \
   CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST \
   CLAUDE_CODE_HOST_AUTH_ENV_VAR \
-  CLAUDE_CODE_HOST_CREDS_FILE
+  CLAUDE_CODE_HOST_CREDS_FILE \
+  CLAUDE_CODE_PROCESS_WRAPPER
 do
   assert_claude_runtime_override_rejected \
     "$runtime_var" "/tmp/claude-runtime-${runtime_var}.stderr"

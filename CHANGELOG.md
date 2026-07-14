@@ -55,8 +55,8 @@ and auto-generated notes also live on the
   gateways remain available through the explicit upstream/chaining configuration.
 - Guarded tools now run inside an owned Unix process group with terminal job-control
   handoff. Normal exit and SIGINT/SIGTERM clean up helpers, restore the terminal,
-  and drain proxy/dashboard connections; cancelled response streams emit a
-  value-free `stream_interrupted` audit event.
+  and drain proxy/dashboard connections; cancelled downstream response streams
+  emit a value-free, audit-only `stream_cancelled` event.
 - Concurrent guards serialize audit tail repair and complete JSONL appends through
   an owner-only pathname lock. Claude notices use a process-local outcome ledger,
   so same-inode copy-truncation cannot hide a protected turn.

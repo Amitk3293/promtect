@@ -6,8 +6,8 @@ use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Read, Seek, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Mutable, lock-guarded state for a file-backed audit sink: the target path and
 /// a cached open handle. The handle is reused across events so the log is not
@@ -17,6 +17,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// event re-opens, which is enough to recover from a rotated/truncated log.
 struct FileSink {
     path: PathBuf,
+    /// Shared once per configured pathname instead of resolving and allocating
+    /// a registry entry on every audit event.
+    process_lock: Arc<Mutex<()>>,
     /// `None` until the first successful open; cleared on write error to force a
     /// re-open on the next event.
     handle: Option<std::fs::File>,
@@ -66,34 +69,38 @@ pub struct Audit {
     /// Process-local request outcomes waiting for the next Claude Stop hook.
     /// This is authoritative for the in-session notice: a mutable JSONL cursor
     /// cannot distinguish same-inode truncate-and-regrow from no new records.
-    turn_ledger: Mutex<AuditTurnLedger>,
+    turn_ledger: Option<Mutex<AuditTurnLedger>>,
     /// Set once, the first time a write fails, to gate a one-shot stderr warning.
     warned: AtomicBool,
 }
 
 impl Audit {
     pub fn to_file(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
         Audit {
             sink: Mutex::new(Some(FileSink {
-                path: path.into(),
+                process_lock: process_path_lock(&path),
+                path,
                 handle: None,
             })),
             request_scope: None,
             session_stats: Mutex::new(AuditSessionStats::default()),
-            turn_ledger: Mutex::new(AuditTurnLedger::default()),
+            turn_ledger: None,
             warned: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn to_file_scoped(path: impl Into<PathBuf>, request_scope: String) -> Self {
+        let path = path.into();
         Audit {
             sink: Mutex::new(Some(FileSink {
-                path: path.into(),
+                process_lock: process_path_lock(&path),
+                path,
                 handle: None,
             })),
             request_scope: Some(request_scope.into()),
             session_stats: Mutex::new(AuditSessionStats::default()),
-            turn_ledger: Mutex::new(AuditTurnLedger::default()),
+            turn_ledger: Some(Mutex::new(AuditTurnLedger::default())),
             warned: AtomicBool::new(false),
         }
     }
@@ -104,7 +111,7 @@ impl Audit {
             sink: Mutex::new(None),
             request_scope: None,
             session_stats: Mutex::new(AuditSessionStats::default()),
-            turn_ledger: Mutex::new(AuditTurnLedger::default()),
+            turn_ledger: None,
             warned: AtomicBool::new(false),
         }
     }
@@ -142,9 +149,11 @@ impl Audit {
     /// since the preceding Stop hook. Requests later marked failed, blocked, or
     /// interrupted are excluded even if their request summary was written first.
     pub(crate) fn take_turn_notice(&self) -> AuditTurnNotice {
+        let Some(turn_ledger) = self.turn_ledger.as_ref() else {
+            return AuditTurnNotice::default();
+        };
         let ledger = {
-            let mut ledger = self
-                .turn_ledger
+            let mut ledger = turn_ledger
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *ledger)
@@ -190,7 +199,11 @@ impl Audit {
         // Lock order is always the process-local sink mutex followed by the
         // pathname lock. Keeping one order prevents two Audit instances in this
         // process from deadlocking while the OS lock serializes other processes.
-        let _path_lock = match Self::acquire_path_lock(&sink.path) {
+        let _process_guard = sink
+            .process_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _path_lock = match Self::acquire_path_lock_for_prepare(&sink.path) {
             Ok(lock) => lock,
             Err(error) => {
                 self.warn_once();
@@ -254,23 +267,7 @@ impl Audit {
         }
         // Audit is fail-open. A paused/crashed peer must never stall request
         // masking or guard startup while it holds this advisory lock.
-        // Serialize ordinary short appends across independent Audit instances,
-        // while preserving fail-open behavior if a paused peer holds the lock.
-        // A normal JSONL append completes well inside this bounded window; a
-        // genuinely stuck owner cannot stall masking indefinitely.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
-        loop {
-            match lock.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    return Err(Error::from(ErrorKind::WouldBlock));
-                }
-                Err(std::fs::TryLockError::Error(error)) => return Err(error),
-            }
-        }
+        lock.try_lock().map_err(std::io::Error::from)?;
         if !same_audit_file(&lock, &lock_path)? {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -278,6 +275,26 @@ impl Audit {
             ));
         }
         Ok(lock)
+    }
+
+    /// Startup runs on a dedicated blocking thread and may wait briefly for an
+    /// ordinary append in another process. Request-path writes intentionally do
+    /// not use this policy: they remain try-only and fail open under contention.
+    fn acquire_path_lock_for_prepare(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        const RETRY_WINDOW: Duration = Duration::from_millis(250);
+        const RETRY_INTERVAL: Duration = Duration::from_millis(5);
+        let deadline = Instant::now() + RETRY_WINDOW;
+        loop {
+            match Self::acquire_path_lock(path) {
+                Ok(lock) => return Ok(lock),
+                Err(error)
+                    if error.kind() == ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(RETRY_INTERVAL);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Open the audit log for append while the caller holds
@@ -399,6 +416,14 @@ impl Audit {
             return; // null sink: discard.
         };
 
+        // Independent Audit instances in this process share a short pathname
+        // mutex, so their ordinary appends never collide at the OS lock. The OS
+        // lock itself remains try-only: a paused external process cannot block a
+        // Tokio request worker.
+        let _process_guard = sink
+            .process_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _path_lock = match Self::acquire_path_lock(&sink.path) {
             Ok(lock) => lock,
             Err(_) => {
@@ -509,9 +534,8 @@ impl Audit {
         bytes_out: usize,
         blocked: bool,
     ) {
-        {
-            let mut ledger = self
-                .turn_ledger
+        if let Some(turn_ledger) = self.turn_ledger.as_ref() {
+            let mut ledger = turn_ledger
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if blocked {
@@ -544,11 +568,13 @@ impl Audit {
 
     /// Record one event. `placeholder` is a sentinel id, NOT a secret.
     pub fn record(&self, action: &str, kind: &str, placeholder: &str, request_id: &str) {
-        if matches!(
-            action,
-            "request_blocked" | "request_rejected" | "request_failed" | "stream_interrupted"
-        ) {
-            self.turn_ledger
+        if let Some(turn_ledger) = self.turn_ledger.as_ref()
+            && matches!(
+                action,
+                "request_blocked" | "request_rejected" | "request_failed" | "stream_interrupted"
+            )
+        {
+            turn_ledger
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .unsuccessful
@@ -585,6 +611,40 @@ impl Audit {
         });
         self.append_line(&line.to_string(), false);
     }
+}
+
+/// Per-path serialization for independent Audit instances in this process.
+/// Weak entries avoid retaining arbitrary paths after their final writer exits.
+fn process_path_lock(path: &std::path::Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let path = process_path_lock_key(path);
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path, Arc::downgrade(&lock));
+    lock
+}
+
+fn process_path_lock_key(path: &std::path::Path) -> PathBuf {
+    let Some(file_name) = path.file_name() else {
+        return path.to_path_buf();
+    };
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let normalized_parent = parent.canonicalize().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|current| current.join(parent))
+            .unwrap_or_else(|_| parent.to_path_buf())
+    });
+    normalized_parent.join(file_name)
 }
 
 #[cfg(unix)]
@@ -636,6 +696,12 @@ fn validate_audit_file(file: &std::fs::File) -> std::io::Result<std::fs::Metadat
             return Err(Error::new(
                 ErrorKind::PermissionDenied,
                 "audit log target must be owned by the current user",
+            ));
+        }
+        if metadata.nlink() != 1 {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "audit log target must not have hard-link aliases",
             ));
         }
     }
@@ -724,6 +790,20 @@ mod tests {
                 output_secrets: 0,
             }
         );
+        remove_audit_fixture(&path);
+    }
+
+    #[test]
+    fn turn_ledger_exists_only_for_scoped_claude_guards() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-turn-ledger-scope-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let standalone = Audit::to_file(path.clone());
+        let scoped = Audit::to_file_scoped(path.clone(), "claude-session".to_string());
+
+        assert!(standalone.turn_ledger.is_none());
+        assert!(scoped.turn_ledger.is_some());
         remove_audit_fixture(&path);
     }
 
@@ -857,6 +937,31 @@ mod tests {
         assert_eq!(actual, original, "symlink target must remain byte-exact");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_audit_path_never_mutates_its_target() {
+        let dir = std::env::temp_dir();
+        let suffix = uuid::Uuid::new_v4();
+        let target = dir.join(format!("promtect-audit-hardlink-target-{suffix}.jsonl"));
+        let alias = dir.join(format!("promtect-audit-hardlink-alias-{suffix}.jsonl"));
+        let original = b"{\"existing\":true}\n";
+        std::fs::write(&target, original).expect("seed target");
+        std::fs::hard_link(&target, &alias).expect("create audit hard link");
+        let audit = Audit::to_file(alias.clone());
+
+        let prepare_result = audit.prepare();
+        audit.record("mask", "aws_key", "opaque-sentinel", "req-hardlink");
+
+        let actual = std::fs::read(&target).expect("read target after rejected audit writes");
+        remove_audit_fixture(&alias);
+        std::fs::remove_file(&target).ok();
+        assert!(
+            prepare_result.is_err(),
+            "append prepare unexpectedly accepted the hard link"
+        );
+        assert_eq!(actual, original, "hard-link target must remain byte-exact");
+    }
+
     #[test]
     fn non_regular_audit_target_is_rejected_without_mutation() {
         let path =
@@ -928,6 +1033,51 @@ mod tests {
                 .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
             "tail repair and the following append must share one critical section"
         );
+    }
+
+    #[test]
+    fn prepare_retries_brief_external_contention() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-prepare-contention-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&path, b"").expect("seed audit file");
+        let held_lock = Audit::acquire_path_lock(&path).expect("hold audit pathname lock");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(held_lock);
+        });
+        let audit = Audit::to_file(path.clone());
+        let started = Instant::now();
+
+        let result = audit.prepare();
+
+        release.join().expect("release audit pathname lock");
+        let elapsed = started.elapsed();
+        remove_audit_fixture(&path);
+        assert!(result.is_ok(), "brief startup contention must recover");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "startup contention retry must remain bounded"
+        );
+    }
+
+    #[test]
+    fn process_path_lock_normalizes_existing_parent_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "promtect-process-lock-alias-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create audit parent");
+        let direct = nested.join("audit.jsonl");
+        let aliased = nested.join("..").join("nested").join("audit.jsonl");
+
+        let first = process_path_lock(&direct);
+        let second = process_path_lock(&aliased);
+
+        std::fs::remove_dir_all(&root).ok();
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
