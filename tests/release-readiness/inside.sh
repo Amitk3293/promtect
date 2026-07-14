@@ -421,6 +421,135 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 python3 scripts/verify-draft-release.py v1.2.3 "$source_sha_fixture" \
   --assets < "$root/draft-assets.json"
+python3 - "$root/draft-assets.json" "$root/published-assets.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["isDraft"] = False
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+python3 scripts/verify-draft-release.py v1.2.3 "$source_sha_fixture" \
+  --published < "$root/published-assets.json"
+
+fake_bin="$root/fake-bin"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1 $2" = "release edit" ]; then
+  exit "${PROMTECT_TEST_EDIT_STATUS:-0}"
+fi
+if [ "$1 $2" = "release view" ]; then
+  cat "$PROMTECT_TEST_PUBLISHED_RELEASE"
+  exit 0
+fi
+if [ "$1 $2" = "release download" ]; then
+  destination=""
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dir)
+        destination="$2"
+        shift 2
+        ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$destination" ]
+  cp "$PROMTECT_TEST_REMOTE_ASSETS"/*.tar.gz \
+    "$PROMTECT_TEST_REMOTE_ASSETS"/*.tar.gz.sha256 "$destination/"
+  exit 0
+fi
+exit 2
+SH
+chmod +x "$fake_bin/gh"
+
+publish_work="$root/publish-work"
+remote_exact="$root/remote-exact"
+mkdir -p "$publish_work/dist" "$remote_exact"
+cp "$first"/*.tar.gz "$first"/*.tar.gz.sha256 "$publish_work/dist/"
+cp "$first"/*.tar.gz "$first"/*.tar.gz.sha256 "$remote_exact/"
+python3 - "$root/published-assets.json" "$root/published-same-run.json" \
+  "$tag" "$source_sha" "$remote_exact" <<'PY'
+import json
+import pathlib
+import sys
+
+source, destination, tag, source_sha, asset_dir = sys.argv[1:]
+with open(source, encoding="utf-8") as handle:
+    data = json.load(handle)
+data["name"] = f"Promtect {tag}"
+data["body"] = (
+    f"<!-- promtect-core-release:v1 tag={tag} source={source_sha} -->\n\n"
+    f"Promtect Core {tag}.\n\n"
+    "Verify the attached archives with their SHA-256 sidecars before installation."
+)
+data["tagName"] = tag
+data["targetCommitish"] = source_sha
+data["assets"] = [
+    {"name": path.name}
+    for path in sorted(pathlib.Path(asset_dir).glob(f"promtect-{tag}-*.tar.gz*"))
+]
+with open(destination, "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+publisher="$PWD/scripts/publish-verified-draft.sh"
+(
+  cd "$publish_work"
+  PATH="$fake_bin:$PATH" \
+    PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
+    PROMTECT_TEST_EDIT_STATUS=0 \
+    PROMTECT_TEST_PUBLISHED_RELEASE="$root/published-same-run.json" \
+    PROMTECT_TEST_REMOTE_ASSETS="$remote_exact" \
+    bash "$publisher" "$tag" "$source_sha"
+)
+
+remote_corrupt="$root/remote-corrupt"
+cp -a "$remote_exact" "$remote_corrupt"
+corrupt_archive="$remote_corrupt/promtect-${tag}-x86_64-unknown-linux-gnu.tar.gz"
+python3 - "$corrupt_archive" <<'PY'
+import gzip
+import io
+import os
+import sys
+import tarfile
+
+path = sys.argv[1]
+with tarfile.open(path, "r:gz") as source:
+    entries = [(member, source.extractfile(member).read()) for member in source.getmembers()]
+with open(f"{path}.new", "wb") as raw:
+    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.USTAR_FORMAT) as output:
+            for member, body in entries:
+                if member.name == "README.md":
+                    body += b"\ncorrupted remote body\n"
+                member.size = len(body)
+                output.addfile(member, io.BytesIO(body))
+os.replace(f"{path}.new", path)
+PY
+(
+  cd "$remote_corrupt"
+  sha256sum "$(basename "$corrupt_archive")" \
+    > "$(basename "$corrupt_archive").sha256"
+)
+PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
+  bash scripts/verify-release-assets.sh "$tag" "$remote_corrupt" "$source_sha"
+if (
+  cd "$publish_work"
+  PATH="$fake_bin:$PATH" \
+    PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
+    PROMTECT_TEST_EDIT_STATUS=1 \
+    PROMTECT_TEST_PUBLISHED_RELEASE="$root/published-same-run.json" \
+    PROMTECT_TEST_REMOTE_ASSETS="$remote_corrupt" \
+    bash "$publisher" "$tag" "$source_sha"
+) >/dev/null 2>&1; then
+  echo "lost publish response accepted corrupted same-name remote assets" >&2
+  exit 1
+fi
+
 python3 - "$root/draft-assets.json" <<'PY'
 import json
 import sys
@@ -435,6 +564,27 @@ PY
 if python3 scripts/verify-draft-release.py v1.2.3 "$source_sha_fixture" \
   --assets < "$root/draft-assets.json" >/dev/null 2>&1; then
   echo "incomplete draft release asset set passed verification" >&2
+  exit 1
+fi
+python3 - "$root/published-same-run.json" "$root/incomplete-published.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["assets"].pop()
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+if (
+  cd "$publish_work"
+  PATH="$fake_bin:$PATH" \
+    PROMTECT_TEST_ONLY_SKIP_ARCH_CHECK=1 \
+    PROMTECT_TEST_PUBLISHED_RELEASE="$root/incomplete-published.json" \
+    PROMTECT_TEST_REMOTE_ASSETS="$remote_exact" \
+    bash "$publisher" "$tag" "$source_sha"
+) >/dev/null 2>&1; then
+  echo "lost publish response accepted an incomplete published release" >&2
   exit 1
 fi
 
@@ -853,6 +1003,7 @@ from pathlib import Path
 
 release = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
 container = Path(".github/workflows/docker-publish.yml").read_text(encoding="utf-8")
+publisher = Path("scripts/publish-verified-draft.sh").read_text(encoding="utf-8")
 assert release.index("release-controls:") < release.index("environment: core-release")
 assert container.index("release-controls:") < container.index(
     "environment: core-container-release"
@@ -865,6 +1016,11 @@ for workflow in (release, container):
     assert "RELEASE_ADMIN_BYPASS_EVIDENCE" in workflow
 assert "--normalization-candidate" in release
 assert "--assets-subset" in release
+assert '"$TAG" "$SOURCE_SHA" --published' in release
+assert 'publish-verified-draft.sh "$TAG" "$SOURCE_SHA"' in release
+assert 'cmp "$candidate" "$published_dir/$(basename "$candidate")"' in release
+assert 'verify-release-assets.sh" "$tag" "$published_dir" "$source_sha"' in publisher
+assert 'cmp "$candidate" "$published"' in publisher
 assert "isDraft,isPrerelease,name,body,assets,tagName,targetCommitish" in release
 assert "push-by-digest=true" in container
 assert "--resume-digest \"$PUBLISH_DIGEST\"" in container

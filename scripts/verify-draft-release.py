@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate that a GitHub draft release still belongs to the reviewed source."""
+"""Validate that a GitHub release still belongs to the reviewed source."""
 
 import argparse
 import json
@@ -7,7 +7,7 @@ import sys
 
 
 def fail(message: str) -> None:
-    raise SystemExit(f"draft release verification error: {message}")
+    raise SystemExit(f"release verification error: {message}")
 
 
 parser = argparse.ArgumentParser()
@@ -16,9 +16,12 @@ parser.add_argument("source_sha")
 parser.add_argument("--assets", action="store_true")
 parser.add_argument("--assets-subset", action="store_true")
 parser.add_argument("--normalization-candidate", action="store_true")
+parser.add_argument("--published", action="store_true")
 args = parser.parse_args()
 
-if sum((args.assets, args.assets_subset, args.normalization_candidate)) > 1:
+if sum(
+    (args.assets, args.assets_subset, args.normalization_candidate, args.published)
+) > 1:
     fail("choose only one asset validation mode")
 
 try:
@@ -29,7 +32,10 @@ if not isinstance(data, dict):
     fail("GitHub response is not an object")
 if data.get("tagName") != args.tag:
     fail("tag does not match validated tag")
-if data.get("isDraft") is not True:
+if args.published:
+    if data.get("isDraft") is not False:
+        fail("release is not published")
+elif data.get("isDraft") is not True:
     fail("release is not an unpublished draft")
 if data.get("targetCommitish") != args.source_sha:
     fail("target does not match validated source SHA")
@@ -47,7 +53,7 @@ if not args.normalization_candidate:
     if data.get("body") != expected_body:
         fail("release body does not match deterministic reviewed metadata")
 
-if args.assets or args.assets_subset or args.normalization_candidate:
+if args.assets or args.assets_subset or args.normalization_candidate or args.published:
     targets = (
         "aarch64-apple-darwin",
         "x86_64-apple-darwin",
@@ -71,11 +77,12 @@ if args.assets or args.assets_subset or args.normalization_candidate:
     actual = [asset["name"] for asset in assets]
     if len(actual) != len(set(actual)):
         fail("draft has duplicate assets")
-    if args.assets and set(actual) != expected:
-        fail("draft has an incomplete or unexpected asset set")
+    if (args.assets or args.published) and set(actual) != expected:
+        fail("release has an incomplete or unexpected asset set")
     if (args.assets_subset or args.normalization_candidate) and not set(
         actual
     ).issubset(expected):
         fail("draft has an unexpected asset")
 
-print(f"draft release verified: {args.tag}, {args.source_sha}")
+state = "published" if args.published else "draft"
+print(f"{state} release verified: {args.tag}, {args.source_sha}")
