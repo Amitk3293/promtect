@@ -10,6 +10,7 @@ use promtect::proxy::shutdown_signal;
 
 #[tokio::main]
 async fn main() {
+    promtect::install_value_free_panic_hook();
     let args: Vec<String> = std::env::args().collect();
 
     // Help must print before any port binding attempt.

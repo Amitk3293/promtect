@@ -36,6 +36,11 @@ and auto-generated notes also live on the
   `NOTICE`, `COMMERCIAL.md`, and `TRADEMARK.md`.
 
 ### Fixed
+- CPU-bound detector, masking, and residual-scan work no longer starves Tokio's
+  async workers. Scan admission is bounded before request-body retention; an
+  overloaded proxy fails closed with a value-free HTTP 503, and a request that
+  does not finish uploading within 30 seconds fails closed with a value-free
+  HTTP 408. Neither rejection opens an upstream connection.
 - `promtect --version`, `promtect -V`, and `promtect version` now print the version
   and exit, instead of starting the proxy.
 - `promtect guard claude` now overrides persisted Claude base-URL settings and

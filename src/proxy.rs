@@ -13,6 +13,7 @@ use axum::{
     http::{HeaderMap, Method, Uri},
     response::Response,
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt as _;
 use std::sync::Arc;
@@ -30,6 +31,26 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 const UNSUPPORTED_CONTENT_ENCODING_MESSAGE: &str =
     "promtect: unsupported request Content-Encoding; send an identity-encoded body";
 const UNSUPPORTED_CONTENT_ENCODING_AUDIT_MARKER: &str = "«unsupported-content-encoding»";
+const SCAN_CAPACITY_MESSAGE: &str = "promtect: request scanning is at capacity; retry later";
+const SCAN_CAPACITY_AUDIT_MARKER: &str = "«scan-capacity-exhausted»";
+const REQUEST_BODY_TIMEOUT_MESSAGE: &str = "promtect: request body timed out";
+const REQUEST_BODY_TIMEOUT_AUDIT_MARKER: &str = "«request-body-timeout»";
+const SCAN_TASK_FAILURE_LOG_MESSAGE: &str = "promtect: request scanning task failed";
+const REQUEST_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONCURRENT_SCANS: usize = 4;
+
+fn scan_slot_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, MAX_CONCURRENT_SCANS)
+}
+
+fn try_scan_permit(
+    scan_slots: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+    Arc::clone(scan_slots).try_acquire_owned()
+}
 
 /// Build a plain-text response without ever panicking. Used for Promtect's own
 /// error replies (413/415/502), where we fully control status and headers. The
@@ -103,15 +124,52 @@ pub struct Ctx {
     pub output_scan: Option<crate::stream::ResponseScanner>,
 }
 
-/// Core detectors plus any extra (Pro) detection pass, merged into one match list.
-/// `None` yields exactly the core's `detect()` output, so the public proxy's
-/// behavior is unchanged; a downstream build adds its matches here. The merged
-/// list may overlap — [`mask_with_matches`] coalesces overlaps before masking.
+/// Internal Axum state. Each running proxy owns one bounded scan budget; every
+/// clone of its router shares that budget. Keeping admission out of [`Ctx`]
+/// preserves the downstream composition API while preventing independent proxy
+/// instances from stealing each other's permits.
+#[derive(Clone)]
+struct AppState {
+    ctx: Ctx,
+    scan_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// Whether a detector hit can be masked exactly from the text it inspected.
+///
+/// Downstream detectors also use deliberately invalid spans as fail-closed
+/// control markers when their own runtime bounds are exceeded. Treat every
+/// malformed or value-mismatched hit as unmaskable so it can block without
+/// spending more CPU on detector passes that cannot make the request safe.
+fn match_is_maskable(text: &str, hit: &detect::Match) -> bool {
+    hit.start < hit.end
+        && hit.end <= text.len()
+        && text.is_char_boundary(hit.start)
+        && text.is_char_boundary(hit.end)
+        && text
+            .get(hit.start..hit.end)
+            .is_some_and(|value| value == hit.value.as_str())
+}
+
+/// Extra (Pro) detectors run before the Core detector set so a bounded
+/// downstream pass can reject work before Core scans the complete body. A
+/// malformed extra hit is a fail-closed control result: return it immediately
+/// and let the request path block without running Core. Valid extra matches are
+/// then merged with Core exactly as before.
+///
+/// `None` still yields exactly the Core detector output. The merged list may
+/// overlap — [`mask_with_matches`] coalesces overlaps before masking.
 fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Match> {
-    let mut matches = detect::detect(text);
-    if let Some(extra) = extra {
-        matches.extend(extra(text));
+    let extra_matches = extra.as_ref().map_or_else(Vec::new, |detect| detect(text));
+    if extra_matches
+        .iter()
+        .any(|hit| !match_is_maskable(text, hit))
+    {
+        return extra_matches;
     }
+    // Preserve Core-first merge precedence for overlapping valid spans; only
+    // execution order changes so downstream bounds can fail before Core work.
+    let mut matches = detect::detect(text);
+    matches.extend(extra_matches);
     matches
 }
 
@@ -164,10 +222,169 @@ fn scan_for_residual_leaks(
         .collect()
 }
 
+enum PreparedBody {
+    Forward(Vec<u8>),
+    Block(Response),
+}
+
+fn residual_block_response(
+    ctx: &Ctx,
+    request_id: &str,
+    hit_count: usize,
+    request_kinds: &[&str],
+    body_len: usize,
+    masked_len: usize,
+    leaks: &[detect::Match],
+) -> Response {
+    let leak_kinds: Vec<&str> = {
+        let mut kinds: Vec<&str> = leaks.iter().map(|hit| hit.kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds
+    };
+    eprintln!(
+        "[promtect] ⚠️  LEAK req {}: {} pattern{} may not be masked ({}) \
+         — request blocked",
+        &request_id[..8],
+        leaks.len(),
+        if leaks.len() == 1 { "" } else { "s" },
+        leak_kinds.join(", ")
+    );
+    ctx.audit
+        .record_request(request_id, hit_count, request_kinds, body_len, masked_len);
+    ctx.audit.record(
+        "request_blocked",
+        "residual_secret",
+        "«residual-secret»",
+        request_id,
+    );
+    text_response(
+        400,
+        format!(
+            "promtect: {} secret pattern{} not masked before forwarding ({})",
+            leaks.len(),
+            if leaks.len() == 1 { "" } else { "s" },
+            leak_kinds.join(", ")
+        ),
+    )
+}
+
+fn preflight_block_response(ctx: &Ctx, request_id: &str, failure_kinds: &[&str]) -> Response {
+    let kind = failure_kinds
+        .first()
+        .copied()
+        .unwrap_or("detector_preflight");
+    eprintln!(
+        "[promtect] req {}: detector preflight failed closed",
+        &request_id[..8]
+    );
+    ctx.audit.record_blocked_request(request_id);
+    ctx.audit.record(
+        "request_rejected",
+        kind,
+        "«detector-preflight-rejected»",
+        request_id,
+    );
+    text_response(400, "promtect: request detector failed closed")
+}
+
+fn scan_task_failure_log_message(_: &tokio::task::JoinError) -> &'static str {
+    // JoinError's Display includes a panic payload when one is available. A
+    // downstream detector panic may have inspected request text, so never format
+    // either Display/Debug or extract the panic payload into logs.
+    SCAN_TASK_FAILURE_LOG_MESSAGE
+}
+
+/// Perform UTF-8 validation, detection, masking, and the residual scan away from
+/// Tokio's async workers. Detector regexes are synchronous and may inspect the
+/// complete configured body limit; running them on an async worker can prevent
+/// unrelated connections, timers, and shutdown from being polled.
+fn prepare_body(body_bytes: Bytes, ctx: &Ctx, vault: &Vault, request_id: &str) -> PreparedBody {
+    let text = match std::str::from_utf8(&body_bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            ctx.audit
+                .record_request(request_id, 0, &[], body_bytes.len(), body_bytes.len());
+            return PreparedBody::Forward(body_bytes.to_vec());
+        }
+    };
+
+    let matches = compose_matches(text, &ctx.extra_detect);
+    let hit_count = matches.len();
+    let mut kinds: Vec<&str> = matches.iter().map(|hit| hit.kind).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+
+    // Invalid downstream spans are fail-closed control results. Block them
+    // immediately, before copying/masking the body or running Core and residual
+    // detector passes. This is how a bounded Pro rulebook rejects excess work.
+    if matches.iter().any(|hit| !match_is_maskable(text, hit)) {
+        return PreparedBody::Block(preflight_block_response(ctx, request_id, &kinds));
+    }
+
+    let masked = mask_with_matches(text, matches, vault, &ctx.audit, request_id);
+    if hit_count > 0 && !is_quiet() {
+        eprintln!(
+            "[promtect] req {}: masked {} secret{} ({})",
+            &request_id[..8],
+            hit_count,
+            if hit_count == 1 { "" } else { "s" },
+            kinds.join(", ")
+        );
+    }
+
+    if hit_count > 0 {
+        let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect, vault);
+        if !leaks.is_empty() {
+            return PreparedBody::Block(residual_block_response(
+                ctx,
+                request_id,
+                hit_count,
+                &kinds,
+                body_bytes.len(),
+                masked.len(),
+                &leaks,
+            ));
+        }
+    }
+
+    ctx.audit.record_request(
+        request_id,
+        hit_count,
+        &kinds,
+        body_bytes.len(),
+        masked.len(),
+    );
+    PreparedBody::Forward(masked.into_bytes())
+}
+
+async fn prepare_body_async(
+    body_bytes: Bytes,
+    ctx: Ctx,
+    vault: Arc<Vault>,
+    request_id: String,
+    scan_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<PreparedBody, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _scan_permit = scan_permit;
+        prepare_body(body_bytes, &ctx, &vault, &request_id)
+    })
+    .await
+}
+
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
 /// body, forwards to `upstream`, and restores secrets in the response.
 pub fn app(ctx: Ctx) -> Router {
-    Router::new().fallback(handle).with_state(ctx)
+    app_with_scan_slots(
+        ctx,
+        Arc::new(tokio::sync::Semaphore::new(scan_slot_limit())),
+    )
+}
+
+fn app_with_scan_slots(ctx: Ctx, scan_slots: Arc<tokio::sync::Semaphore>) -> Router {
+    Router::new()
+        .fallback(handle)
+        .with_state(AppState { ctx, scan_slots })
 }
 
 /// Resolve the upstream origin (scheme + host) from an explicit override or a
@@ -297,7 +514,8 @@ pub async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
+async fn handle(State(state): State<AppState>, req: Request) -> Response {
+    let AppState { ctx, scan_slots } = state;
     ctx.requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -321,6 +539,29 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
         return text_response(415, UNSUPPORTED_CONTENT_ENCODING_MESSAGE);
     }
 
+    // Admission happens before reading the body. Tokio's blocking pool has a
+    // high default limit and started blocking tasks cannot be cancelled, so an
+    // unbounded queue of maximum-size detector jobs would retain unbounded
+    // memory and CPU work. Saturation fails closed without touching the body or
+    // opening an upstream connection.
+    let scan_permit = match try_scan_permit(&scan_slots) {
+        Ok(permit) => permit,
+        Err(_) => {
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_rejected",
+                "scan_capacity",
+                SCAN_CAPACITY_AUDIT_MARKER,
+                &request_id,
+            );
+            eprintln!(
+                "[promtect] req {}: rejected because request scanning is at capacity",
+                &request_id[..8]
+            );
+            return text_response(503, SCAN_CAPACITY_MESSAGE);
+        }
+    };
+
     let method = req.method().clone();
     let uri = req.uri().clone();
 
@@ -328,9 +569,14 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // exceeds the limit, so we refuse oversized bodies with 413 instead of
     // silently forwarding an empty/truncated one (the old `.unwrap_or_default()`
     // behaviour) or buffering without bound.
-    let body_bytes = match axum::body::to_bytes(req.into_body(), ctx.max_body_bytes).await {
-        Ok(b) => b,
-        Err(_) => {
+    let body_bytes = match tokio::time::timeout(
+        REQUEST_BODY_TIMEOUT,
+        axum::body::to_bytes(req.into_body(), ctx.max_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
             ctx.audit.record_blocked_request(&request_id);
             ctx.audit.record(
                 "request_blocked",
@@ -346,6 +592,20 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
                 ),
             );
         }
+        Err(_) => {
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_rejected",
+                "body_timeout",
+                REQUEST_BODY_TIMEOUT_AUDIT_MARKER,
+                &request_id,
+            );
+            eprintln!(
+                "[promtect] req {}: rejected because the request body timed out",
+                &request_id[..8]
+            );
+            return text_response(408, REQUEST_BODY_TIMEOUT_MESSAGE);
+        }
     };
     // INVARIANT: one vault per request. The same vault masks the outbound body
     // and restores the inbound response, so only sentinels minted *for this
@@ -353,110 +613,29 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // Held in an `Arc` so it can move into the response stream, which the server
     // polls after this handler returns.
     let vault = Arc::new(Vault::new());
-
-    // Scan the body only when it is genuinely text. We decide this from the ACTUAL
-    // bytes (valid UTF-8?), NOT the client-declared `Content-Type` — otherwise a
-    // request could bypass masking and leak a secret simply by mislabelling a JSON
-    // body as `application/octet-stream`. A body that is not valid UTF-8 is binary
-    // (or mislabelled binary) and is forwarded byte-for-byte, so the proxy never
-    // corrupts it by lossy conversion or a mistaken substitution.
-    let forward_bytes = match std::str::from_utf8(&body_bytes) {
-        Ok(text) => {
-            // Compose the core detectors with any extra (Pro) pass, then mask AND
-            // summarize from the same match set so the summary reflects everything
-            // masked. extra_detect is None in the public core (behavior unchanged).
-            let matches = compose_matches(text, &ctx.extra_detect);
-            let hit_count = matches.len();
-
-            // Per-request summary kinds (value-free), taken before the match list is
-            // consumed by masking.
-            let mut kinds: Vec<&str> = matches.iter().map(|m| m.kind).collect();
-            kinds.sort_unstable();
-            kinds.dedup();
-
-            // Mask request body content. Auth headers forwarded untouched in forward().
-            let masked = mask_with_matches(text, matches, &vault, &ctx.audit, &request_id);
-
-            // Emit a Promtect-attributed stderr line so the user can see masking
-            // in their terminal without opening the dashboard. Suppressed under
-            // `guard` (quiet mode) so it does not corrupt a wrapped TUI; the count
-            // still lands in the audit log, the dashboard, and the exit summary.
-            if hit_count > 0 && !is_quiet() {
-                eprintln!(
-                    "[promtect] req {}: masked {} secret{} ({})",
-                    &request_id[..8],
-                    hit_count,
-                    if hit_count == 1 { "" } else { "s" },
-                    kinds.join(", ")
-                );
-            }
-
-            // Post-mask leak check: only needed when masking ran — if no secrets
-            // were detected, the masked body is identical to the input and a second
-            // scan would find the same nothing (wasted work on every clean request).
-            if hit_count > 0 {
-                // Re-run the active detectors over the complete masked body, then
-                // suppress only structurally valid matches wholly inside exact
-                // sentinels minted by this request. Any other surviving match means
-                // masking missed it, so block rather than forward plaintext secrets.
-                let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect, &vault);
-                if !leaks.is_empty() {
-                    let leak_kinds: Vec<&str> = {
-                        let mut v: Vec<&str> = leaks.iter().map(|m| m.kind).collect();
-                        v.sort_unstable();
-                        v.dedup();
-                        v
-                    };
-                    eprintln!(
-                        "[promtect] ⚠️  LEAK req {}: {} pattern{} may not be masked ({}) \
-                         — request blocked",
-                        &request_id[..8],
-                        leaks.len(),
-                        if leaks.len() == 1 { "" } else { "s" },
-                        leak_kinds.join(", ")
-                    );
-                    // Record before blocking so the dashboard counts this request.
-                    ctx.audit.record_request(
-                        &request_id,
-                        hit_count,
-                        &kinds,
-                        body_bytes.len(),
-                        masked.len(),
-                    );
-                    ctx.audit.record(
-                        "request_blocked",
-                        "residual_secret",
-                        "«residual-secret»",
-                        &request_id,
-                    );
-                    return text_response(
-                        400,
-                        format!(
-                            "promtect: {} secret pattern{} not masked before forwarding ({})",
-                            leaks.len(),
-                            if leaks.len() == 1 { "" } else { "s" },
-                            leak_kinds.join(", ")
-                        ),
-                    );
-                }
-            }
-
-            ctx.audit.record_request(
+    let prepared = prepare_body_async(
+        body_bytes,
+        ctx.clone(),
+        Arc::clone(&vault),
+        request_id.clone(),
+        scan_permit,
+    )
+    .await;
+    let forward_bytes = match prepared {
+        Ok(PreparedBody::Forward(bytes)) => bytes,
+        Ok(PreparedBody::Block(response)) => return response,
+        Err(error) => {
+            // A blocking detector task can fail only if it panics or the runtime
+            // shuts down. Either case fails closed and remains value-free.
+            eprintln!("{}", scan_task_failure_log_message(&error));
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_blocked",
+                "scan_failure",
+                "«request-scan-failed»",
                 &request_id,
-                hit_count,
-                &kinds,
-                body_bytes.len(),
-                masked.len(),
             );
-
-            masked.into_bytes()
-        }
-        Err(_) => {
-            // Non-UTF-8 (binary) body: forward unscanned, but record it as traffic
-            // (zero secrets) so the request still appears in metrics.
-            ctx.audit
-                .record_request(&request_id, 0, &[], body_bytes.len(), body_bytes.len());
-            body_bytes.to_vec()
+            return text_response(500, "promtect: request scanning failed");
         }
     };
 
@@ -874,6 +1053,289 @@ mod tests {
         let composed = super::compose_matches(text, &Some(extra));
         assert_eq!(composed.len(), base + 1);
         assert!(composed.iter().any(|m| m.kind == "custom"));
+    }
+
+    #[test]
+    fn compose_matches_short_circuits_core_for_an_unmaskable_extra_result() {
+        let text = "AKIAIOSFODNN7EXAMPLE followed by a bounded detector failure";
+        let extra: super::ExtraDetector = std::sync::Arc::new(|_| {
+            vec![super::detect::Match::new(
+                "rulebook_scan_limit",
+                String::new(),
+                usize::MAX,
+                usize::MAX,
+            )]
+        });
+
+        let composed = super::compose_matches(text, &Some(extra));
+
+        assert_eq!(composed.len(), 1);
+        assert_eq!(composed[0].kind, "rulebook_scan_limit");
+        assert!(
+            !composed.iter().any(|hit| hit.kind == "aws_key"),
+            "Core must not scan after a downstream detector fails closed"
+        );
+    }
+
+    #[test]
+    fn unmaskable_extra_preflight_is_blocked_without_claiming_masked_traffic() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let audit_path = std::env::temp_dir().join(format!(
+            "promtect-preflight-audit-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let extra: super::ExtraDetector = Arc::new(|_| {
+            vec![super::detect::Match::new(
+                "rulebook_scan_limit",
+                String::new(),
+                usize::MAX,
+                usize::MAX,
+            )]
+        });
+        let ctx = super::Ctx {
+            upstream: "http://127.0.0.1:1".to_owned(),
+            audit: Arc::new(crate::audit::Audit::to_file(audit_path.clone())),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: Some(extra),
+            output_scan: None,
+        };
+
+        let prepared = super::prepare_body(
+            bytes::Bytes::from_static(b"ordinary request body"),
+            &ctx,
+            &crate::vault::Vault::new(),
+            "preflight-request",
+        );
+        assert!(matches!(prepared, super::PreparedBody::Block(_)));
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let metrics = crate::metrics::aggregate(&audit_path);
+        std::fs::remove_file(&audit_path).ok();
+
+        assert!(audit.contains(r#""action":"request""#));
+        assert!(audit.contains(r#""masked":0"#));
+        assert!(audit.contains(r#""blocked":true"#));
+        assert!(audit.contains(r#""action":"request_rejected""#));
+        assert!(audit.contains(r#""detector":"rulebook_scan_limit""#));
+        assert_eq!(metrics.requests_total, 1);
+        assert_eq!(metrics.requests_clean, 0);
+        assert_eq!(metrics.requests_with_secrets, 0);
+        assert_eq!(metrics.requests_blocked_total, 1);
+        assert_eq!(metrics.recent[0].masked, 0);
+        assert!(metrics.recent[0].blocked);
+    }
+
+    #[tokio::test]
+    async fn synchronous_detector_work_does_not_block_the_async_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let started_for_detector = Arc::clone(&started);
+        let extra: super::ExtraDetector = Arc::new(move |_| {
+            started_for_detector.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            Vec::new()
+        });
+        let ctx = super::Ctx {
+            upstream: "http://127.0.0.1:1".to_owned(),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: Some(extra),
+            output_scan: None,
+        };
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let scan_permit = Arc::clone(&scan_slots)
+            .acquire_owned()
+            .await
+            .expect("scan semaphore stays open");
+        let prepare = super::prepare_body_async(
+            bytes::Bytes::from_static(b"ordinary text"),
+            ctx,
+            Arc::new(crate::vault::Vault::new()),
+            "test-request".to_owned(),
+            scan_permit,
+        );
+        let heartbeat = async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let (heartbeat, prepared) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(100), heartbeat),
+            prepare
+        );
+
+        assert!(
+            heartbeat.is_ok(),
+            "the async timer must run while synchronous detection is active"
+        );
+        assert!(matches!(prepared, Ok(super::PreparedBody::Forward(_))));
+    }
+
+    #[tokio::test]
+    async fn saturated_scan_admission_fails_closed_before_body_or_upstream() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use tokio::time::timeout;
+
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let slot_count = u32::try_from(super::scan_slot_limit()).expect("small scan-slot cap");
+        let held_slots = timeout(
+            Duration::from_secs(2),
+            Arc::clone(&scan_slots).acquire_many_owned(slot_count),
+        )
+        .await
+        .expect("other tests release scan slots")
+        .expect("scan semaphore stays open");
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream counter");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let ctx = super::Ctx {
+            upstream: format!("http://{upstream_addr}"),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: None,
+            output_scan: None,
+        };
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let proxy_addr = proxy.local_addr().expect("proxy address");
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy, super::app_with_scan_slots(ctx, scan_slots))
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve proxy");
+        });
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/saturated"))
+            .body(canary)
+            .send()
+            .await
+            .expect("capacity response");
+        let status = response.status();
+        let response_body = response.text().await.expect("read capacity response");
+
+        let _ = shutdown.send(());
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("proxy shutdown timeout")
+            .expect("proxy task join");
+        drop(held_slots);
+
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_body, super::SCAN_CAPACITY_MESSAGE);
+        assert!(!response_body.contains(canary));
+        assert!(
+            timeout(Duration::from_millis(50), upstream.accept())
+                .await
+                .is_err(),
+            "saturated admission must not open an upstream connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_request_body_times_out_value_free_and_releases_admission() {
+        use futures_util::StreamExt as _;
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use tower::ServiceExt as _;
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream counter");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let upstream_connections = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&upstream_connections);
+        let (upstream_shutdown, mut upstream_shutdown_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut upstream_shutdown_rx => break,
+                    connection = upstream.accept() => {
+                        if connection.is_err() { break; }
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        let ctx = super::Ctx {
+            upstream: format!("http://{upstream_addr}"),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: None,
+            output_scan: None,
+        };
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let app_scan_slots = Arc::clone(&scan_slots);
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let partial_then_stalled = futures_util::stream::once(async move {
+            Ok::<_, Infallible>(bytes::Bytes::from_static(canary.as_bytes()))
+        })
+        .chain(futures_util::stream::pending());
+        let request = axum::http::Request::post("/slow")
+            .body(axum::body::Body::from_stream(partial_then_stalled))
+            .expect("build slow request");
+        let response_task = tokio::spawn(async move {
+            super::app_with_scan_slots(ctx, app_scan_slots)
+                .oneshot(request)
+                .await
+                .expect("slow body response")
+        });
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(super::REQUEST_BODY_TIMEOUT + Duration::from_secs(1)).await;
+        let response = response_task.await.expect("response task join");
+        let status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read timeout response");
+        let permit_after_timeout =
+            super::try_scan_permit(&scan_slots).expect("timeout releases scan slot");
+        drop(permit_after_timeout);
+        let _ = upstream_shutdown.send(());
+        upstream_task.await.expect("upstream task join");
+
+        assert_eq!(status, axum::http::StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response_body, super::REQUEST_BODY_TIMEOUT_MESSAGE);
+        assert!(
+            !response_body
+                .as_ref()
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+        );
+        assert_eq!(upstream_connections.load(Ordering::SeqCst), 0);
     }
 
     #[test]

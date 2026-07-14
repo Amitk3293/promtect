@@ -211,11 +211,11 @@ async fn output_scan_flags_model_secret_in_live_response() {
     let _ = std::fs::remove_file(&audit_path);
 }
 
-/// A downstream paid/rulebook detector participates in both masking and the
-/// final residual check. If its first span is unusable, the second pass catches
-/// the surviving canary and blocks before the upstream receives a request.
+/// A downstream paid/rulebook detector participates in the fail-closed request
+/// path. If its first span is unusable, the proxy blocks immediately without a
+/// Core scan, a redundant detector pass, or an upstream connection.
 #[tokio::test]
-async fn active_extra_detector_blocks_a_residual_before_upstream() {
+async fn active_extra_detector_blocks_an_unmaskable_result_before_upstream() {
     let (mock_url, seen) = spawn_mock().await;
     let mut c = ctx(&mock_url);
     let calls = Arc::new(AtomicU64::new(0));
@@ -250,8 +250,8 @@ async fn active_extra_detector_blocks_a_residual_before_upstream() {
 
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
-    assert!(body.contains("custom_rulebook"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(body, "promtect: request detector failed closed");
     assert!(!body.contains("CUSTOMSECRET"));
 }
 
