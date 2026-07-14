@@ -2,3 +2,5 @@
 .claude/
 *.jsonl
 tests/provider-harness/.requirements-wheels/
+__pycache__/
+*.py[cod]

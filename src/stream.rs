@@ -26,8 +26,10 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
 use std::collections::{HashSet, hash_map::RandomState};
 use std::hash::BuildHasher;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 /// A response-side detection pass, injected by `promtect-pro` (license-gated):
 /// it scans the restored response text for secrets the model echoed back or
@@ -366,6 +368,58 @@ impl StreamOutcome {
     }
 }
 
+struct ObservedStream<S> {
+    inner: Pin<Box<S>>,
+    audit: Arc<Audit>,
+    request_id: String,
+    interrupted: Arc<AtomicBool>,
+    completed: bool,
+}
+
+impl<S> ObservedStream<S> {
+    fn record_outcome(&self, action: &str, detector: &str, placeholder: &str) {
+        if !self.interrupted.swap(true, Ordering::AcqRel) {
+            self.audit
+                .record(action, detector, placeholder, &self.request_id);
+        }
+    }
+}
+
+impl<E, S> Stream for ObservedStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(Some(Err(error))) => {
+                this.record_outcome("stream_interrupted", "upstream", "«stream-interrupted»");
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.completed = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for ObservedStream<S> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Dropping an otherwise healthy upstream stream means the
+            // downstream client stopped consuming it. Record that separately:
+            // it is operationally useful, but it does not invalidate the fact
+            // that Promtect masked the outbound request.
+            self.record_outcome("stream_cancelled", "downstream", "«stream-cancelled»");
+        }
+    }
+}
+
 /// Observe failures in a byte-preserving downstream response stream.
 ///
 /// Every successful upstream byte and every source error is forwarded unchanged.
@@ -384,22 +438,13 @@ where
     let outcome = StreamOutcome {
         interrupted: Arc::new(AtomicBool::new(false)),
     };
-    let outcome_for_stream = outcome.clone();
-    let observed = stream.map(move |item| match item {
-        Ok(bytes) => Ok(bytes),
-        Err(error) => {
-            outcome_for_stream
-                .interrupted
-                .store(true, Ordering::Release);
-            audit.record(
-                "stream_interrupted",
-                "upstream",
-                "«stream-interrupted»",
-                &request_id,
-            );
-            Err(error)
-        }
-    });
+    let observed = ObservedStream {
+        inner: Box::pin(stream),
+        audit,
+        request_id,
+        interrupted: Arc::clone(&outcome.interrupted),
+        completed: false,
+    };
     (observed, outcome)
 }
 
@@ -793,5 +838,31 @@ mod tests {
         assert!(outcome.was_interrupted());
         assert!(log.contains("\"action\":\"stream_interrupted\""));
         assert!(!log.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[tokio::test]
+    async fn downstream_cancellation_is_distinct_from_upstream_interruption() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-stream-cancelled-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(Audit::to_file(path.clone()));
+        let upstream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let (observed, outcome) =
+            observe_stream_errors(upstream, Arc::clone(&audit), "request-cancelled".into());
+
+        drop(observed);
+        assert!(outcome.was_interrupted());
+        drop(audit);
+
+        let log = std::fs::read_to_string(&path).expect("read cancellation audit");
+        std::fs::remove_file(&path).ok();
+        let mut lock_name = path.into_os_string();
+        lock_name.push(".lock");
+        std::fs::remove_file(std::path::PathBuf::from(lock_name)).ok();
+        assert!(log.contains("\"action\":\"stream_cancelled\""));
+        assert!(log.contains("\"detector\":\"downstream\""));
+        assert!(!log.contains("\"action\":\"stream_interrupted\""));
+        assert!(log.contains("\"request_id\":\"request-cancelled\""));
     }
 }

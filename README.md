@@ -127,7 +127,7 @@ and does not install a root certificate or change the system trust store.
 and tears it down on exit, no manual env-var wiring:
 
 ```sh
-promtect guard claude                     # Claude Code, secrets masked → Anthropic
+promtect guard claude                     # unmanaged individual Claude Max → Anthropic
 promtect guard codex                      # Codex → OpenAI
 promtect guard ollama run deepseek-r1     # local Ollama, nothing leaves your box
 promtect guard ollama --cloud run gpt-oss:120b-cloud   # Ollama Cloud → masked → ollama.com
@@ -146,12 +146,20 @@ cannot be mistaken for a new root command. Unknown root commands fail closed.
 It also disables Codex WebSockets and provider retries, keeping each protected
 model call on one observable HTTP Responses request.
 
-Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OLLAMA_API_KEY`) flow
-through untouched, Promtect only masks the request body. The base URL each tool
-needs is set for you (`ANTHROPIC_BASE_URL` for Claude, `OPENAI_BASE_URL` for Codex,
-`OLLAMA_HOST` for Ollama). Local Ollama runs on your own machine, so there is little
-to protect; `--cloud` points it at `ollama.com`, where your prompt leaves the box and
-masking earns its keep. Combine with
+`guard claude` currently supports a verified first-party, unmanaged individual
+Claude Max profile. It fails before binding for API-key, Pro, Team, Enterprise,
+gateway, remote/endpoint-managed, or unknown profiles because Claude managed
+settings outrank command-line routing and hooks. API-key users can use the
+[manual Claude proxy setup](docs/integrations/claude-code.md#start-promtect-manual),
+which does not include the automatic in-session notice.
+
+Manual proxy sessions and supported non-Claude guards forward their provider API
+keys untouched; Promtect only masks the request body. `guard claude` instead
+refuses environment auth overrides and uses the verified stored individual Max
+credential. The base URL each tool needs is set for you (`ANTHROPIC_BASE_URL` for
+Claude, `OPENAI_BASE_URL` for Codex, `OLLAMA_HOST` for Ollama). Local Ollama runs on
+your own machine, so there is little to protect; `--cloud` points it at `ollama.com`,
+where your prompt leaves the box and masking earns its keep. Combine with
 [Headroom](https://github.com/chopratejas/headroom) for secrets-safe **and** ~90%
 cheaper sessions.
 
@@ -192,7 +200,7 @@ point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 
 | Tool | Setup |
 |------|-------|
-| **Claude Code** | `promtect` then `ANTHROPIC_BASE_URL=http://127.0.0.1:8790` |
+| **Claude Code** | `promtect guard claude` for reviewed Claude Code 2.1.209 + individual Max + automatic notice; manual base-URL routing remains available for API-key use ([guide](docs/integrations/claude-code.md)) |
 | **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8790/v1` |
 | **OpenAI Codex CLI** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |
 | **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |
