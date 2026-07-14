@@ -10,7 +10,11 @@
 # /usr/local/cargo/bin, so cargo/rustc stay available.
 services:
   test:
-    image: rust:1-bookworm # latest stable Rust toolchain, includes clippy + rustfmt
+    # Build the digest-pinned toolchain once so disposable test containers do
+    # not redownload Clippy/rustfmt on every run.
+    build:
+      context: .
+      dockerfile: Dockerfile.test
     working_dir: /build
     volumes:
       - .:/build
