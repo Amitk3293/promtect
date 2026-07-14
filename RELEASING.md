@@ -204,19 +204,23 @@ requires both the package API and direct registry reads for all three tags to
 resolve to the pushed digest. Missing or deleted provenance fails closed rather
 than guessing from flattened tag history.
 
-If a tag promotion is interrupted, a retry may resume only aliases that already
-resolve to the exact digest pushed by that retry. An absent alias is created, a
-same-digest alias is idempotently recreated, and any other digest fails closed.
-This makes a partial multi-tag write recoverable without permitting immutable
-version replacement.
+Before the first customer-facing tag write, the protected job stores the chosen
+digest, tag, and exact source SHA in an immutable 90-day workflow artifact. A
+retry selects the oldest unexpired record bound to that `main` source and reuses
+its digest even when a fresh rebuild has another digest. An absent alias is
+created, a same-digest alias is idempotently recreated, and any other digest
+fails closed. A missing, expired, malformed, wrong-branch, or wrong-source record
+cannot authorize recovery. This makes a partial multi-tag write recoverable
+without permitting immutable version replacement.
 
 GHCR does not provide a permanent immutable-tag guarantee. These controls
 enforce non-replacement for this serialized workflow and detect publication
 drift at completion; a separate actor with package write access could still move
 or delete a tag later. Limit package writers, monitor tag-to-digest mappings,
-and treat signed attestations/digest pins as the durable identity. A failure that
-cannot prove same-digest partial state requires a new patch version, never
-intentional tag replacement.
+and treat signed attestations/digest pins as the durable identity. If a recovery
+record has expired while an orphan alias remains, stop and use a separately
+reviewed package-administration cleanup; a new patch must not bypass the orphan
+provenance check.
 
 The conventional container `latest` tag is deprecated and is never published or
 advanced. Consumers must pin `X.Y.Z`, `vX.Y.Z`, or deliberately track `X.Y`.

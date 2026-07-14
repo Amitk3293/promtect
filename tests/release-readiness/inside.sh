@@ -220,6 +220,44 @@ JSON
 python3 scripts/check-ghcr-tags.py v1.2.4 \
   "$root/ghcr-partial-rolling-resume.json" --resume-digest "$digest_b"
 
+digest_record_sha="0123456789abcdef0123456789abcdef01234567"
+python3 scripts/container-digest-state.py create \
+  "$root/container-digest.json" v1.2.4 "$digest_record_sha" "$digest_b"
+[ "$(python3 scripts/container-digest-state.py verify \
+  "$root/container-digest.json" v1.2.4 "$digest_record_sha")" = "$digest_b" ]
+if python3 scripts/container-digest-state.py verify \
+  "$root/container-digest.json" v1.2.5 "$digest_record_sha" \
+  >/dev/null 2>&1; then
+  echo "container digest record passed for the wrong tag" >&2
+  exit 1
+fi
+cat > "$root/container-artifacts.json" <<JSON
+[
+  {
+    "artifacts": [
+    {
+      "id": 22,
+      "name": "core-container-v1.2.4-${digest_record_sha}-digest",
+      "expired": false,
+      "created_at": "2026-07-14T11:00:00Z",
+      "workflow_run": {"head_sha": "${digest_record_sha}", "head_branch": "main"}
+    },
+    {
+      "id": 11,
+      "name": "core-container-v1.2.4-${digest_record_sha}-digest",
+      "expired": false,
+      "created_at": "2026-07-14T10:00:00Z",
+      "workflow_run": {"head_sha": "${digest_record_sha}", "head_branch": "main"}
+    }
+    ]
+  }
+]
+JSON
+[ "$(python3 scripts/container-digest-state.py select-artifact \
+  "$root/container-artifacts.json" \
+  "core-container-v1.2.4-${digest_record_sha}-digest" \
+  "$digest_record_sha")" = 11 ]
+
 cat > "$root/ghcr-stale-rolling.json" <<JSON
 [[
   {"name":"$digest_a","metadata":{"container":{"tags":["1.2","1.2.3","v1.2.3"]}}},
@@ -758,10 +796,12 @@ assert "--normalization-candidate" in release
 assert "--assets-subset" in release
 assert "isDraft,isPrerelease,name,body,assets,tagName,targetCommitish" in release
 assert "push-by-digest=true" in container
-assert "--resume-digest \"$PUSHED_DIGEST\"" in container
+assert "--resume-digest \"$PUBLISH_DIGEST\"" in container
 assert "require_absent_or_same" in container
 assert "--expected-digest" in container
 assert "imagetools inspect" in container
+assert "Persist digest before any customer-facing tag write" in container
+assert "container-digest-state.py" in container
 for workflow in (release, container):
     assert '[ "$sha" = "$WORKFLOW_SHA" ]' in workflow
 for runner in ("macos-15", "macos-15-intel", "ubuntu-22.04", "ubuntu-22.04-arm"):

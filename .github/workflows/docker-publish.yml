@@ -103,6 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: core-container-release
     permissions:
+      actions: read
       contents: read
       packages: write
     # Only publish after the test suite passes.
@@ -143,10 +144,50 @@ jobs:
           context: .
           outputs: type=image,name=ghcr.io/amitk3293/promtect,push-by-digest=true,name-canonical=true,push=true
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Resolve restart-safe publication digest
+        id: publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          trap 'rm -rf "$root"' EXIT
+          artifact_name="core-container-${TAG}-${SOURCE_SHA}-digest"
+          gh api --method GET --paginate --slurp \
+            "/repos/${GITHUB_REPOSITORY}/actions/artifacts" \
+            -f "name=$artifact_name" -f per_page=100 \
+            > "$root/artifacts.json"
+          artifact_id="$(python3 scripts/container-digest-state.py \
+            select-artifact "$root/artifacts.json" "$artifact_name" "$SOURCE_SHA")"
+          publication_digest="$CURRENT_DIGEST"
+          if [ -n "$artifact_id" ]; then
+            mkdir "$root/prior"
+            gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+              > "$root/prior.zip"
+            unzip -q "$root/prior.zip" -d "$root/prior"
+            publication_digest="$(python3 scripts/container-digest-state.py \
+              verify "$root/prior/container-digest.json" "$TAG" "$SOURCE_SHA")"
+          fi
+          record="$RUNNER_TEMP/container-digest.json"
+          python3 scripts/container-digest-state.py create \
+            "$record" "$TAG" "$SOURCE_SHA" "$publication_digest"
+          {
+            echo "artifact_name=$artifact_name"
+            echo "digest=$publication_digest"
+            echo "record=$record"
+          } >> "$GITHUB_OUTPUT"
+      - name: Persist digest before any customer-facing tag write
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.publication.outputs.artifact_name }}
+          path: ${{ steps.publication.outputs.record }}
+          if-no-files-found: error
+          retention-days: 90
       - name: Recheck tags, promote reviewed digest, and verify postcondition
         env:
           GH_TOKEN: ${{ github.token }}
-          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+          PUBLISH_DIGEST: ${{ steps.publication.outputs.digest }}
         run: |
           set -euo pipefail
           versions="$(mktemp)"
@@ -169,7 +210,7 @@ jobs:
           bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
           fetch_versions
           python3 scripts/check-ghcr-tags.py "$TAG" "$versions" \
-            --resume-digest "$PUSHED_DIGEST" --state-output "$state"
+            --resume-digest "$PUBLISH_DIGEST" --state-output "$state"
 
           version="${TAG#v}"
           rolling="${version%.*}"
@@ -182,7 +223,7 @@ jobs:
             local reference="$1"
             local resolved
             if resolved="$(inspect_digest "$reference")"; then
-              [ "$resolved" = "$PUSHED_DIGEST" ] \
+              [ "$resolved" = "$PUBLISH_DIGEST" ] \
                 || { echo "GHCR tag already exists at another digest: $reference" >&2; return 1; }
               echo "resuming same-digest GHCR tag: $reference"
               return 0
@@ -220,7 +261,7 @@ jobs:
             --tag "$image:$version" \
             --tag "$image:$TAG" \
             --tag "$image:$rolling" \
-            "$image@$PUSHED_DIGEST"
+            "$image@$PUBLISH_DIGEST"
 
           verified=false
           for _ in 1 2 3 4 5 6; do
@@ -228,14 +269,14 @@ jobs:
             api_ok=false
             registry_ok=true
             if python3 scripts/check-ghcr-tags.py "$TAG" "$versions" \
-              --expected-digest "$PUSHED_DIGEST"; then
+              --expected-digest "$PUBLISH_DIGEST"; then
               api_ok=true
             fi
             for published_tag in "$version" "$TAG" "$rolling"; do
               actual_digest="sha256:$(docker buildx imagetools inspect \
                 "$image:$published_tag" --raw | sha256sum | awk '{print $1}')" \
                 || registry_ok=false
-              [ "$actual_digest" = "$PUSHED_DIGEST" ] || registry_ok=false
+              [ "$actual_digest" = "$PUBLISH_DIGEST" ] || registry_ok=false
             done
             if [ "$api_ok" = true ] && [ "$registry_ok" = true ]; then
               verified=true
