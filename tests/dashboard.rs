@@ -357,10 +357,9 @@ async fn api_metrics_skips_oversized_records_and_keeps_recent_lifecycle() {
 #[tokio::test]
 #[cfg(unix)]
 async fn scan_failure_returns_503_and_recovers_when_path_becomes_readable() {
-    let audit_path = std::env::temp_dir().join(format!(
-        "promtect-dashboard-scan-failure-{}",
-        uuid::Uuid::new_v4()
-    ));
+    // Keep the basename short enough for macOS's Unix-domain socket path cap.
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let audit_path = std::env::temp_dir().join(format!("pt-d-{}", &suffix[..8]));
     let listener =
         std::os::unix::net::UnixListener::bind(&audit_path).expect("create non-file audit path");
     let base = spawn_dashboard(audit_path.clone()).await;

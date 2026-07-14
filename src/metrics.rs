@@ -783,10 +783,11 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn aggregate_reports_existing_non_file_path_as_error() {
-        let path = std::env::temp_dir().join(format!(
-            "promtect-metrics-scan-error-{}",
-            uuid::Uuid::new_v4()
-        ));
+        // macOS limits Unix-domain socket paths to roughly 104 bytes. Its
+        // per-user temporary directory is already long, so keep the fixture
+        // basename deliberately short.
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let path = std::env::temp_dir().join(format!("pt-m-{}", &suffix[..8]));
         let listener =
             std::os::unix::net::UnixListener::bind(&path).expect("create non-file audit path");
 
