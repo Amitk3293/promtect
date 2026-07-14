@@ -421,6 +421,38 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 python3 scripts/verify-draft-release.py v1.2.3 "$source_sha_fixture" \
   --assets < "$root/draft-assets.json"
+python3 - "$root/draft-assets.json" "$root/published-assets.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["isDraft"] = False
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+python3 scripts/verify-draft-release.py v1.2.3 "$source_sha_fixture" \
+  --published < "$root/published-assets.json"
+
+fake_bin="$root/fake-bin"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1 $2" = "release edit" ]; then
+  exit 1
+fi
+if [ "$1 $2" = "release view" ]; then
+  cat "$PROMTECT_TEST_PUBLISHED_RELEASE"
+  exit 0
+fi
+exit 2
+SH
+chmod +x "$fake_bin/gh"
+PATH="$fake_bin:$PATH" \
+  PROMTECT_TEST_PUBLISHED_RELEASE="$root/published-assets.json" \
+  bash scripts/publish-verified-draft.sh v1.2.3 "$source_sha_fixture"
+
 python3 - "$root/draft-assets.json" <<'PY'
 import json
 import sys
@@ -435,6 +467,23 @@ PY
 if python3 scripts/verify-draft-release.py v1.2.3 "$source_sha_fixture" \
   --assets < "$root/draft-assets.json" >/dev/null 2>&1; then
   echo "incomplete draft release asset set passed verification" >&2
+  exit 1
+fi
+python3 - "$root/draft-assets.json" "$root/incomplete-published.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    data = json.load(handle)
+data["isDraft"] = False
+with open(sys.argv[2], "w", encoding="utf-8") as handle:
+    json.dump(data, handle)
+PY
+if PATH="$fake_bin:$PATH" \
+  PROMTECT_TEST_PUBLISHED_RELEASE="$root/incomplete-published.json" \
+  bash scripts/publish-verified-draft.sh v1.2.3 "$source_sha_fixture" \
+    >/dev/null 2>&1; then
+  echo "lost publish response accepted an incomplete published release" >&2
   exit 1
 fi
 
@@ -865,6 +914,9 @@ for workflow in (release, container):
     assert "RELEASE_ADMIN_BYPASS_EVIDENCE" in workflow
 assert "--normalization-candidate" in release
 assert "--assets-subset" in release
+assert '"$TAG" "$SOURCE_SHA" --published' in release
+assert 'publish-verified-draft.sh "$TAG" "$SOURCE_SHA"' in release
+assert 'cmp "$candidate" "$published_dir/$(basename "$candidate")"' in release
 assert "isDraft,isPrerelease,name,body,assets,tagName,targetCommitish" in release
 assert "push-by-digest=true" in container
 assert "--resume-digest \"$PUBLISH_DIGEST\"" in container

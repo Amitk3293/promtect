@@ -1729,7 +1729,7 @@ fn preflight_guard_terminal() -> Result<(), String> {
 
     match nix::unistd::tcgetpgrp(std::io::stdin()) {
         Ok(foreground_pgrp) => require_foreground_guard(foreground_pgrp, nix::unistd::getpgrp()),
-        Err(Errno::ENOTTY) => Ok(()),
+        Err(Errno::ENOTTY | Errno::EBADF) => Ok(()),
         Err(error) => Err(format!("cannot inspect terminal job control ({error})")),
     }
 }
@@ -1748,7 +1748,7 @@ impl GuardTerminalLease {
 
         let original_pgrp = match nix::unistd::tcgetpgrp(std::io::stdin()) {
             Ok(pgrp) => pgrp,
-            Err(Errno::ENOTTY) => return Ok(None),
+            Err(Errno::ENOTTY | Errno::EBADF) => return Ok(None),
             Err(error) => return Err(format!("cannot inspect terminal job control ({error})")),
         };
         require_foreground_guard(original_pgrp, nix::unistd::getpgrp())?;

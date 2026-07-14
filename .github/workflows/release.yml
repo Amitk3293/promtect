@@ -269,7 +269,26 @@ jobs:
 
           bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
           if existing_json="$(gh release view "$TAG" \
-            --json "isDraft,assets,tagName,targetCommitish" 2>/dev/null)"; then
+            --json "$metadata_fields" 2>/dev/null)"; then
+            if printf '%s\n' "$existing_json" \
+              | python3 scripts/verify-draft-release.py \
+                "$TAG" "$SOURCE_SHA" --published >/dev/null 2>&1; then
+              printf '%s\n' "$existing_json" \
+                | python3 scripts/verify-draft-release.py \
+                  "$TAG" "$SOURCE_SHA" --published
+              (
+                published_dir="$(mktemp -d)"
+                trap 'rm -rf "$published_dir"' EXIT
+                gh release download "$TAG" --dir "$published_dir" \
+                  --pattern '*.tar.gz' --pattern '*.tar.gz.sha256'
+                bash scripts/verify-release-assets.sh \
+                  "$TAG" "$published_dir" "$SOURCE_SHA"
+                for candidate in dist/*.tar.gz dist/*.tar.gz.sha256; do
+                  cmp "$candidate" "$published_dir/$(basename "$candidate")"
+                done
+              )
+              exit 0
+            fi
             printf '%s\n' "$existing_json" \
               | python3 scripts/verify-draft-release.py \
                 "$TAG" "$SOURCE_SHA" --normalization-candidate
@@ -307,4 +326,4 @@ jobs:
             --prerelease=false
           release_json="$(gh release view "$TAG" --json "$metadata_fields")"
           validate_draft_target "$release_json"
-          gh release edit "$TAG" --draft=false --latest
+          bash scripts/publish-verified-draft.sh "$TAG" "$SOURCE_SHA"
