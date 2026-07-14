@@ -13,6 +13,7 @@ use axum::{
     http::{HeaderMap, Method, Uri},
     response::Response,
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::BodyExt as _;
 use std::sync::Arc;
@@ -103,15 +104,42 @@ pub struct Ctx {
     pub output_scan: Option<crate::stream::ResponseScanner>,
 }
 
-/// Core detectors plus any extra (Pro) detection pass, merged into one match list.
-/// `None` yields exactly the core's `detect()` output, so the public proxy's
-/// behavior is unchanged; a downstream build adds its matches here. The merged
-/// list may overlap — [`mask_with_matches`] coalesces overlaps before masking.
+/// Whether a detector hit can be masked exactly from the text it inspected.
+///
+/// Downstream detectors also use deliberately invalid spans as fail-closed
+/// control markers when their own runtime bounds are exceeded. Treat every
+/// malformed or value-mismatched hit as unmaskable so it can block without
+/// spending more CPU on detector passes that cannot make the request safe.
+fn match_is_maskable(text: &str, hit: &detect::Match) -> bool {
+    hit.start < hit.end
+        && hit.end <= text.len()
+        && text.is_char_boundary(hit.start)
+        && text.is_char_boundary(hit.end)
+        && text
+            .get(hit.start..hit.end)
+            .is_some_and(|value| value == hit.value.as_str())
+}
+
+/// Extra (Pro) detectors run before the Core detector set so a bounded
+/// downstream pass can reject work before Core scans the complete body. A
+/// malformed extra hit is a fail-closed control result: return it immediately
+/// and let the request path block without running Core. Valid extra matches are
+/// then merged with Core exactly as before.
+///
+/// `None` still yields exactly the Core detector output. The merged list may
+/// overlap — [`mask_with_matches`] coalesces overlaps before masking.
 fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Match> {
-    let mut matches = detect::detect(text);
-    if let Some(extra) = extra {
-        matches.extend(extra(text));
+    let extra_matches = extra.as_ref().map_or_else(Vec::new, |detect| detect(text));
+    if extra_matches
+        .iter()
+        .any(|hit| !match_is_maskable(text, hit))
+    {
+        return extra_matches;
     }
+    // Preserve Core-first merge precedence for overlapping valid spans; only
+    // execution order changes so downstream bounds can fail before Core work.
+    let mut matches = detect::detect(text);
+    matches.extend(extra_matches);
     matches
 }
 
@@ -162,6 +190,133 @@ fn scan_for_residual_leaks(
             !is_minted_sentinel_content
         })
         .collect()
+}
+
+enum PreparedBody {
+    Forward(Vec<u8>),
+    Block(Response),
+}
+
+fn residual_block_response(
+    ctx: &Ctx,
+    request_id: &str,
+    hit_count: usize,
+    request_kinds: &[&str],
+    body_len: usize,
+    masked_len: usize,
+    leaks: &[detect::Match],
+) -> Response {
+    let leak_kinds: Vec<&str> = {
+        let mut kinds: Vec<&str> = leaks.iter().map(|hit| hit.kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds
+    };
+    eprintln!(
+        "[promtect] ⚠️  LEAK req {}: {} pattern{} may not be masked ({}) \
+         — request blocked",
+        &request_id[..8],
+        leaks.len(),
+        if leaks.len() == 1 { "" } else { "s" },
+        leak_kinds.join(", ")
+    );
+    ctx.audit
+        .record_request(request_id, hit_count, request_kinds, body_len, masked_len);
+    ctx.audit.record(
+        "request_blocked",
+        "residual_secret",
+        "«residual-secret»",
+        request_id,
+    );
+    text_response(
+        400,
+        format!(
+            "promtect: {} secret pattern{} not masked before forwarding ({})",
+            leaks.len(),
+            if leaks.len() == 1 { "" } else { "s" },
+            leak_kinds.join(", ")
+        ),
+    )
+}
+
+/// Perform UTF-8 validation, detection, masking, and the residual scan away from
+/// Tokio's async workers. Detector regexes are synchronous and may inspect the
+/// complete configured body limit; running them on an async worker can prevent
+/// unrelated connections, timers, and shutdown from being polled.
+fn prepare_body(body_bytes: Bytes, ctx: &Ctx, vault: &Vault, request_id: &str) -> PreparedBody {
+    let text = match std::str::from_utf8(&body_bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            ctx.audit
+                .record_request(request_id, 0, &[], body_bytes.len(), body_bytes.len());
+            return PreparedBody::Forward(body_bytes.to_vec());
+        }
+    };
+
+    let matches = compose_matches(text, &ctx.extra_detect);
+    let hit_count = matches.len();
+    let mut kinds: Vec<&str> = matches.iter().map(|hit| hit.kind).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+
+    // Invalid downstream spans are fail-closed control results. Block them
+    // immediately, before copying/masking the body or running Core and residual
+    // detector passes. This is how a bounded Pro rulebook rejects excess work.
+    if matches.iter().any(|hit| !match_is_maskable(text, hit)) {
+        return PreparedBody::Block(residual_block_response(
+            ctx,
+            request_id,
+            hit_count,
+            &kinds,
+            body_bytes.len(),
+            body_bytes.len(),
+            &matches,
+        ));
+    }
+
+    let masked = mask_with_matches(text, matches, vault, &ctx.audit, request_id);
+    if hit_count > 0 && !is_quiet() {
+        eprintln!(
+            "[promtect] req {}: masked {} secret{} ({})",
+            &request_id[..8],
+            hit_count,
+            if hit_count == 1 { "" } else { "s" },
+            kinds.join(", ")
+        );
+    }
+
+    if hit_count > 0 {
+        let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect, vault);
+        if !leaks.is_empty() {
+            return PreparedBody::Block(residual_block_response(
+                ctx,
+                request_id,
+                hit_count,
+                &kinds,
+                body_bytes.len(),
+                masked.len(),
+                &leaks,
+            ));
+        }
+    }
+
+    ctx.audit.record_request(
+        request_id,
+        hit_count,
+        &kinds,
+        body_bytes.len(),
+        masked.len(),
+    );
+    PreparedBody::Forward(masked.into_bytes())
+}
+
+async fn prepare_body_async(
+    body_bytes: Bytes,
+    ctx: Ctx,
+    vault: Arc<Vault>,
+    request_id: String,
+) -> Result<PreparedBody, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || prepare_body(body_bytes, &ctx, &vault, &request_id)).await
 }
 
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
@@ -353,110 +508,28 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // Held in an `Arc` so it can move into the response stream, which the server
     // polls after this handler returns.
     let vault = Arc::new(Vault::new());
-
-    // Scan the body only when it is genuinely text. We decide this from the ACTUAL
-    // bytes (valid UTF-8?), NOT the client-declared `Content-Type` — otherwise a
-    // request could bypass masking and leak a secret simply by mislabelling a JSON
-    // body as `application/octet-stream`. A body that is not valid UTF-8 is binary
-    // (or mislabelled binary) and is forwarded byte-for-byte, so the proxy never
-    // corrupts it by lossy conversion or a mistaken substitution.
-    let forward_bytes = match std::str::from_utf8(&body_bytes) {
-        Ok(text) => {
-            // Compose the core detectors with any extra (Pro) pass, then mask AND
-            // summarize from the same match set so the summary reflects everything
-            // masked. extra_detect is None in the public core (behavior unchanged).
-            let matches = compose_matches(text, &ctx.extra_detect);
-            let hit_count = matches.len();
-
-            // Per-request summary kinds (value-free), taken before the match list is
-            // consumed by masking.
-            let mut kinds: Vec<&str> = matches.iter().map(|m| m.kind).collect();
-            kinds.sort_unstable();
-            kinds.dedup();
-
-            // Mask request body content. Auth headers forwarded untouched in forward().
-            let masked = mask_with_matches(text, matches, &vault, &ctx.audit, &request_id);
-
-            // Emit a Promtect-attributed stderr line so the user can see masking
-            // in their terminal without opening the dashboard. Suppressed under
-            // `guard` (quiet mode) so it does not corrupt a wrapped TUI; the count
-            // still lands in the audit log, the dashboard, and the exit summary.
-            if hit_count > 0 && !is_quiet() {
-                eprintln!(
-                    "[promtect] req {}: masked {} secret{} ({})",
-                    &request_id[..8],
-                    hit_count,
-                    if hit_count == 1 { "" } else { "s" },
-                    kinds.join(", ")
-                );
-            }
-
-            // Post-mask leak check: only needed when masking ran — if no secrets
-            // were detected, the masked body is identical to the input and a second
-            // scan would find the same nothing (wasted work on every clean request).
-            if hit_count > 0 {
-                // Re-run the active detectors over the complete masked body, then
-                // suppress only structurally valid matches wholly inside exact
-                // sentinels minted by this request. Any other surviving match means
-                // masking missed it, so block rather than forward plaintext secrets.
-                let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect, &vault);
-                if !leaks.is_empty() {
-                    let leak_kinds: Vec<&str> = {
-                        let mut v: Vec<&str> = leaks.iter().map(|m| m.kind).collect();
-                        v.sort_unstable();
-                        v.dedup();
-                        v
-                    };
-                    eprintln!(
-                        "[promtect] ⚠️  LEAK req {}: {} pattern{} may not be masked ({}) \
-                         — request blocked",
-                        &request_id[..8],
-                        leaks.len(),
-                        if leaks.len() == 1 { "" } else { "s" },
-                        leak_kinds.join(", ")
-                    );
-                    // Record before blocking so the dashboard counts this request.
-                    ctx.audit.record_request(
-                        &request_id,
-                        hit_count,
-                        &kinds,
-                        body_bytes.len(),
-                        masked.len(),
-                    );
-                    ctx.audit.record(
-                        "request_blocked",
-                        "residual_secret",
-                        "«residual-secret»",
-                        &request_id,
-                    );
-                    return text_response(
-                        400,
-                        format!(
-                            "promtect: {} secret pattern{} not masked before forwarding ({})",
-                            leaks.len(),
-                            if leaks.len() == 1 { "" } else { "s" },
-                            leak_kinds.join(", ")
-                        ),
-                    );
-                }
-            }
-
-            ctx.audit.record_request(
+    let prepared = prepare_body_async(
+        body_bytes,
+        ctx.clone(),
+        Arc::clone(&vault),
+        request_id.clone(),
+    )
+    .await;
+    let forward_bytes = match prepared {
+        Ok(PreparedBody::Forward(bytes)) => bytes,
+        Ok(PreparedBody::Block(response)) => return response,
+        Err(error) => {
+            // A blocking detector task can fail only if it panics or the runtime
+            // shuts down. Either case fails closed and remains value-free.
+            eprintln!("promtect: request scanning task failed: {error}");
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_blocked",
+                "scan_failure",
+                "«request-scan-failed»",
                 &request_id,
-                hit_count,
-                &kinds,
-                body_bytes.len(),
-                masked.len(),
             );
-
-            masked.into_bytes()
-        }
-        Err(_) => {
-            // Non-UTF-8 (binary) body: forward unscanned, but record it as traffic
-            // (zero secrets) so the request still appears in metrics.
-            ctx.audit
-                .record_request(&request_id, 0, &[], body_bytes.len(), body_bytes.len());
-            body_bytes.to_vec()
+            return text_response(500, "promtect: request scanning failed");
         }
     };
 
@@ -874,6 +947,76 @@ mod tests {
         let composed = super::compose_matches(text, &Some(extra));
         assert_eq!(composed.len(), base + 1);
         assert!(composed.iter().any(|m| m.kind == "custom"));
+    }
+
+    #[test]
+    fn compose_matches_short_circuits_core_for_an_unmaskable_extra_result() {
+        let text = "AKIAIOSFODNN7EXAMPLE followed by a bounded detector failure";
+        let extra: super::ExtraDetector = std::sync::Arc::new(|_| {
+            vec![super::detect::Match::new(
+                "rulebook_scan_limit",
+                String::new(),
+                usize::MAX,
+                usize::MAX,
+            )]
+        });
+
+        let composed = super::compose_matches(text, &Some(extra));
+
+        assert_eq!(composed.len(), 1);
+        assert_eq!(composed[0].kind, "rulebook_scan_limit");
+        assert!(
+            !composed.iter().any(|hit| hit.kind == "aws_key"),
+            "Core must not scan after a downstream detector fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronous_detector_work_does_not_block_the_async_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let started_for_detector = Arc::clone(&started);
+        let extra: super::ExtraDetector = Arc::new(move |_| {
+            started_for_detector.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            Vec::new()
+        });
+        let ctx = super::Ctx {
+            upstream: "http://127.0.0.1:1".to_owned(),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: Some(extra),
+            output_scan: None,
+        };
+        let prepare = super::prepare_body_async(
+            bytes::Bytes::from_static(b"ordinary text"),
+            ctx,
+            Arc::new(crate::vault::Vault::new()),
+            "test-request".to_owned(),
+        );
+        let heartbeat = async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let (heartbeat, prepared) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(100), heartbeat),
+            prepare
+        );
+
+        assert!(
+            heartbeat.is_ok(),
+            "the async timer must run while synchronous detection is active"
+        );
+        assert!(matches!(prepared, Ok(super::PreparedBody::Forward(_))));
     }
 
     #[test]
