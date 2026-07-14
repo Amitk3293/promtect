@@ -24,8 +24,12 @@ use crate::mask::restore_scan;
 use crate::vault::Vault;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream::BoxStream};
-use std::collections::HashSet;
+use std::collections::{HashSet, hash_map::RandomState};
+use std::hash::BuildHasher;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 
 /// A response-side detection pass, injected by `promtect-pro` (license-gated):
 /// it scans the restored response text for secrets the model echoed back or
@@ -37,11 +41,20 @@ use std::sync::Arc;
 /// stays byte-for-byte identical to a build without it.
 pub type ResponseScanner = Arc<dyn Fn(&str) -> Vec<crate::detect::Match> + Send + Sync>;
 
-/// Overlap window (bytes) carried between restored chunks so a generated secret
-/// split across a chunk boundary is still seen whole by the output scan.
-/// ponytail: fixed 256-byte window — a secret longer than this split exactly on a
-/// boundary can be missed; acceptable for a warn-only backstop, widen if needed.
-const OUTPUT_SCAN_OVERLAP: usize = 256;
+/// Maximum match width (bytes) that the incremental response scanner can prove
+/// across arbitrary upstream chunk boundaries. Downstream configurable-pattern
+/// features claiming full streamed equivalence must reject larger or unbounded
+/// matches and look-around semantics that depend on artificial window edges.
+pub const OUTPUT_SCAN_MAX_MATCH_BYTES: usize = 256;
+
+/// Maximum distinct output findings retained and audited for one detector kind
+/// in one response. The scan is observe-only, so bounding repeated findings is
+/// preferable to letting a hostile response grow memory and audit output.
+pub const OUTPUT_SCAN_MAX_FINDINGS_PER_KIND: usize = 16;
+
+/// Maximum distinct output findings retained and audited across one response.
+/// This also bounds scanners that return an unexpected number of detector kinds.
+pub const OUTPUT_SCAN_MAX_FINDINGS_PER_REQUEST: usize = 64;
 
 /// First byte of the two-byte UTF-8 encoding of `«` (U+00AB) and `»` (U+00BB).
 const GUILLEMET_LEAD: u8 = 0xC2;
@@ -77,9 +90,16 @@ pub struct StreamRestorer {
     /// Trailing window of already-restored text, prepended to the next chunk so a
     /// generated secret split across a chunk boundary is still scanned whole.
     scan_tail: String,
-    /// Distinct (kind, value) secrets already reported by the output scan, so each
-    /// is warned about once across the stream, not once per chunk or overlap.
-    flagged: HashSet<(&'static str, String)>,
+    /// Distinct (kind, keyed fingerprint) findings already reported by the output
+    /// scan. Fixed-size fingerprints keep plaintext findings out of retained scan
+    /// state; the per-kind and per-request caps bound this set.
+    flagged: HashSet<(&'static str, u64)>,
+    /// Per-request randomized hasher used to fingerprint finding values before
+    /// deduplication. One instance is retained so overlapping windows hash alike.
+    finding_hasher: RandomState,
+    /// Whether the audit already records that additional findings were dropped
+    /// after reaching a cap. One value-free marker preserves operational truth.
+    finding_limit_audited: bool,
 }
 
 impl StreamRestorer {
@@ -98,6 +118,8 @@ impl StreamRestorer {
             scanner: None,
             scan_tail: String::new(),
             flagged: HashSet::new(),
+            finding_hasher: RandomState::new(),
+            finding_limit_audited: false,
         }
     }
 
@@ -198,7 +220,30 @@ impl StreamRestorer {
             if self.vault.knows_secret(m.value.as_str()) {
                 continue;
             }
-            if self.flagged.insert((m.kind, m.value.as_str().to_owned())) {
+            let fingerprint = self.finding_hasher.hash_one((m.kind, m.value.as_str()));
+            if self.flagged.contains(&(m.kind, fingerprint)) {
+                continue;
+            }
+            if self.flagged.len() >= OUTPUT_SCAN_MAX_FINDINGS_PER_REQUEST
+                || self
+                    .flagged
+                    .iter()
+                    .filter(|(kind, _)| *kind == m.kind)
+                    .count()
+                    >= OUTPUT_SCAN_MAX_FINDINGS_PER_KIND
+            {
+                if !self.finding_limit_audited {
+                    self.audit.record(
+                        "output_secret_limit",
+                        "output_scan",
+                        "«output-scan-limit»",
+                        &self.request_id,
+                    );
+                    self.finding_limit_audited = true;
+                }
+                continue;
+            }
+            if self.flagged.insert((m.kind, fingerprint)) {
                 // Value-free: only the detector kind is recorded, never the secret.
                 self.audit
                     .record("output_secret", m.kind, "«output-scan»", &self.request_id);
@@ -214,7 +259,7 @@ impl StreamRestorer {
             }
         }
         // Roll the overlap window forward over the just-scanned text.
-        self.scan_tail = tail_of(&hay, OUTPUT_SCAN_OVERLAP);
+        self.scan_tail = tail_of(&hay, OUTPUT_SCAN_MAX_MATCH_BYTES);
     }
 }
 
@@ -305,6 +350,104 @@ where
     })
 }
 
+/// Shared completion state for a downstream response stream.
+///
+/// The response body exposes this as the value-free
+/// `promtect-stream-outcome` HTTP trailer after all payload bytes. A trailer is
+/// used because an interruption is not knowable when the response headers are
+/// first sent, and adding a marker to an SSE/NDJSON payload would corrupt the
+/// provider protocol.
+#[derive(Clone)]
+pub(crate) struct StreamOutcome {
+    interrupted: Arc<AtomicBool>,
+}
+
+impl StreamOutcome {
+    pub(crate) fn was_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+}
+
+struct ObservedStream<S> {
+    inner: Pin<Box<S>>,
+    audit: Arc<Audit>,
+    request_id: String,
+    interrupted: Arc<AtomicBool>,
+    completed: bool,
+}
+
+impl<S> ObservedStream<S> {
+    fn record_outcome(&self, action: &str, detector: &str, placeholder: &str) {
+        if !self.interrupted.swap(true, Ordering::AcqRel) {
+            self.audit
+                .record(action, detector, placeholder, &self.request_id);
+        }
+    }
+}
+
+impl<E, S> Stream for ObservedStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>>,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.as_mut().get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(Some(Err(error))) => {
+                this.record_outcome("stream_interrupted", "upstream", "«stream-interrupted»");
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.completed = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<S> Drop for ObservedStream<S> {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Dropping an otherwise healthy upstream stream means the
+            // downstream client stopped consuming it. Record that separately:
+            // it is operationally useful, but it does not invalidate the fact
+            // that Promtect masked the outbound request.
+            self.record_outcome("stream_cancelled", "downstream", "«stream-cancelled»");
+        }
+    }
+}
+
+/// Observe failures in a byte-preserving downstream response stream.
+///
+/// Every successful upstream byte and every source error is forwarded unchanged.
+/// The error also produces one value-free audit event. Keeping the error in the
+/// stream makes ordinary clients fail on truncated SSE, NDJSON, JSON, or binary
+/// bodies instead of accepting a clean EOF merely because they ignore trailers.
+pub(crate) fn observe_stream_errors<E, S>(
+    stream: S,
+    audit: Arc<Audit>,
+    request_id: String,
+) -> (impl Stream<Item = Result<Bytes, E>> + Send, StreamOutcome)
+where
+    E: Send + 'static,
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+{
+    let outcome = StreamOutcome {
+        interrupted: Arc::new(AtomicBool::new(false)),
+    };
+    let observed = ObservedStream {
+        inner: Box::pin(stream),
+        audit,
+        request_id,
+        interrupted: Arc::clone(&outcome.interrupted),
+        completed: false,
+    };
+    (observed, outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,17 +503,12 @@ mod tests {
         }
         let _ = sr.finish();
 
-        assert!(
-            !sr.flagged.iter().any(|(_, v)| v == "AKIAIOSFODNN7EXAMPLE"),
-            "restored request secret must be ignored by the output scan"
+        assert_eq!(
+            sr.flagged.len(),
+            1,
+            "the restored request secret must not consume finding state"
         );
-        assert!(
-            sr.flagged
-                .iter()
-                .any(|(k, v)| *k == "aws_key" && v == model_key),
-            "model-generated key must be flagged, got {:?}",
-            sr.flagged
-        );
+        assert!(sr.flagged.iter().any(|(kind, _)| *kind == "aws_key"));
     }
 
     /// The output scan is observe-only: streamed bytes are identical with and
@@ -409,13 +547,120 @@ mod tests {
         }
         let _ = sr.finish();
 
-        assert!(
-            sr.flagged
-                .iter()
-                .any(|(k, v)| *k == "aws_key" && v == model_key),
-            "a key split across chunks must still be caught, got {:?}",
-            sr.flagged
-        );
+        assert_eq!(sr.flagged.len(), 1);
+        assert!(sr.flagged.iter().any(|(kind, _)| *kind == "aws_key"));
+    }
+
+    fn bounded_output_scan_oracle(body: &str, chunk_size: usize) -> (Vec<u8>, String) {
+        let entropy = regex::Regex::new(r"E[A-Za-z0-9]{32};").expect("entropy test regex");
+        let email = regex::Regex::new(r"Mperson[0-9]{3}@example\.com;").expect("email test regex");
+        let scanner: ResponseScanner = Arc::new(move |text: &str| {
+            entropy
+                .find_iter(text)
+                .map(|hit| {
+                    crate::detect::Match::new(
+                        "entropy",
+                        hit.as_str().to_owned(),
+                        hit.start(),
+                        hit.end(),
+                    )
+                })
+                .chain(email.find_iter(text).map(|hit| {
+                    crate::detect::Match::new(
+                        "email",
+                        hit.as_str().to_owned(),
+                        hit.start(),
+                        hit.end(),
+                    )
+                }))
+                .collect()
+        });
+        let audit_path = std::env::temp_dir().join(format!(
+            "promtect-output-cap-{}-{chunk_size}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(Audit::to_file(&audit_path));
+        let mut restorer = StreamRestorer::new(
+            Arc::new(Vault::new()),
+            Arc::clone(&audit),
+            format!("output-cap-{chunk_size}"),
+        )
+        .with_output_scanner(Some(scanner));
+        let mut streamed = Vec::new();
+        for chunk in body.as_bytes().chunks(chunk_size) {
+            streamed.extend_from_slice(&restorer.push(chunk));
+        }
+        streamed.extend_from_slice(&restorer.finish());
+        drop(restorer);
+        drop(audit);
+        let log = std::fs::read_to_string(&audit_path).expect("read value-free audit");
+        std::fs::remove_file(audit_path).ok();
+        (streamed, log)
+    }
+
+    #[test]
+    fn output_scan_findings_are_bounded_and_chunk_invariant() {
+        let body = (0..80)
+            .map(|index| format!("E{index:032}; Mperson{index:03}@example.com; ",))
+            .collect::<String>();
+
+        for chunk_size in [body.len(), 1, 31, 256, 257] {
+            let (streamed, log) = bounded_output_scan_oracle(&body, chunk_size);
+            assert_eq!(streamed, body.as_bytes(), "chunk size {chunk_size}");
+            assert_eq!(
+                log.lines()
+                    .filter(|line| {
+                        line.contains("\"action\":\"output_secret\"")
+                            && line.contains("\"detector\":\"entropy\"")
+                    })
+                    .count(),
+                OUTPUT_SCAN_MAX_FINDINGS_PER_KIND,
+                "entropy audit count at chunk size {chunk_size}: {log}"
+            );
+            assert_eq!(
+                log.lines()
+                    .filter(|line| {
+                        line.contains("\"action\":\"output_secret\"")
+                            && line.contains("\"detector\":\"email\"")
+                    })
+                    .count(),
+                OUTPUT_SCAN_MAX_FINDINGS_PER_KIND,
+                "email audit count at chunk size {chunk_size}: {log}"
+            );
+            assert!(!log.contains("E00000000000000000000000000000000;"));
+            assert!(!log.contains("Mperson000@example.com;"));
+            assert_eq!(
+                log.lines()
+                    .filter(|line| line.contains("\"action\":\"output_secret_limit\""))
+                    .count(),
+                1,
+                "one value-free saturation marker at chunk size {chunk_size}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_scan_total_cap_bounds_many_detector_kinds() {
+        let scanner: ResponseScanner = Arc::new(|_| {
+            ["kind_a", "kind_b", "kind_c", "kind_d", "kind_e"]
+                .into_iter()
+                .flat_map(|kind| {
+                    (0..OUTPUT_SCAN_MAX_FINDINGS_PER_KIND + 1).map(move |index| {
+                        crate::detect::Match::new(kind, format!("finding-{kind}-{index}"), 0, 1)
+                    })
+                })
+                .collect()
+        });
+        let mut restorer = StreamRestorer::new(
+            Arc::new(Vault::new()),
+            Audit::null().into(),
+            "total-cap".into(),
+        )
+        .with_output_scanner(Some(scanner));
+
+        let _ = restorer.push(b"x");
+
+        assert_eq!(restorer.flagged.len(), OUTPUT_SCAN_MAX_FINDINGS_PER_REQUEST);
     }
 
     #[test]
@@ -551,5 +796,73 @@ mod tests {
             "x «promtect:aws_key:00",
             "held carry bytes must be flushed, not dropped, before the error"
         );
+    }
+
+    #[tokio::test]
+    async fn observed_interruption_preserves_bytes_propagates_error_and_audits() {
+        #[derive(Debug)]
+        struct TestErr;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-stream-outcome-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(Audit::to_file(path.clone()));
+        let (vault, _sentinel) = vault_with("AKIAIOSFODNN7EXAMPLE", "aws_key");
+        let sr = StreamRestorer::new(vault, Arc::clone(&audit), "request-1".into());
+        let partial = "data: «promtect:aws_key:00";
+        let upstream = futures_util::stream::iter(vec![
+            Ok::<Bytes, TestErr>(Bytes::from(partial)),
+            Err(TestErr),
+        ])
+        .boxed();
+
+        let restored = restore_stream(upstream, sr);
+        let (observed, outcome) =
+            observe_stream_errors(restored, Arc::clone(&audit), "request-1".into());
+        let items: Vec<Result<Bytes, TestErr>> = observed.collect().await;
+        assert!(
+            matches!(items.last(), Some(Err(_))),
+            "successful bytes must be followed by the source error"
+        );
+        let emitted: Vec<u8> = items
+            .iter()
+            .filter_map(|item| item.as_ref().ok())
+            .flat_map(|bytes| bytes.iter().copied())
+            .collect();
+        drop(audit);
+
+        let log = std::fs::read_to_string(&path).expect("read stream outcome audit");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(emitted, partial.as_bytes());
+        assert!(outcome.was_interrupted());
+        assert!(log.contains("\"action\":\"stream_interrupted\""));
+        assert!(!log.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[tokio::test]
+    async fn downstream_cancellation_is_distinct_from_upstream_interruption() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-stream-cancelled-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let audit = Arc::new(Audit::to_file(path.clone()));
+        let upstream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let (observed, outcome) =
+            observe_stream_errors(upstream, Arc::clone(&audit), "request-cancelled".into());
+
+        drop(observed);
+        assert!(outcome.was_interrupted());
+        drop(audit);
+
+        let log = std::fs::read_to_string(&path).expect("read cancellation audit");
+        std::fs::remove_file(&path).ok();
+        let mut lock_name = path.into_os_string();
+        lock_name.push(".lock");
+        std::fs::remove_file(std::path::PathBuf::from(lock_name)).ok();
+        assert!(log.contains("\"action\":\"stream_cancelled\""));
+        assert!(log.contains("\"detector\":\"downstream\""));
+        assert!(!log.contains("\"action\":\"stream_interrupted\""));
+        assert!(log.contains("\"request_id\":\"request-cancelled\""));
     }
 }

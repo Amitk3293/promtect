@@ -4,7 +4,7 @@
 use crate::audit::Audit;
 use crate::detect;
 use crate::mask::mask_with_matches;
-use crate::stream::{StreamRestorer, restore_stream};
+use crate::stream::{StreamRestorer, observe_stream_errors, restore_stream};
 use crate::vault::Vault;
 use axum::{
     Router,
@@ -13,8 +13,12 @@ use axum::{
     http::{HeaderMap, Method, Uri},
     response::Response,
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
+use http_body_util::BodyExt as _;
 use std::sync::Arc;
+
+const STREAM_OUTCOME_HEADER: &str = "promtect-stream-outcome";
 
 /// Default cap on the request body Promtect will buffer in memory before masking.
 /// A masking proxy has to read the whole body to scan it, so an unbounded read
@@ -24,8 +28,32 @@ use std::sync::Arc;
 /// (`PROMTECT_MAX_BODY_BYTES`) and testable without a multi-megabyte fixture.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
+const UNSUPPORTED_CONTENT_ENCODING_MESSAGE: &str =
+    "promtect: unsupported request Content-Encoding; send an identity-encoded body";
+const UNSUPPORTED_CONTENT_ENCODING_AUDIT_MARKER: &str = "«unsupported-content-encoding»";
+const SCAN_CAPACITY_MESSAGE: &str = "promtect: request scanning is at capacity; retry later";
+const SCAN_CAPACITY_AUDIT_MARKER: &str = "«scan-capacity-exhausted»";
+const REQUEST_BODY_TIMEOUT_MESSAGE: &str = "promtect: request body timed out";
+const REQUEST_BODY_TIMEOUT_AUDIT_MARKER: &str = "«request-body-timeout»";
+const SCAN_TASK_FAILURE_LOG_MESSAGE: &str = "promtect: request scanning task failed";
+const REQUEST_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_CONCURRENT_SCANS: usize = 4;
+
+fn scan_slot_limit() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, MAX_CONCURRENT_SCANS)
+}
+
+fn try_scan_permit(
+    scan_slots: &Arc<tokio::sync::Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+    Arc::clone(scan_slots).try_acquire_owned()
+}
+
 /// Build a plain-text response without ever panicking. Used for Promtect's own
-/// error replies (413/502), where we fully control status and headers. The
+/// error replies (413/415/502), where we fully control status and headers. The
 /// fallback arm only fires for an impossible invalid-status case and still
 /// yields a valid `Response`, never a panic in the request path.
 fn text_response(status: u16, msg: impl Into<String>) -> Response {
@@ -96,22 +124,267 @@ pub struct Ctx {
     pub output_scan: Option<crate::stream::ResponseScanner>,
 }
 
-/// Core detectors plus any extra (Pro) detection pass, merged into one match list.
-/// `None` yields exactly the core's `detect()` output, so the public proxy's
-/// behavior is unchanged; a downstream build adds its matches here. The merged
-/// list may overlap — [`mask_with_matches`] coalesces overlaps before masking.
+/// Internal Axum state. Each running proxy owns one bounded scan budget; every
+/// clone of its router shares that budget. Keeping admission out of [`Ctx`]
+/// preserves the downstream composition API while preventing independent proxy
+/// instances from stealing each other's permits.
+#[derive(Clone)]
+struct AppState {
+    ctx: Ctx,
+    scan_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// Whether a detector hit can be masked exactly from the text it inspected.
+///
+/// Downstream detectors also use deliberately invalid spans as fail-closed
+/// control markers when their own runtime bounds are exceeded. Treat every
+/// malformed or value-mismatched hit as unmaskable so it can block without
+/// spending more CPU on detector passes that cannot make the request safe.
+fn match_is_maskable(text: &str, hit: &detect::Match) -> bool {
+    hit.start < hit.end
+        && hit.end <= text.len()
+        && text.is_char_boundary(hit.start)
+        && text.is_char_boundary(hit.end)
+        && text
+            .get(hit.start..hit.end)
+            .is_some_and(|value| value == hit.value.as_str())
+}
+
+/// Extra (Pro) detectors run before the Core detector set so a bounded
+/// downstream pass can reject work before Core scans the complete body. A
+/// malformed extra hit is a fail-closed control result: return it immediately
+/// and let the request path block without running Core. Valid extra matches are
+/// then merged with Core exactly as before.
+///
+/// `None` still yields exactly the Core detector output. The merged list may
+/// overlap — [`mask_with_matches`] coalesces overlaps before masking.
 fn compose_matches(text: &str, extra: &Option<ExtraDetector>) -> Vec<detect::Match> {
-    let mut matches = detect::detect(text);
-    if let Some(extra) = extra {
-        matches.extend(extra(text));
+    let extra_matches = extra.as_ref().map_or_else(Vec::new, |detect| detect(text));
+    if extra_matches
+        .iter()
+        .any(|hit| !match_is_maskable(text, hit))
+    {
+        return extra_matches;
     }
+    // Preserve Core-first merge precedence for overlapping valid spans; only
+    // execution order changes so downstream bounds can fail before Core work.
+    let mut matches = detect::detect(text);
+    matches.extend(extra_matches);
     matches
+}
+
+/// Return whether a structurally valid hit is contained by one minted sentinel.
+///
+/// `minted_sentinel_spans` yields sorted, non-overlapping ranges because it is
+/// backed by `Regex::find_iter`. Locate the last sentinel beginning at or before
+/// the hit instead of scanning every sentinel for every detector match. This
+/// keeps residual filtering O(matches × log(sentinels)) for large paid requests.
+fn is_within_minted_sentinel(
+    hit_start: usize,
+    hit_end: usize,
+    sentinel_spans: &[std::ops::Range<usize>],
+) -> bool {
+    let insertion = sentinel_spans.partition_point(|span| span.start <= hit_start);
+    insertion
+        .checked_sub(1)
+        .and_then(|index| sentinel_spans.get(index))
+        .is_some_and(|span| hit_end <= span.end)
+}
+
+/// Re-run the exact active request detector chain over a masked body.
+///
+/// The detector receives the complete masked body, preserving anchored and
+/// context-sensitive rule semantics plus original byte offsets. Structurally
+/// valid matches wholly contained inside an exact sentinel minted by this
+/// request's vault are discarded; malformed matches, unknown sentinel-shaped
+/// input, and matches extending outside a minted sentinel remain residual leaks
+/// and fail closed. Reusing
+/// [`compose_matches`] is the security invariant: a downstream paid or custom
+/// detector cannot participate in masking while being omitted from the final
+/// residual check.
+fn scan_for_residual_leaks(
+    masked: &str,
+    extra: &Option<ExtraDetector>,
+    vault: &Vault,
+) -> Vec<detect::Match> {
+    let sentinel_spans: Vec<_> = crate::mask::minted_sentinel_spans(masked, vault).collect();
+    compose_matches(masked, extra)
+        .into_iter()
+        .filter(|hit| {
+            let has_exact_span = hit.start < hit.end
+                && masked
+                    .get(hit.start..hit.end)
+                    .is_some_and(|value| value == hit.value.as_str());
+            let is_minted_sentinel_content =
+                has_exact_span && is_within_minted_sentinel(hit.start, hit.end, &sentinel_spans);
+            !is_minted_sentinel_content
+        })
+        .collect()
+}
+
+enum PreparedBody {
+    Forward(Vec<u8>),
+    Block(Response),
+}
+
+fn residual_block_response(
+    ctx: &Ctx,
+    request_id: &str,
+    hit_count: usize,
+    request_kinds: &[&str],
+    body_len: usize,
+    masked_len: usize,
+    leaks: &[detect::Match],
+) -> Response {
+    let leak_kinds: Vec<&str> = {
+        let mut kinds: Vec<&str> = leaks.iter().map(|hit| hit.kind).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        kinds
+    };
+    eprintln!(
+        "[promtect] ⚠️  LEAK req {}: {} pattern{} may not be masked ({}) \
+         — request blocked",
+        &request_id[..8],
+        leaks.len(),
+        if leaks.len() == 1 { "" } else { "s" },
+        leak_kinds.join(", ")
+    );
+    ctx.audit
+        .record_request(request_id, hit_count, request_kinds, body_len, masked_len);
+    ctx.audit.record(
+        "request_blocked",
+        "residual_secret",
+        "«residual-secret»",
+        request_id,
+    );
+    text_response(
+        400,
+        format!(
+            "promtect: {} secret pattern{} not masked before forwarding ({})",
+            leaks.len(),
+            if leaks.len() == 1 { "" } else { "s" },
+            leak_kinds.join(", ")
+        ),
+    )
+}
+
+fn preflight_block_response(ctx: &Ctx, request_id: &str, failure_kinds: &[&str]) -> Response {
+    let kind = failure_kinds
+        .first()
+        .copied()
+        .unwrap_or("detector_preflight");
+    eprintln!(
+        "[promtect] req {}: detector preflight failed closed",
+        &request_id[..8]
+    );
+    ctx.audit.record_blocked_request(request_id);
+    ctx.audit.record(
+        "request_rejected",
+        kind,
+        "«detector-preflight-rejected»",
+        request_id,
+    );
+    text_response(400, "promtect: request detector failed closed")
+}
+
+fn scan_task_failure_log_message(_: &tokio::task::JoinError) -> &'static str {
+    // JoinError's Display includes a panic payload when one is available. A
+    // downstream detector panic may have inspected request text, so never format
+    // either Display/Debug or extract the panic payload into logs.
+    SCAN_TASK_FAILURE_LOG_MESSAGE
+}
+
+/// Perform UTF-8 validation, detection, masking, and the residual scan away from
+/// Tokio's async workers. Detector regexes are synchronous and may inspect the
+/// complete configured body limit; running them on an async worker can prevent
+/// unrelated connections, timers, and shutdown from being polled.
+fn prepare_body(body_bytes: Bytes, ctx: &Ctx, vault: &Vault, request_id: &str) -> PreparedBody {
+    let text = match std::str::from_utf8(&body_bytes) {
+        Ok(text) => text,
+        Err(_) => {
+            ctx.audit
+                .record_request(request_id, 0, &[], body_bytes.len(), body_bytes.len());
+            return PreparedBody::Forward(body_bytes.to_vec());
+        }
+    };
+
+    let matches = compose_matches(text, &ctx.extra_detect);
+    let hit_count = matches.len();
+    let mut kinds: Vec<&str> = matches.iter().map(|hit| hit.kind).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+
+    // Invalid downstream spans are fail-closed control results. Block them
+    // immediately, before copying/masking the body or running Core and residual
+    // detector passes. This is how a bounded Pro rulebook rejects excess work.
+    if matches.iter().any(|hit| !match_is_maskable(text, hit)) {
+        return PreparedBody::Block(preflight_block_response(ctx, request_id, &kinds));
+    }
+
+    let masked = mask_with_matches(text, matches, vault, &ctx.audit, request_id);
+    if hit_count > 0 && !is_quiet() {
+        eprintln!(
+            "[promtect] req {}: masked {} secret{} ({})",
+            &request_id[..8],
+            hit_count,
+            if hit_count == 1 { "" } else { "s" },
+            kinds.join(", ")
+        );
+    }
+
+    if hit_count > 0 {
+        let leaks = scan_for_residual_leaks(&masked, &ctx.extra_detect, vault);
+        if !leaks.is_empty() {
+            return PreparedBody::Block(residual_block_response(
+                ctx,
+                request_id,
+                hit_count,
+                &kinds,
+                body_bytes.len(),
+                masked.len(),
+                &leaks,
+            ));
+        }
+    }
+
+    ctx.audit.record_request(
+        request_id,
+        hit_count,
+        &kinds,
+        body_bytes.len(),
+        masked.len(),
+    );
+    PreparedBody::Forward(masked.into_bytes())
+}
+
+async fn prepare_body_async(
+    body_bytes: Bytes,
+    ctx: Ctx,
+    vault: Arc<Vault>,
+    request_id: String,
+    scan_permit: tokio::sync::OwnedSemaphorePermit,
+) -> Result<PreparedBody, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let _scan_permit = scan_permit;
+        prepare_body(body_bytes, &ctx, &vault, &request_id)
+    })
+    .await
 }
 
 /// Build the Promtect Axum router: a catch-all fallback that masks the request
 /// body, forwards to `upstream`, and restores secrets in the response.
 pub fn app(ctx: Ctx) -> Router {
-    Router::new().fallback(handle).with_state(ctx)
+    app_with_scan_slots(
+        ctx,
+        Arc::new(tokio::sync::Semaphore::new(scan_slot_limit())),
+    )
+}
+
+fn app_with_scan_slots(ctx: Ctx, scan_slots: Arc<tokio::sync::Semaphore>) -> Router {
+    Router::new()
+        .fallback(handle)
+        .with_state(AppState { ctx, scan_slots })
 }
 
 /// Resolve the upstream origin (scheme + host) from an explicit override or a
@@ -241,21 +514,76 @@ pub async fn shutdown_signal() {
     ctrl_c.await;
 }
 
-async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
+async fn handle(State(state): State<AppState>, req: Request) -> Response {
+    let AppState { ctx, scan_slots } = state;
     ctx.requests
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let request_id = uuid::Uuid::new_v4().to_string();
+    let headers = req.headers().clone();
+
+    // SECURITY: reject compressed or malformed request bodies using headers only,
+    // before reading the body or constructing any upstream request. Promtect cannot
+    // safely scan encoded bytes, and forwarding them unscanned would leak secrets.
+    if !request_content_encoding_is_supported(&headers) {
+        ctx.audit.record_blocked_request(&request_id);
+        ctx.audit.record(
+            "request_rejected",
+            "content_encoding",
+            UNSUPPORTED_CONTENT_ENCODING_AUDIT_MARKER,
+            &request_id,
+        );
+        eprintln!(
+            "[promtect] req {}: rejected unsupported request Content-Encoding",
+            &request_id[..8]
+        );
+        return text_response(415, UNSUPPORTED_CONTENT_ENCODING_MESSAGE);
+    }
+
+    // Admission happens before reading the body. Tokio's blocking pool has a
+    // high default limit and started blocking tasks cannot be cancelled, so an
+    // unbounded queue of maximum-size detector jobs would retain unbounded
+    // memory and CPU work. Saturation fails closed without touching the body or
+    // opening an upstream connection.
+    let scan_permit = match try_scan_permit(&scan_slots) {
+        Ok(permit) => permit,
+        Err(_) => {
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_rejected",
+                "scan_capacity",
+                SCAN_CAPACITY_AUDIT_MARKER,
+                &request_id,
+            );
+            eprintln!(
+                "[promtect] req {}: rejected because request scanning is at capacity",
+                &request_id[..8]
+            );
+            return text_response(503, SCAN_CAPACITY_MESSAGE);
+        }
+    };
+
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let headers = req.headers().clone();
 
     // Buffer the body with a hard cap. `to_bytes` returns Err once the stream
     // exceeds the limit, so we refuse oversized bodies with 413 instead of
     // silently forwarding an empty/truncated one (the old `.unwrap_or_default()`
     // behaviour) or buffering without bound.
-    let body_bytes = match axum::body::to_bytes(req.into_body(), ctx.max_body_bytes).await {
-        Ok(b) => b,
-        Err(_) => {
+    let body_bytes = match tokio::time::timeout(
+        REQUEST_BODY_TIMEOUT,
+        axum::body::to_bytes(req.into_body(), ctx.max_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => {
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_blocked",
+                "body_limit",
+                "«request-body-rejected»",
+                &request_id,
+            );
             return text_response(
                 413,
                 format!(
@@ -264,6 +592,20 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
                 ),
             );
         }
+        Err(_) => {
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_rejected",
+                "body_timeout",
+                REQUEST_BODY_TIMEOUT_AUDIT_MARKER,
+                &request_id,
+            );
+            eprintln!(
+                "[promtect] req {}: rejected because the request body timed out",
+                &request_id[..8]
+            );
+            return text_response(408, REQUEST_BODY_TIMEOUT_MESSAGE);
+        }
     };
     // INVARIANT: one vault per request. The same vault masks the outbound body
     // and restores the inbound response, so only sentinels minted *for this
@@ -271,103 +613,29 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
     // Held in an `Arc` so it can move into the response stream, which the server
     // polls after this handler returns.
     let vault = Arc::new(Vault::new());
-
-    // Scan the body only when it is genuinely text. We decide this from the ACTUAL
-    // bytes (valid UTF-8?), NOT the client-declared `Content-Type` — otherwise a
-    // request could bypass masking and leak a secret simply by mislabelling a JSON
-    // body as `application/octet-stream`. A body that is not valid UTF-8 is binary
-    // (or mislabelled binary) and is forwarded byte-for-byte, so the proxy never
-    // corrupts it by lossy conversion or a mistaken substitution.
-    let forward_bytes = match std::str::from_utf8(&body_bytes) {
-        Ok(text) => {
-            // Compose the core detectors with any extra (Pro) pass, then mask AND
-            // summarize from the same match set so the summary reflects everything
-            // masked. extra_detect is None in the public core (behavior unchanged).
-            let matches = compose_matches(text, &ctx.extra_detect);
-            let hit_count = matches.len();
-
-            // Per-request summary kinds (value-free), taken before the match list is
-            // consumed by masking.
-            let mut kinds: Vec<&str> = matches.iter().map(|m| m.kind).collect();
-            kinds.sort_unstable();
-            kinds.dedup();
-
-            // Mask request body content. Auth headers forwarded untouched in forward().
-            let masked = mask_with_matches(text, matches, &vault, &ctx.audit, &request_id);
-
-            // Emit a Promtect-attributed stderr line so the user can see masking
-            // in their terminal without opening the dashboard. Suppressed under
-            // `guard` (quiet mode) so it does not corrupt a wrapped TUI; the count
-            // still lands in the audit log, the dashboard, and the exit summary.
-            if hit_count > 0 && !is_quiet() {
-                eprintln!(
-                    "[promtect] req {}: masked {} secret{} ({})",
-                    &request_id[..8],
-                    hit_count,
-                    if hit_count == 1 { "" } else { "s" },
-                    kinds.join(", ")
-                );
-            }
-
-            // Post-mask leak check: only needed when masking ran — if no secrets
-            // were detected, the masked body is identical to the input and a second
-            // scan would find the same nothing (wasted work on every clean request).
-            if hit_count > 0 {
-                // Re-run detectors with sentinels stripped so their kind:HEX content
-                // can't false-positive. A surviving match means masking missed it —
-                // block rather than forward plaintext secrets.
-                let leaks = crate::mask::scan_for_leaks(&masked);
-                if !leaks.is_empty() {
-                    let leak_kinds: Vec<&str> = {
-                        let mut v: Vec<&str> = leaks.iter().map(|m| m.kind).collect();
-                        v.sort_unstable();
-                        v.dedup();
-                        v
-                    };
-                    eprintln!(
-                        "[promtect] ⚠️  LEAK req {}: {} pattern{} may not be masked ({}) \
-                         — request blocked",
-                        &request_id[..8],
-                        leaks.len(),
-                        if leaks.len() == 1 { "" } else { "s" },
-                        leak_kinds.join(", ")
-                    );
-                    // Record before blocking so the dashboard counts this request.
-                    ctx.audit.record_request(
-                        &request_id,
-                        hit_count,
-                        &kinds,
-                        body_bytes.len(),
-                        masked.len(),
-                    );
-                    return text_response(
-                        400,
-                        format!(
-                            "promtect: {} secret pattern{} not masked before forwarding ({})",
-                            leaks.len(),
-                            if leaks.len() == 1 { "" } else { "s" },
-                            leak_kinds.join(", ")
-                        ),
-                    );
-                }
-            }
-
-            ctx.audit.record_request(
+    let prepared = prepare_body_async(
+        body_bytes,
+        ctx.clone(),
+        Arc::clone(&vault),
+        request_id.clone(),
+        scan_permit,
+    )
+    .await;
+    let forward_bytes = match prepared {
+        Ok(PreparedBody::Forward(bytes)) => bytes,
+        Ok(PreparedBody::Block(response)) => return response,
+        Err(error) => {
+            // A blocking detector task can fail only if it panics or the runtime
+            // shuts down. Either case fails closed and remains value-free.
+            eprintln!("{}", scan_task_failure_log_message(&error));
+            ctx.audit.record_blocked_request(&request_id);
+            ctx.audit.record(
+                "request_blocked",
+                "scan_failure",
+                "«request-scan-failed»",
                 &request_id,
-                hit_count,
-                &kinds,
-                body_bytes.len(),
-                masked.len(),
             );
-
-            masked.into_bytes()
-        }
-        Err(_) => {
-            // Non-UTF-8 (binary) body: forward unscanned, but record it as traffic
-            // (zero secrets) so the request still appears in metrics.
-            ctx.audit
-                .record_request(&request_id, 0, &[], body_bytes.len(), body_bytes.len());
-            body_bytes.to_vec()
+            return text_response(500, "promtect: request scanning failed");
         }
     };
 
@@ -378,9 +646,33 @@ async fn handle(State(ctx): State<Ctx>, req: Request) -> Response {
             // don't disclose the upstream host/path to the proxied tool (which may
             // echo or log the response). The error never contains the secret.
             eprintln!("promtect: upstream request failed: {e}");
+            ctx.audit.record(
+                "request_failed",
+                "upstream",
+                "«upstream-request-failed»",
+                &request_id,
+            );
             text_response(502, "promtect: upstream request failed".to_string())
         }
     }
+}
+
+/// Whether every request `Content-Encoding` value is a non-empty, identity-only
+/// coding list. An absent header is supported. Malformed bytes, empty tokens,
+/// unknown codings, and any non-identity coding fail closed.
+fn request_content_encoding_is_supported(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::CONTENT_ENCODING)
+        .iter()
+        .all(|value| {
+            let Ok(value) = value.to_str() else {
+                return false;
+            };
+            value.split(',').all(|coding| {
+                let coding = coding.trim();
+                !coding.is_empty() && coding.eq_ignore_ascii_case("identity")
+            })
+        })
 }
 
 /// Whether a *response* is a known binary/opaque type that must NOT be run
@@ -493,25 +785,42 @@ async fn restore_response(
     // A binary response (e.g. an image endpoint) must stream back byte-for-byte —
     // running it through the restorer would lossily corrupt it. `text/event-stream`
     // is textual, so SSE is restored.
-    let body = if will_restore {
+    let source = if will_restore {
         // Transparent mode: restore secrets incrementally as the response
         // streams. SSE answers reach the client token-by-token instead of being
         // buffered whole (the M0 "hang"). The vault moves into the stream, which
         // the server polls after this handler returns.
-        let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id)
+        let sr = StreamRestorer::new(vault, Arc::clone(&ctx.audit), request_id.clone())
             .with_output_scanner(ctx.output_scan.clone());
-        Body::from_stream(restore_stream(r.bytes_stream().boxed(), sr))
+        restore_stream(r.bytes_stream().boxed(), sr).boxed()
     } else {
         // Strict mode (PROMTECT_RESTORE=false), or a binary/compressed response:
         // never re-insert secrets. Stream the body straight through; the
         // per-request vault is dropped (and its contents zeroized) unused.
         drop(vault);
-        Body::from_stream(r.bytes_stream())
+        r.bytes_stream().boxed()
     };
+
+    let audit = Arc::clone(&ctx.audit);
+    let outcome_request_id = request_id.clone();
+    let (observed, outcome) = observe_stream_errors(source, audit, outcome_request_id);
+    let body = Body::from_stream(observed).with_trailers(async move {
+        let mut trailers = HeaderMap::new();
+        trailers.insert(
+            STREAM_OUTCOME_HEADER,
+            if outcome.was_interrupted() {
+                axum::http::HeaderValue::from_static("interrupted")
+            } else {
+                axum::http::HeaderValue::from_static("complete")
+            },
+        );
+        Some(Ok::<_, axum::Error>(trailers))
+    });
+    out = out.header("trailer", STREAM_OUTCOME_HEADER);
 
     // Status and headers come from an already-parsed upstream response, so this
     // build cannot realistically fail; fall back to a clean 502 rather than panic.
-    out.body(body)
+    out.body(Body::new(body))
         .unwrap_or_else(|_| text_response(502, "promtect: could not assemble upstream response"))
 }
 
@@ -519,6 +828,88 @@ async fn restore_response(
 mod tests {
     use super::resolve_upstream;
     use super::{is_quiet, set_quiet};
+
+    fn headers_with_content_encoding(value: &'static str) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_ENCODING,
+            axum::http::HeaderValue::from_static(value),
+        );
+        headers
+    }
+
+    #[test]
+    fn request_content_encoding_accepts_absent_header() {
+        assert!(super::request_content_encoding_is_supported(
+            &axum::http::HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn request_content_encoding_accepts_identity_with_case_and_whitespace() {
+        for value in ["identity", "IdEnTiTy", "identity , identity"] {
+            assert!(
+                super::request_content_encoding_is_supported(&headers_with_content_encoding(value)),
+                "{value:?} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_every_non_identity_coding() {
+        for value in [
+            "gzip",
+            "deflate",
+            "br",
+            "zstd",
+            "snappy",
+            "gzip, br",
+            "identity, gzip",
+            "GzIp",
+            "gzip , br",
+        ] {
+            assert!(
+                !super::request_content_encoding_is_supported(&headers_with_content_encoding(
+                    value
+                )),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_empty_or_malformed_lists() {
+        for value in ["", " ", ",", "identity,", ",identity"] {
+            assert!(
+                !super::request_content_encoding_is_supported(&headers_with_content_encoding(
+                    value
+                )),
+                "{value:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_when_any_repeated_header_is_non_identity() {
+        let mut headers = headers_with_content_encoding("identity");
+        headers.append(
+            axum::http::header::CONTENT_ENCODING,
+            axum::http::HeaderValue::from_static("br"),
+        );
+
+        assert!(!super::request_content_encoding_is_supported(&headers));
+    }
+
+    #[test]
+    fn request_content_encoding_rejects_non_utf8_header_value() {
+        let mut headers = axum::http::HeaderMap::new();
+        let value = axum::http::HeaderValue::from_bytes(b"\xff")
+            .expect("opaque non-UTF-8 header bytes are valid HeaderValue data");
+        assert!(value.to_str().is_err(), "test value must be non-UTF-8");
+        headers.insert(axum::http::header::CONTENT_ENCODING, value);
+
+        assert!(!super::request_content_encoding_is_supported(&headers));
+    }
 
     #[test]
     fn quiet_flag_round_trips() {
@@ -662,5 +1053,531 @@ mod tests {
         let composed = super::compose_matches(text, &Some(extra));
         assert_eq!(composed.len(), base + 1);
         assert!(composed.iter().any(|m| m.kind == "custom"));
+    }
+
+    #[test]
+    fn compose_matches_short_circuits_core_for_an_unmaskable_extra_result() {
+        let text = "AKIAIOSFODNN7EXAMPLE followed by a bounded detector failure";
+        let extra: super::ExtraDetector = std::sync::Arc::new(|_| {
+            vec![super::detect::Match::new(
+                "rulebook_scan_limit",
+                String::new(),
+                usize::MAX,
+                usize::MAX,
+            )]
+        });
+
+        let composed = super::compose_matches(text, &Some(extra));
+
+        assert_eq!(composed.len(), 1);
+        assert_eq!(composed[0].kind, "rulebook_scan_limit");
+        assert!(
+            !composed.iter().any(|hit| hit.kind == "aws_key"),
+            "Core must not scan after a downstream detector fails closed"
+        );
+    }
+
+    #[test]
+    fn unmaskable_extra_preflight_is_blocked_without_claiming_masked_traffic() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let audit_path = std::env::temp_dir().join(format!(
+            "promtect-preflight-audit-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let extra: super::ExtraDetector = Arc::new(|_| {
+            vec![super::detect::Match::new(
+                "rulebook_scan_limit",
+                String::new(),
+                usize::MAX,
+                usize::MAX,
+            )]
+        });
+        let ctx = super::Ctx {
+            upstream: "http://127.0.0.1:1".to_owned(),
+            audit: Arc::new(crate::audit::Audit::to_file(audit_path.clone())),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: Some(extra),
+            output_scan: None,
+        };
+
+        let prepared = super::prepare_body(
+            bytes::Bytes::from_static(b"ordinary request body"),
+            &ctx,
+            &crate::vault::Vault::new(),
+            "preflight-request",
+        );
+        assert!(matches!(prepared, super::PreparedBody::Block(_)));
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let metrics = crate::metrics::aggregate(&audit_path);
+        std::fs::remove_file(&audit_path).ok();
+
+        assert!(audit.contains(r#""action":"request""#));
+        assert!(audit.contains(r#""masked":0"#));
+        assert!(audit.contains(r#""blocked":true"#));
+        assert!(audit.contains(r#""action":"request_rejected""#));
+        assert!(audit.contains(r#""detector":"rulebook_scan_limit""#));
+        assert_eq!(metrics.requests_total, 1);
+        assert_eq!(metrics.requests_clean, 0);
+        assert_eq!(metrics.requests_with_secrets, 0);
+        assert_eq!(metrics.requests_blocked_total, 1);
+        assert_eq!(metrics.recent[0].masked, 0);
+        assert!(metrics.recent[0].blocked);
+    }
+
+    #[tokio::test]
+    async fn synchronous_detector_work_does_not_block_the_async_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::time::Duration;
+
+        let started = Arc::new(AtomicBool::new(false));
+        let started_for_detector = Arc::clone(&started);
+        let extra: super::ExtraDetector = Arc::new(move |_| {
+            started_for_detector.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(200));
+            Vec::new()
+        });
+        let ctx = super::Ctx {
+            upstream: "http://127.0.0.1:1".to_owned(),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: Some(extra),
+            output_scan: None,
+        };
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let scan_permit = Arc::clone(&scan_slots)
+            .acquire_owned()
+            .await
+            .expect("scan semaphore stays open");
+        let prepare = super::prepare_body_async(
+            bytes::Bytes::from_static(b"ordinary text"),
+            ctx,
+            Arc::new(crate::vault::Vault::new()),
+            "test-request".to_owned(),
+            scan_permit,
+        );
+        let heartbeat = async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let (heartbeat, prepared) = tokio::join!(
+            tokio::time::timeout(Duration::from_millis(100), heartbeat),
+            prepare
+        );
+
+        assert!(
+            heartbeat.is_ok(),
+            "the async timer must run while synchronous detection is active"
+        );
+        assert!(matches!(prepared, Ok(super::PreparedBody::Forward(_))));
+    }
+
+    #[tokio::test]
+    async fn saturated_scan_admission_fails_closed_before_body_or_upstream() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use tokio::time::timeout;
+
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let slot_count = u32::try_from(super::scan_slot_limit()).expect("small scan-slot cap");
+        let held_slots = timeout(
+            Duration::from_secs(2),
+            Arc::clone(&scan_slots).acquire_many_owned(slot_count),
+        )
+        .await
+        .expect("other tests release scan slots")
+        .expect("scan semaphore stays open");
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream counter");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let ctx = super::Ctx {
+            upstream: format!("http://{upstream_addr}"),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: None,
+            output_scan: None,
+        };
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let proxy_addr = proxy.local_addr().expect("proxy address");
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        let proxy_task = tokio::spawn(async move {
+            axum::serve(proxy, super::app_with_scan_slots(ctx, scan_slots))
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve proxy");
+        });
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let response = reqwest::Client::new()
+            .post(format!("http://{proxy_addr}/saturated"))
+            .body(canary)
+            .send()
+            .await
+            .expect("capacity response");
+        let status = response.status();
+        let response_body = response.text().await.expect("read capacity response");
+
+        let _ = shutdown.send(());
+        timeout(Duration::from_secs(2), proxy_task)
+            .await
+            .expect("proxy shutdown timeout")
+            .expect("proxy task join");
+        drop(held_slots);
+
+        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response_body, super::SCAN_CAPACITY_MESSAGE);
+        assert!(!response_body.contains(canary));
+        assert!(
+            timeout(Duration::from_millis(50), upstream.accept())
+                .await
+                .is_err(),
+            "saturated admission must not open an upstream connection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_request_body_times_out_value_free_and_releases_admission() {
+        use futures_util::StreamExt as _;
+        use std::convert::Infallible;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Duration;
+        use tokio::sync::oneshot;
+        use tower::ServiceExt as _;
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind upstream counter");
+        let upstream_addr = upstream.local_addr().expect("upstream address");
+        let upstream_connections = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&upstream_connections);
+        let (upstream_shutdown, mut upstream_shutdown_rx) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut upstream_shutdown_rx => break,
+                    connection = upstream.accept() => {
+                        if connection.is_err() { break; }
+                        counted.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        });
+        let ctx = super::Ctx {
+            upstream: format!("http://{upstream_addr}"),
+            audit: Arc::new(crate::audit::Audit::null()),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: None,
+            output_scan: None,
+        };
+        let scan_slots = Arc::new(tokio::sync::Semaphore::new(super::scan_slot_limit()));
+        let app_scan_slots = Arc::clone(&scan_slots);
+        let canary = "AKIAIOSFODNN7EXAMPLE";
+        let partial_then_stalled = futures_util::stream::once(async move {
+            Ok::<_, Infallible>(bytes::Bytes::from_static(canary.as_bytes()))
+        })
+        .chain(futures_util::stream::pending());
+        let request = axum::http::Request::post("/slow")
+            .body(axum::body::Body::from_stream(partial_then_stalled))
+            .expect("build slow request");
+        let response_task = tokio::spawn(async move {
+            super::app_with_scan_slots(ctx, app_scan_slots)
+                .oneshot(request)
+                .await
+                .expect("slow body response")
+        });
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(super::REQUEST_BODY_TIMEOUT + Duration::from_secs(1)).await;
+        let response = response_task.await.expect("response task join");
+        let status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("read timeout response");
+        let permit_after_timeout =
+            super::try_scan_permit(&scan_slots).expect("timeout releases scan slot");
+        drop(permit_after_timeout);
+        let _ = upstream_shutdown.send(());
+        upstream_task.await.expect("upstream task join");
+
+        assert_eq!(status, axum::http::StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response_body, super::REQUEST_BODY_TIMEOUT_MESSAGE);
+        assert!(
+            !response_body
+                .as_ref()
+                .windows(canary.len())
+                .any(|window| window == canary.as_bytes())
+        );
+        assert_eq!(upstream_connections.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn residual_scan_reuses_extra_detector_after_masking_skips_a_bad_span() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let text = "payload CUSTOMSECRET";
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_detector = Arc::clone(&calls);
+        let extra: super::ExtraDetector = Arc::new(move |candidate: &str| {
+            let Some(start) = candidate.find("CUSTOMSECRET") else {
+                return Vec::new();
+            };
+            let end = if calls_for_detector.fetch_add(1, Ordering::SeqCst) == 0 {
+                candidate.len() + 1
+            } else {
+                start + "CUSTOMSECRET".len()
+            };
+            vec![super::detect::Match::new(
+                "custom",
+                "CUSTOMSECRET".to_owned(),
+                start,
+                end,
+            )]
+        });
+        let active = Some(extra);
+        let vault = crate::vault::Vault::new();
+        let masked = crate::mask::mask_with_matches(
+            text,
+            super::compose_matches(text, &active),
+            &vault,
+            &crate::audit::Audit::null(),
+            "request",
+        );
+
+        assert!(
+            masked.contains("CUSTOMSECRET"),
+            "the deliberately invalid first span must survive masking"
+        );
+        let leaks = super::scan_for_residual_leaks(&masked, &active, &vault);
+        assert!(
+            leaks.iter().any(|hit| hit.kind == "custom"),
+            "the active extra detector must inspect and catch the residual canary"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn residual_scan_without_extra_remains_core_only() {
+        let vault = crate::vault::Vault::new();
+        let leaks =
+            super::scan_for_residual_leaks("AKIAIOSFODNN7EXAMPLE and CUSTOMSECRET", &None, &vault);
+
+        assert!(leaks.iter().any(|hit| hit.kind == "aws_key"));
+        assert!(!leaks.iter().any(|hit| hit.kind == "custom"));
+    }
+
+    #[test]
+    fn residual_scan_does_not_manufacture_matches_for_custom_rules() {
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            ["CUSTOMSECRET", "promtect"]
+                .into_iter()
+                .filter_map(|needle| {
+                    candidate.find(needle).map(|start| {
+                        super::detect::Match::new(
+                            "custom",
+                            needle.to_owned(),
+                            start,
+                            start + needle.len(),
+                        )
+                    })
+                })
+                .collect()
+        });
+        let active = Some(detector);
+        let vault = crate::vault::Vault::new();
+        let masked = crate::mask::mask_with_matches(
+            "payload CUSTOMSECRET",
+            super::compose_matches("payload CUSTOMSECRET", &active),
+            &vault,
+            &crate::audit::Audit::null(),
+            "request",
+        );
+
+        assert!(masked.contains("«promtect:custom:"));
+        assert!(
+            super::scan_for_residual_leaks(&masked, &active, &vault).is_empty(),
+            "custom matches wholly inside sentinel syntax must not become residual leaks"
+        );
+    }
+
+    #[test]
+    fn minted_span_binary_lookup_matches_linear_oracle_at_scale() {
+        let spans: Vec<std::ops::Range<usize>> = (0..10_000)
+            .map(|index| {
+                let start = index * 64;
+                start..start + 48
+            })
+            .collect();
+
+        let mut hits = Vec::with_capacity(spans.len() * 3 + 2);
+        for span in &spans {
+            hits.push((span.start, span.end));
+            hits.push((span.start + 7, span.end - 7));
+            hits.push((span.end - 1, span.end + 1));
+        }
+        hits.push((0, 0));
+        hits.push((spans.last().unwrap().end + 1, spans.last().unwrap().end + 2));
+
+        for (start, end) in hits {
+            let expected = spans
+                .iter()
+                .any(|span| span.start <= start && end <= span.end);
+            assert_eq!(
+                super::is_within_minted_sentinel(start, end, &spans),
+                expected,
+                "binary containment disagreed for {start}..{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn residual_scan_suppresses_many_request_minted_sentinel_matches() {
+        let vault = crate::vault::Vault::new();
+        let masked = (0..1_024)
+            .map(|index| vault.sentinel_for("custom", &format!("secret-{index}")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            candidate
+                .match_indices("promtect")
+                .map(|(start, value)| {
+                    super::detect::Match::new(
+                        "custom",
+                        value.to_owned(),
+                        start,
+                        start + value.len(),
+                    )
+                })
+                .collect()
+        });
+
+        assert!(
+            super::scan_for_residual_leaks(&masked, &Some(detector), &vault).is_empty(),
+            "matches wholly inside every request-minted sentinel must be suppressed"
+        );
+    }
+
+    #[test]
+    fn residual_scan_preserves_whole_body_context_across_a_sentinel() {
+        let vault = crate::vault::Vault::new();
+        let sentinel = vault.sentinel_for("custom", "masked_secret");
+        let masked = format!("BEGIN {sentinel} residual_secret END");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            if !candidate.starts_with("BEGIN ") || !candidate.ends_with(" END") {
+                return Vec::new();
+            }
+            let Some(start) = candidate.find("residual_secret") else {
+                return Vec::new();
+            };
+            vec![super::detect::Match::new(
+                "context_rule",
+                "residual_secret".to_owned(),
+                start,
+                start + "residual_secret".len(),
+            )]
+        });
+
+        let leaks = super::scan_for_residual_leaks(&masked, &Some(detector), &vault);
+
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].kind, "context_rule");
+        assert_eq!(leaks[0].value.as_str(), "residual_secret");
+    }
+
+    #[test]
+    fn residual_scan_does_not_create_artificial_fragment_anchors() {
+        let vault = crate::vault::Vault::new();
+        let sentinel = vault.sentinel_for("custom", "masked_secret");
+        let masked = format!("prefix {sentinel} anchored_tail");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            if candidate.strip_prefix(" anchored_tail").is_none() {
+                return Vec::new();
+            }
+            vec![super::detect::Match::new(
+                "anchored_rule",
+                "anchored_tail".to_owned(),
+                1,
+                candidate.len(),
+            )]
+        });
+
+        assert!(
+            super::scan_for_residual_leaks(&masked, &Some(detector), &vault).is_empty(),
+            "a tail fragment must not be presented to a rule as a new full input"
+        );
+    }
+
+    #[test]
+    fn residual_scan_blocks_a_match_partially_overlapping_a_minted_sentinel() {
+        let vault = crate::vault::Vault::new();
+        let sentinel = vault.sentinel_for("custom", "masked_secret");
+        let masked = format!("prefix {sentinel} residual_tail");
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            let Some(start) = candidate.find("promtect") else {
+                return Vec::new();
+            };
+            let end = candidate.len();
+            vec![super::detect::Match::new(
+                "overlap_rule",
+                candidate[start..end].to_owned(),
+                start,
+                end,
+            )]
+        });
+
+        let leaks = super::scan_for_residual_leaks(&masked, &Some(detector), &vault);
+
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].kind, "overlap_rule");
+    }
+
+    #[test]
+    fn residual_scan_does_not_trust_user_supplied_sentinel_shapes() {
+        let vault = crate::vault::Vault::new();
+        let masked = "prefix «promtect:custom:0000» suffix";
+        let detector: super::ExtraDetector = std::sync::Arc::new(|candidate: &str| {
+            let Some(start) = candidate.find("promtect") else {
+                return Vec::new();
+            };
+            vec![super::detect::Match::new(
+                "sentinel_shape_rule",
+                "promtect".to_owned(),
+                start,
+                start + "promtect".len(),
+            )]
+        });
+
+        let leaks = super::scan_for_residual_leaks(masked, &Some(detector), &vault);
+
+        assert_eq!(leaks.len(), 1);
+        assert_eq!(leaks[0].kind, "sentinel_shape_rule");
     }
 }

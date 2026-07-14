@@ -10,6 +10,7 @@ use promtect::proxy::shutdown_signal;
 
 #[tokio::main]
 async fn main() {
+    promtect::install_value_free_panic_hook();
     let args: Vec<String> = std::env::args().collect();
 
     // Help must print before any port binding attempt.
@@ -169,6 +170,9 @@ async fn main() {
             std::env::var("PROMTECT_AUDIT").unwrap_or_else(|_| "promtect-audit.jsonl".into());
         let app = promtect::dashboard::app(promtect::dashboard::DashCtx {
             audit_path: std::sync::Arc::new(audit_path.into()),
+            restore_enabled: proxy::parse_restore(
+                std::env::var("PROMTECT_RESTORE").ok().as_deref(),
+            ),
         });
         let addr = format!("{bind}:{port}");
         // Graceful exit (not a panic/backtrace) when the port is taken — a common,

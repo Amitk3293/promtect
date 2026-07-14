@@ -1,0 +1,72 @@
+services:
+  mock-provider:
+    build:
+      context: .
+    command: ["python", "mock_provider.py"]
+    networks: [provider-harness]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+  promtect:
+    build:
+      context: ../..
+    environment:
+      PROMTECT_BIND: 0.0.0.0
+      PROMTECT_ALLOW_PUBLIC_BIND: "1"
+      PROMTECT_PORT: "8790"
+      PROMTECT_UPSTREAM: http://mock-provider:9000
+      PROMTECT_READ_TIMEOUT: "1"
+      PROMTECT_AUDIT: /tmp/promtect-audit.jsonl
+    depends_on: [mock-provider]
+    networks: [provider-harness]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+  promtect-refusal:
+    build:
+      context: ../..
+    environment:
+      PROMTECT_BIND: 0.0.0.0
+      PROMTECT_ALLOW_PUBLIC_BIND: "1"
+      PROMTECT_PORT: "8790"
+      PROMTECT_UPSTREAM: http://mock-provider:65534
+      PROMTECT_READ_TIMEOUT: "1"
+      PROMTECT_AUDIT: /tmp/promtect-audit.jsonl
+    depends_on: [mock-provider]
+    networks: [provider-harness]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+  promtect-cli:
+    build:
+      context: ../..
+    environment:
+      PROMTECT_BIND: 0.0.0.0
+      PROMTECT_ALLOW_PUBLIC_BIND: "1"
+      PROMTECT_PORT: "8790"
+      PROMTECT_UPSTREAM: http://mock-provider:9000/cli
+      PROMTECT_READ_TIMEOUT: "10"
+      PROMTECT_AUDIT: /tmp/promtect-audit.jsonl
+    depends_on: [mock-provider]
+    networks: [provider-harness]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+  runner:
+    build:
+      context: ../..
+      dockerfile: tests/provider-harness/Dockerfile.cli
+    command: ["sh", "-c", "python3 /harness/run_protocols.py && sh /harness/run_clis.sh"]
+    depends_on: [promtect, promtect-refusal, promtect-cli]
+    networks: [provider-harness]
+    read_only: true
+    tmpfs: [/tmp]
+    security_opt: [no-new-privileges:true]
+
+networks:
+  provider-harness:
+    internal: true

@@ -1,16 +1,16 @@
 # Promtect commercial editions
 
-AI tools see everything you paste. Promtect runs on your machine and catches the things you
-don't want them to see, then sends a cleaned-up request upstream so your real secrets never
-leave your laptop. You still get a useful answer back.
+AI tools see what their clients send. Promtect runs as a local proxy and masks
+recognized matches in supported request bodies before sending the remaining
+prompt upstream. It is not universal DLP; the exact boundary and current edition
+states live in [`PRODUCT-CONTRACT.json`](PRODUCT-CONTRACT.json).
 
-The free core catches passwords and API keys, the credentials that get into your servers and
-your accounts. That is yours, free, forever.
+The free Core contains 96 public detector kinds for recognized credential formats.
+It remains available under the Sustainable Use License.
 
-Pro catches the next layer: your customers' personal and payment details, and the secrets
-that don't look like anything Promtect has seen before. One leaked customer record or one
-leaked key can mean a breach, a fine, and a week spent rotating every key you own. Pro stops
-it at the source, on your machine, for the price of a couple of coffees a month.
+Pro is the beta paid layer for entropy, personal-data, payment-data, Skills/MCP,
+and response scanning. It is not generally available until compatible artifact,
+activation, fulfillment, and recovery journeys pass the launch gate.
 
 ## What you pay for
 
@@ -34,42 +34,30 @@ The free core is the floor. Pro is the ceiling.
 
 ## Pricing
 
-Prices below are indicative ahead of general availability. Pay annually and get two months free.
+These are the locked catalog prices. Checkout is disabled until commercial
+readiness is green. Pro is beta; Team and Enterprise are planned products.
 
-|  | Free | Pro | Team (most popular) | Enterprise |
+|  | Core | Pro (beta) | Team (planned) | Enterprise (planned) |
 |---|---|---|---|---|
 | Price | $0 | **$12 / dev / month** | **$25 / dev / month** | from quote |
 | Billing | forever | annual ($96/yr), or $12 monthly | annual ($240/yr), 3-seat minimum | contact sales |
-| Catches known passwords and API key formats | ✅ | ✅ | ✅ | ✅ |
-| Runs on your machine, no cloud, nothing to install in your browser | ✅ | ✅ | ✅ | ✅ |
-| Catches secrets that don't match a known pattern |  | ✅ | ✅ | ✅ |
-| Catches customer personal info (names, emails, phones, addresses) and payment details (card numbers, ID numbers) |  | ✅ | ✅ | ✅ |
-| Checks the AI tools and plug-ins you install aren't quietly stealing your data |  | ✅ | ✅ | ✅ |
-| Checks what the model sends back, not just what you send |  | ✅ | ✅ | ✅ |
-| One shared rulebook across the whole team |  |  | ✅ | ✅ |
-| One dashboard showing it's working, without ever storing a secret |  |  | ✅ | ✅ |
-| Priority support |  |  | ✅ | ✅ |
-| Push the rules to every laptop and run the control plane yourself |  |  |  | ✅ |
-| Single sign-on (SSO / SAML) and role-based access |  |  |  | ✅ |
-| Feeds your security monitoring tools (SIEM) |  |  |  | ✅ |
-| SOC 2 / HIPAA mapping, support agreement (SLA) |  |  |  | ✅ |
+| 96 known-format detector kinds | available | available through Core | planned bundle | planned bundle |
+| Entropy, PII/PHI, and payment detectors | — | beta | beta | beta |
+| Skills/MCP static scan and response scan | — | beta | beta | beta |
+| Shared rulebook, policy, roles, seats, and SIEM | — | — | beta components; operational product planned | beta components; operational product planned |
+| SSO/SAML, fleet UI, central audit, air-gap distribution, compliance mapping, SLA | — | — | — | planned |
 
-Pro and Team start with a 14-day trial. The first 100 paid customers get a
-time-limited year-1 discount (year one only, not a lifetime deal). Cancel any time.
-30-day refund if it does not earn its keep.
+Trial, discount, cancellation, and refund terms are not offered until checkout,
+served legal terms, fulfillment, and recovery are operational.
 
 ## How that compares
 
-The other tools that catch secrets and personal info before they hit an AI cost far more, and
-they do it by routing your code through their cloud or a browser plug-in. Promtect never sends
-your code anywhere. It runs on your machine.
+Competitor pricing and capability comparisons require dated primary-source
+evidence before publication. Promtect runs its proxy locally, but the remaining
+prompt still goes to the configured upstream.
 
-- GitGuardian: $600 to $800 per developer per year.
-- Nightfall AI: $75,000 and up per year at the enterprise tier.
-- Prompt Security, WitnessAI, Lasso: roughly $120 to $180 per seat, or $50k flat.
-
-Promtect Pro is $144 per developer per year ($96 if you pay annually) and never leaves your
-machine. You pay for the catch, not for someone else to hold your secrets.
+Promtect Pro's locked catalog price is $12 monthly or $96 annually per developer.
+It is not currently available for purchase.
 
 ## Embed / OEM
 
@@ -78,13 +66,13 @@ license. Email sales@promtect.org and tell me what you are building.
 
 ## Buy or talk to me
 
-- Pro and Team: [promtect.org/pro](https://promtect.org/pro)
+- Pro beta and Team planned status: [promtect.org/pro](https://promtect.org/pro)
 - Enterprise and Embed: sales@promtect.org
 
 One person builds and supports this. You talk to me, not a queue.
 
 ---
 
-Prices are indicative and may change before general availability. Promtect is a product
+Prices are locked by the product contract and require a reviewed contract change. Promtect is a product
 of AK DevOps Solutions SL (ESB26575522), Barcelona, Spain. The commercial editions are
 governed by a separate commercial agreement, not the Sustainable Use License.

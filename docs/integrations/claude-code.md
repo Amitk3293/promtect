@@ -5,7 +5,7 @@ Promtect's default mode. Claude Code talks the Anthropic API.
 ## Quickest: one command
 
 ```sh
-promtect guard claude              # starts the proxy, runs Claude Code, masks + restores
+promtect guard claude              # first-party individual Max; masks + restores
 promtect guard claude --headroom   # also chain Headroom for token compression
 ```
 
@@ -42,7 +42,34 @@ promtect selftest        # → promtect selftest: PASS — no leak
 
 ## Notes
 
-- Pass your real Anthropic API key as usual (`ANTHROPIC_API_KEY` / `x-api-key`).
-  Promtect forwards the auth header untouched — it only ever masks the body.
+- `guard claude` currently supports a verified first-party, individual Claude
+  Max profile on the reviewed Claude Code 2.1.209 CLI contract only. It refuses
+  unreviewed CLI versions, API-key, Pro, Team, Enterprise, gateway, remote,
+  MDM, registry, file-based, drop-in, or unknown profiles before binding because
+  Claude's managed settings outrank command-line routing and hooks. API-key users
+  can still use the manual proxy method above, without the automatic in-session
+  notice. Other unmanaged individual tiers will be added only after their exact
+  machine-readable auth contract is verified.
+- The manual proxy supports API-key authentication as usual (`ANTHROPIC_API_KEY` /
+  `x-api-key`) and forwards the auth header untouched. `guard claude` is narrower:
+  it refuses environment authentication overrides and uses only the verified stored
+  individual Max credential, so the launched session cannot silently switch tiers.
+- `guard claude` removes inherited HTTP proxy variables from the Claude child so
+  its loopback Promtect URL cannot be routed through another proxy first. Known
+  endpoint- or server-managed settings are rejected before Claude starts;
+  use the manual proxy or an unmanaged individual Max profile.
+- Named guard accepts interactive Claude sessions, not Claude's separate root
+  commands (`ultrareview`, `gateway`, `agents`, update/install, and similar).
+  Those commands have independent network or lifecycle behavior that Promtect
+  has not verified, so guard rejects them before binding or authentication.
+- On Unix, guarded interactive sessions disable `Ctrl-Z` suspension so Promtect
+  can retain terminal ownership and reliably clean up Claude plus its helper
+  processes. Exit Claude normally or use `Ctrl-C` to stop the guarded session.
+- The unmanaged-profile check is a launch-time preflight, not an operating-system
+  sandbox. Promtect cannot prevent a newly installed higher-precedence policy from
+  changing a running Claude process; stop Claude and restart the guard before continuing.
+- Promtect itself ignores implicit system proxy variables. Chain a trusted
+  gateway explicitly with `--upstream` or `--headroom` so the destination is
+  visible in the guard banner and risk classification.
 - Strict mode: `PROMTECT_RESTORE=false` leaves placeholders in the response (the
   secret is never re-inserted). Use it when policy forbids restoration.

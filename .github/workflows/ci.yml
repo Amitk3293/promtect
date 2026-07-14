@@ -48,6 +48,13 @@ jobs:
       - name: Audit dependencies
         run: cargo audit --deny warnings
 
+  dashboard-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Docker dashboard browser suite
+        run: make dashboard-browser-test
+
   coverage:
     runs-on: ubuntu-latest
     # Report-only: prints the coverage summary on every run; never fails the build.
@@ -64,3 +71,33 @@ jobs:
           tool: cargo-llvm-cov
       - name: Coverage summary (report-only)
         run: cargo llvm-cov --workspace --summary-only
+
+  provider-harness:
+    name: provider-harness (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            uname: x86_64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            uname: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Verify native runner architecture
+        run: test "$(uname -m)" = "${{ matrix.uname }}"
+      - name: Docker provider protocols and pinned CLIs
+        run: sh tests/provider-harness/run.sh
+
+  release-readiness:
+    name: release-readiness (Docker)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Package, install, selftest, and tamper gate
+        run: make release-readiness-test

@@ -50,14 +50,30 @@ They verify behavior that spans the full request/response pipeline.
 | 502 on upstream error | A dead upstream produces a clean 502, not a panic |
 | Stable sentinel | The same secret in the same request always maps to the same sentinel |
 | Body-size cap | A body over `max_body_bytes` returns 413 and never reaches the upstream; a body under the cap passes through normally |
+| Scan admission | Saturated detector capacity returns a value-free 503 before body retention or an upstream connection |
+| Slow request body | A partial body that exceeds the fixed 30-second deadline returns a value-free 408, releases its scan slot, and never reaches the upstream |
+| Async responsiveness | CPU-bound detector work runs outside Tokio's async workers while preserving fail-closed results |
 
 **Run:** `cargo test` (all L2) or `cargo test --test integration` / `cargo test --test proxy_integration` individually
+
+**Dashboard browser matrix** (`tests/dashboard-browser/`): runs the real embedded
+dashboard in Docker and verifies desktop rendering, strict/restore mode truth,
+mobile overflow, keyboard tab focus, and reduced-motion behavior with Chromium.
+It also drives real 413/415 requests through a live Docker proxy and verifies
+their value-free audit outcomes through `/api/metrics` and the rendered request
+history. The tracked synthetic fixture makes the suite reproducible from a clean
+checkout. The Playwright package and browser image are pinned to the same version,
+and the Linux CI gate runs this target on every pull request.
+**Run:** `make dashboard-browser-test`.
 
 **Dashboard server** (`tests/dashboard.rs`): starts the observability server on an
 ephemeral port and asserts `/api/metrics` (JSON), `/metrics` (Prometheus text), and
 `/` (the embedded offline UI) each respond correctly, and that a missing audit file
 yields zeroed metrics rather than an error. The metrics it serves are value-free
-(counts, detector names, byte totals — never a secret). **Run:** `cargo test --test dashboard`.
+(counts, detector names, byte totals — never a secret). Oversized records,
+high-cardinality lifecycle data, and busy/failed aggregation are regression-tested;
+unavailable aggregation returns `503` rather than a false zero snapshot. **Run:**
+`cargo test --test dashboard`.
 
 ---
 
@@ -103,6 +119,20 @@ failure.
 
 ---
 
+### L6 — Provider protocols and pinned CLIs (Docker only)
+
+`tests/provider-harness/` runs the packaged Promtect binary, provider mocks,
+protocol assertions, and current supported CLIs entirely in Docker. Runtime is
+credential-free and isolated on an internal network. It covers Anthropic SSE,
+OpenAI Responses SSE, Ollama NDJSON, byte-split restoration, compression,
+sentinel mutation, timeout, refusal, interruption, and real CLI routing.
+
+**Run:** `make provider-harness`. See
+[`tests/provider-harness/README.md`](tests/provider-harness/README.md) for the
+pins, safety model, and explicit failure-mode expectations.
+
+---
+
 ## Adding to the Suite — the Contract
 
 - **New detector** → add at least one positive case and one negative case
@@ -123,6 +153,7 @@ make test                           # run the full test suite
 make lint                           # cargo fmt --check + clippy -D warnings
 make coverage                       # text coverage summary (needs cargo-llvm-cov)
 make smoke                          # smoke-test the compiled binary
+make provider-harness               # Docker-only provider + real-CLI validation
 
 cargo test --test integration       # L2 canary integration tests only
 cargo test --test proxy_integration # L2 proxy integration tests only

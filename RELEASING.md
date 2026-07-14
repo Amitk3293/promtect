@@ -1,58 +1,249 @@
-# Releasing Promtect
+# Releasing Promtect Core
 
-Binaries and the Homebrew formula are driven by tags.
+Core releases are built from an immutable, reviewed `main` tag, but a tag never
+publishes anything by itself. Candidate construction, GitHub Release
+publication, container publication, and Homebrew tap updates are separate gates.
+This prevents a partial matrix build or an accidental tag from becoming a public
+release.
 
-## Cut a release
+## Required repository controls
 
-1. Land everything on `main` (green CI). The patch version in `Cargo.toml` is
-   bumped automatically on every code commit (see [Versioning](#versioning)), so
-   it already reflects the work since the last release — just confirm it's the
-   version you want to tag (bump the minor/major by hand if this release warrants
-   it).
-2. Tag and push:
-   ```sh
-   git tag -a vX.Y.Z -m "Promtect vX.Y.Z"
-   git push origin vX.Y.Z
-   ```
-3. The **`release`** workflow (`.github/workflows/release.yml`) builds and attaches
-   binaries to the GitHub Release for the tag:
-   - macOS: `aarch64-apple-darwin`, `x86_64-apple-darwin`
-   - Linux: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
-   - Each as `promtect-vX.Y.Z-<target>.tar.gz` + a `.sha256` sidecar.
+Before the first public release:
 
-## Update Homebrew
+- Make the Core and Homebrew tap repositories anonymously readable. Promtect Pro
+  remains private and must never be included in a Core artifact.
+- Configure the GitHub environments `core-release` and
+  `core-container-release` with required reviewers and a single custom
+  deployment-branch policy for `main`. `prevent_self_review` must be the exact
+  boolean `true`, and **Allow administrators to bypass configured protection
+  rules** must be disabled. The workflows also require exact typed confirmation;
+  environment protection is the human authorization boundary.
+- Configure two active repository rulesets for `refs/tags/v*`. The first must
+  restrict creation and list only the approved release operators as `always`
+  bypass actors. The second must restrict updates and deletion with **no bypass
+  actors**. GitHub bypass is ruleset-wide, so combining creation and immutability
+  would also let creation operators bypass update/deletion protection. The
+  workflows re-fetch and compare both the annotated tag object ID and commit
+  after every environment wait, but the separate rulesets are the preventive
+  controls.
+- Require the full staging suite and independent `/code-review` before promotion
+  to `main`. A staging-to-main promotion must contain no unreviewed changes.
+- Keep release tags annotated. Signed tags are preferred when the release
+  operator has a configured signing identity; GitHub artifact attestations are
+  mandatory for the four published archives.
+- Add a read-only fine-grained `RELEASE_READINESS_TOKEN` Actions secret that can
+  inspect environments and repository rulesets. Add repository variables
+  `RELEASE_REVIEWERS` and `RELEASE_BYPASS_ACTORS` containing
+  the exact approved tag-creation operator types and numeric IDs as comma-separated
+  `Type:id` entries (for example, `User:123` or `RepositoryRole:5`). The workflows
+  compare both fields so a same-number actor of another type cannot satisfy the
+  gate. They only issue GET requests with this token; control provisioning
+  remains a manual administrator action.
+- Record a fresh `RELEASE_ADMIN_BYPASS_EVIDENCE` repository variable when the
+  GitHub environment API does not expose an administrator-bypass field. The
+  compact JSON record must be valid for no more than 24 hours, be recorded by an
+  approved reviewer, bind both environment `updated_at` values, state that
+  administrator bypass is disabled, and reference a private screenshot or
+  recording plus its SHA-256:
 
-After the release assets exist, regenerate the formula from the published checksums
-and push it to the tap:
+  ```json
+  {"schema_version":1,"repository":"Amitk3293/promtect","source":"github-environment-settings-ui","evidence_reference":"https://github.com/Amitk3293/promtect/issues/ISSUE#issuecomment-COMMENT","evidence_sha256":"64-lowercase-hex-characters","recorded_by_reviewer_type":"User","recorded_by_reviewer_id":123,"recorded_at":"2026-07-13T19:00:00Z","expires_at":"2026-07-13T20:00:00Z","environments":{"core-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"},"core-container-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"}}}
+  ```
+
+Both publication workflows verify the required API-visible controls described
+above before a protected environment is referenced, so a missing environment
+cannot be silently
+auto-created as the authorization boundary. They verify the same state again
+immediately after approval and before any release or package mutation. A future
+API administrator-bypass field must be the exact boolean `false`; any other
+value fails closed. When that field is absent, the workflow validates the fresh
+manual record above against the current API timestamps.
+
+This record is manual launch-gate evidence, not automatic proof of the UI
+setting. GitHub documents that administrators can bypass environment rules by
+default and that an environment can disable that bypass, but the REST OpenAPI
+schema retrieved on 2026-07-13 exposes `prevent_self_review` and does not expose
+the administrator-bypass setting. The evidence expiry and `updated_at` binding
+limit staleness; an approved human must still inspect the referenced capture.
+See [Deployments and environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
+[Reviewing deployments](https://docs.github.com/en/actions/managing-workflow-runs/reviewing-deployments),
+and the [official REST description](https://github.com/github/rest-api-description).
+Missing credentials, controls, exact actors, evidence, or a main-only deployment
+policy fails closed.
+
+Until those controls and anonymous-read checks are green, run candidate builds
+with `publish=false` only.
+
+## 1. Verify the staging candidate in Docker
+
+Every local Promtect build, package, install, and selftest runs in Docker:
 
 ```sh
-scripts/update-formula.sh vX.Y.Z > ../homebrew-tap/Formula/promtect.rb
-cd ../homebrew-tap && git commit -am "promtect vX.Y.Z" && git push
+make docker-test
+make provider-harness
+make dashboard-browser-test
+make release-readiness-test
 ```
 
-Install: `brew install Amitk3293/tap/promtect` (tap repo `Amitk3293/homebrew-tap`).
+`release-readiness-test` builds Core from the locked dependency graph, packages
+the release layout twice to prove deterministic archive metadata, verifies the
+manifest and checksums, performs a clean extraction/install, runs `--version`
+and `selftest`, generates and parses the formula, and proves checksum tampering
+and path traversal are rejected.
+
+## 2. Promote reviewed staging and create the tag
+
+After the complete staging suite passes, promote that exact reviewed commit to
+`main`. Confirm the version in `Cargo.toml`, then create one annotated tag at the
+promoted commit:
+
+```sh
+git tag -a vX.Y.Z <reviewed-main-sha> -m "Promtect vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+Pushing the tag does not start either publication workflow.
+
+## 3. Build a private release candidate
+
+Manually dispatch `.github/workflows/release.yml` with:
+
+- workflow ref: `main` (any other selected ref fails before candidate work);
+- `tag`: the existing annotated `vX.Y.Z` tag;
+- `publish`: `false`;
+- no publication confirmation.
+
+The workflow verifies that the tag version matches `Cargo.toml` and that the tag
+points at the exact `main` commit containing the dispatched workflow. Older tags
+cannot reuse newer release governance or execute their own older verifier scripts.
+It runs the Docker readiness gate, then builds:
+
+- `aarch64-apple-darwin`
+- `x86_64-apple-darwin`
+- `aarch64-unknown-linux-gnu`
+- `x86_64-unknown-linux-gnu`
+
+Each target is built and executed on a pinned native runner before upload. The
+packaged binary must return the exact version and pass `selftest`. Linux builds
+currently declare their build-host compatibility floor through pinned runners:
+Ubuntu 22.04/glibc 2.35 for both x86-64 and ARM64. Lower
+floors require a separately tested build environment; they must not be claimed
+from header-only inspection.
+
+Each matrix job uploads only a smoke-tested candidate artifact. A single verification job
+downloads all four, rejects incomplete/mixed-source sets, validates immutable
+SHA-256 sidecars, requires every embedded source SHA to equal the validated tag
+commit, and produces a reviewable `promtect.rb`. Nothing is released and the tap
+is not changed.
+
+## 4. Publish the verified Core archives
+
+Candidate-only artifacts are useful rehearsal evidence, but they are not later
+promoted across workflow runs. To publish, dispatch a new workflow run with:
+
+- `publish`: `true`;
+- `publish_confirmation`: `publish vX.Y.Z`.
+
+That run builds and verifies its own candidate before the protected `core-release`
+job becomes eligible for approval. The reviewer must download
+`core-vX.Y.Z-verified` from that same run, compare its artifact digest with the
+verification job summary, inspect the archives, sidecars, embedded source SHA,
+and formula, and only then approve the environment. Reject the job if the
+candidate is not acceptable; never approve based on an artifact from another
+run. Core release runs are serialized across tags so an older version cannot
+finish after a newer version and move GitHub's `latest` marker backwards.
+
+After approval, the job checks out the already validated commit, re-fetches the
+remote annotated tag, and requires both its tag object ID and target commit to
+remain unchanged. It downloads and reverifies the same-run artifact and creates
+GitHub build-provenance attestations. An existing unpublished draft may have its
+title, body, and prerelease state normalized, but only after the preflight binds
+it to the reviewed tag/source and rejects a published release or unexpected
+assets. The normalized draft is then verified against deterministic metadata
+before upload. The job revalidates the tag, complete asset set, downloaded
+assets, and target again before making the release public and marking it as
+GitHub's latest stable release. It refuses to replace an existing published
+release.
+
+Do not delete or replace a published asset. If an artifact is wrong, fix the
+problem and publish a new patch version.
+
+## 5. Validate anonymous acquisition and update Homebrew
+
+From a clean, unauthenticated Docker environment, verify every archive URL and
+sidecar, checksum the downloads, extract the native Linux archive, and run:
+
+```sh
+promtect --version
+promtect selftest
+```
+
+Generate the formula from the published sidecars:
+
+```sh
+scripts/update-formula.sh vX.Y.Z > promtect.rb
+```
+
+The generator accepts only a stable `vX.Y.Z` tag and an `owner/repository`
+`PROMTECT_REPO` value before either is interpolated into formula text.
+
+Open a separate reviewed PR in `Amitk3293/homebrew-tap`; release CI never pushes
+the tap. Run `brew audit --strict`, `brew install --build-from-source`,
+`brew test`, `promtect --version`, and `promtect selftest` in a clean Homebrew
+Docker environment before merging the formula. Finally repeat
+`brew install Amitk3293/tap/promtect` anonymously from a clean environment.
+
+## Optional container publication
+
+The GHCR image is not part of the Homebrew release and is never triggered by a
+tag. Dispatch `.github/workflows/docker-publish.yml` separately **from the
+`main` workflow ref** with the same tag and `publish container vX.Y.Z`; approve
+the `core-container-release` environment only when container distribution is
+intentionally in scope. The job checks out the exact pre-approval commit and
+rejects a changed remote tag.
+
+The build first pushes content by digest without a customer-facing tag. Only
+after the build completes does the serialized job re-read grouped GHCR version
+records, refuse an existing exact tag at another digest, and prove the current `X.Y` tag belongs
+to the highest paired `X.Y.Z`/`vX.Y.Z` digest. The exact resolved digest must
+return the expected version and pass `selftest` before any tag write. The job
+then promotes that reviewed digest to the two exact tags and rolling minor tag. A bounded postcondition
+requires both the package API and direct registry reads for all three tags to
+resolve to the pushed digest. Missing or deleted provenance fails closed rather
+than guessing from flattened tag history.
+
+Before the first customer-facing tag write, the protected job stores the chosen
+digest, tag, and exact source SHA in an immutable 90-day workflow artifact. A
+retry selects the oldest unexpired record bound to that `main` source and reuses
+its digest even when a fresh rebuild has another digest. An absent alias is
+created, a same-digest alias is idempotently recreated, and any other digest
+fails closed. A missing, expired, malformed, wrong-branch, or wrong-source record
+cannot authorize recovery. This makes a partial multi-tag write recoverable
+without permitting immutable version replacement.
+
+GHCR does not provide a permanent immutable-tag guarantee. These controls
+enforce non-replacement for this serialized workflow and detect publication
+drift at completion; a separate actor with package write access could still move
+or delete a tag later. Limit package writers, monitor tag-to-digest mappings,
+and treat signed attestations/digest pins as the durable identity. If a recovery
+record has expired while an orphan alias remains, stop and use a separately
+reviewed package-administration cleanup; a new patch must not bypass the orphan
+provenance check.
+
+The conventional container `latest` tag is deprecated and is never published or
+advanced. Consumers must pin `X.Y.Z`, `vX.Y.Z`, or deliberately track `X.Y`.
+Publication fails while a legacy `latest` tag exists, so the current stale tag
+must be removed through a separately reviewed repository-administration action
+before the first run of this workflow.
 
 ## Versioning
 
-The patch version in `Cargo.toml` auto-increments on any commit that touches code
-(`src/`, `tests/`, `build.rs`, or `Cargo.toml`) via the tracked
-`.githooks/pre-commit` hook; docs-only and CI-only commits don't bump. This keeps
-the crate version moving with the code so a release is never cut from a stale
-version. Enable it once per clone:
+The tracked pre-commit hook increments the patch version for Core code changes.
+Enable it once per clone:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-The hook only ever touches the patch component — bump the minor or major by hand
-in `Cargo.toml` when a release warrants it.
-
-## Moving to a `promtect` org later
-
-The repo can be transferred to an org without losing history, issues, PRs,
-releases/binaries, or stars; old URLs redirect and your commit authorship is
-preserved. After a transfer, repoint:
-- this repo's `release.yml` runs unchanged (owner-relative),
-- the brew line + `scripts/update-formula.sh` default repo (`PROMTECT_REPO`),
-- the site's GitHub links and the formula `url`s,
-- re-link Workers Builds and any CI secrets.
+The hook changes only the patch component. Bump minor or major deliberately when
+the release contract warrants it.

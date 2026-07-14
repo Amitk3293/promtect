@@ -1,8 +1,9 @@
 # Promtect documentation
 
-Promtect is a local proxy that masks secrets in your AI tool's requests before
-they leave your machine, then restores them in the reply. No cloud, no root CA,
-no telemetry. Start here.
+Promtect is a local proxy that masks recognized matches in supported AI-tool
+request bodies before the remaining prompt goes upstream, then restores an
+unchanged sentinel in the reply. It installs no root CA and Core contains no
+Promtect telemetry or hosted control-plane dependency. Start here.
 
 ## Getting started
 
@@ -24,6 +25,8 @@ no telemetry. Start here.
 
 - **[Pro overview](pro.md)** — the paid detection layer and how it composes with the free core.
 - **[Pricing & editions](../COMMERCIAL.md)** — Free, Pro, Team, Enterprise.
+- **[Canonical product contract](product-contract.md)** — versioned prices,
+  availability states, terminology, and bounded claims.
 
 ## Project
 

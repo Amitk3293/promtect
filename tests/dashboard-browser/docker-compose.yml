@@ -1,0 +1,44 @@
+services:
+  dashboard-restore:
+    image: promtect-dashboard-browser-app:local
+    build:
+      context: ../..
+    command: ["dashboard"]
+    environment:
+      PROMTECT_AUDIT: /home/nonroot/audit.jsonl
+      PROMTECT_DASHBOARD_PORT: "8799"
+      PROMTECT_RESTORE: "true"
+    volumes:
+      - ./fixture.ndjson:/home/nonroot/audit.jsonl:ro
+
+  dashboard-strict:
+    image: promtect-dashboard-browser-app:local
+    build:
+      context: ../..
+    command: ["dashboard"]
+    environment:
+      PROMTECT_AUDIT: /home/nonroot/audit.jsonl
+      PROMTECT_DASHBOARD_PORT: "8799"
+      PROMTECT_RESTORE: "false"
+    volumes:
+      - ./fixture.ndjson:/home/nonroot/audit.jsonl:ro
+
+  proxy-live:
+    image: promtect-dashboard-browser-app:local
+    build:
+      context: ../..
+    environment:
+      PROMTECT_UPSTREAM: http://127.0.0.1:9
+      PROMTECT_MAX_BODY_BYTES: "64"
+      PROMTECT_PORT: "8790"
+      PROMTECT_DASHBOARD_PORT: "8799"
+      PROMTECT_AUDIT: /home/nonroot/live-audit.jsonl
+
+  browser:
+    build:
+      context: .
+    ipc: host
+    depends_on:
+      - dashboard-restore
+      - dashboard-strict
+      - proxy-live

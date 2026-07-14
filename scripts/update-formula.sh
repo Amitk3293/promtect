@@ -11,14 +11,31 @@
 set -euo pipefail
 
 tag="${1:?usage: update-formula.sh vX.Y.Z}"
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || { echo "tag must be a stable vX.Y.Z tag" >&2; exit 1; }
 ver="${tag#v}"
 repo="${PROMTECT_REPO:-Amitk3293/promtect}"
+[[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+  || { echo "PROMTECT_REPO must be an owner/repository name" >&2; exit 1; }
 base="https://github.com/${repo}/releases/download/${tag}"
 
-# Pull the published sha256 for one target's tarball from the release assets.
+# Pull the sha256 from a verified local candidate when PROMTECT_ASSET_DIR is
+# set; otherwise read the already-published sidecar from GitHub. Release CI uses
+# the local path so formula generation cannot publish or depend on a partial
+# release.
 sha() {
-  gh release download "$tag" -R "$repo" -p "promtect-${tag}-$1.tar.gz.sha256" -O - \
-    | awk '{print $1}'
+  sidecar="promtect-${tag}-$1.tar.gz.sha256"
+  if [ -n "${PROMTECT_ASSET_DIR:-}" ]; then
+    [ -f "${PROMTECT_ASSET_DIR}/${sidecar}" ] \
+      || { echo "missing ${sidecar}" >&2; exit 1; }
+    awk -v archive="${sidecar%.sha256}" \
+      'length($1) == 64 && $1 !~ /[^0-9a-f]/ && $2 == archive && NF == 2 { print $1; found = 1 } END { exit !found }' \
+      "${PROMTECT_ASSET_DIR}/${sidecar}"
+  else
+    gh release download "$tag" -R "$repo" -p "$sidecar" -O - \
+      | awk -v archive="${sidecar%.sha256}" \
+          'length($1) == 64 && $1 !~ /[^0-9a-f]/ && $2 == archive && NF == 2 { print $1; found = 1 } END { exit !found }'
+  fi
 }
 
 arm_mac="$(sha aarch64-apple-darwin)"

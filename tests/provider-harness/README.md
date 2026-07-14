@@ -1,0 +1,172 @@
+# Docker provider and real-CLI harness
+
+This credential-free black-box harness proves Promtect's current provider wire
+behavior without contacting a provider. Build steps may download the pinned CLI
+artifacts; runtime uses a Docker `internal: true` network with no default route.
+
+```sh
+make provider-harness
+```
+
+The runtime containers mount neither the repository nor the host home, `.env`,
+Git metadata, provider configuration, or credentials. The runner's working
+directory is an empty `/synthetic` directory. Requests contain only the fixed
+AWS example canary `AKIAIOSFODNN7EXAMPLE` and fixed dummy authorization values.
+The real-CLI observer retains only path, byte count, SHA-256, and masking flags;
+it never retains a CLI request body.
+
+### Controlled interactive Claude rehearsal
+
+The default harness cannot render Claude's interactive prompt because its
+runtime network is intentionally internal. Exact Claude Code performs an
+`api.anthropic.com` startup request before displaying that prompt. To prove the
+user-visible Stop-hook notice, run the separate networked Docker gate:
+
+```sh
+tests/provider-harness/run-claude-interactive.sh
+```
+
+The script runs the official `claude auth login` flow inside Docker, stores the
+result only in a temporary owner-only named volume, and mounts that volume
+read-only into the rehearsal runner. A root-only initialization container sets
+the empty volume's ownership; login, Promtect, and the rehearsal remain the
+unprivileged `harness` user. Promtect receives no authentication override
+environment variable. The runner mounts no host files, uses only the fixed
+synthetic canaries, and destroys the credential volume and Compose stack on
+exit. This opt-in gate has external egress for Claude's login/startup checks;
+the deterministic default suite remains credential-free and internal-only.
+
+## Pinned clients (retrieved 2026-07-13)
+
+| Client | Pin | Runtime check | Current source |
+|---|---:|---|---|
+| OpenAI Codex | `0.144.3` | `codex --version` | [release](https://github.com/openai/codex/releases/tag/rust-v0.144.3) |
+| Claude Code | `2.1.209` | `claude --version` | [setup](https://code.claude.com/docs/en/setup) |
+| Ollama | `0.31.2` | `ollama --version` | [release](https://github.com/ollama/ollama/releases/tag/v0.31.2) |
+| Aider | `0.86.2` | `aider --version` | [PyPI](https://pypi.org/project/aider-chat/0.86.2/) |
+
+The harness pins every base-image index digest, commits npm integrity metadata
+and the complete Python dependency resolution, and verifies each Ollama Linux
+archive against the architecture-specific SHA-256 published with v0.31.2 before
+extracting its standalone CLI binary. The Python lock permits only the exact
+CPython 3.11 wheels selected on Debian Bookworm for `linux/amd64` and
+`linux/arm64`; installation forces pip hash checking and rejects source
+distributions. Apt packages still resolve from the Debian repository at build
+time, so the build is not claimed to be byte-for-byte deterministic. Claude's
+npm installer remains version-pinned even though current documentation
+recommends the native installer.
+
+CI runs the complete harness natively on both supported Linux architectures:
+`ubuntu-24.04` for `linux/amd64` and `ubuntu-24.04-arm` for `linux/arm64`.
+Each matrix job verifies the host architecture before Docker builds the CLI
+image, so architecture-specific Python wheels and Ollama archive hashes cannot
+borrow a green result from the other platform.
+
+### Regenerating the Python lock
+
+Run these commands from the repository root. They resolve the direct pin in
+`requirements.in` independently in digest-pinned Python 3.11 Bookworm
+containers on both supported Linux architectures. The generator refuses to
+write a lock if the dependency names or versions differ between targets and
+records only the SHA-256 of the wheels actually selected on those targets.
+
+```sh
+rm -rf tests/provider-harness/.requirements-wheels
+mkdir -p tests/provider-harness/.requirements-wheels/amd64 \
+  tests/provider-harness/.requirements-wheels/arm64
+
+docker run --rm --platform linux/amd64 \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/tests/provider-harness:/work" -w /work \
+  python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+  python -m pip download --disable-pip-version-check --no-cache-dir \
+    --only-binary=:all: --dest .requirements-wheels/amd64 \
+    --requirement requirements.in
+
+docker run --rm --platform linux/arm64 \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/tests/provider-harness:/work" -w /work \
+  python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+  python -m pip download --disable-pip-version-check --no-cache-dir \
+    --only-binary=:all: --dest .requirements-wheels/arm64 \
+    --requirement requirements.in
+
+docker run --rm --platform linux/arm64 \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/tests/provider-harness:/work" -w /work \
+  python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+  python generate_requirements_lock.py .requirements-wheels/amd64 \
+    .requirements-wheels/arm64 requirements.lock
+
+for platform in linux/amd64 linux/arm64; do
+  docker run --rm --platform "$platform" \
+    -v "$PWD/tests/provider-harness:/work:ro" \
+    python:3.11.13-slim-bookworm@sha256:86adf8dbadc3d6e82ee5dd2c74bec2e1c2467cdad47886280501df722372d2e1 \
+    python -m pip install --disable-pip-version-check --no-cache-dir \
+      --only-binary=:all: --require-hashes --requirement /work/requirements.lock
+done
+
+rm -rf tests/provider-harness/.requirements-wheels
+```
+
+Review dependency-version changes before committing the regenerated lock. A
+newly published transitive dependency may legitimately change resolution, but
+it must never enter the harness without a visible lock diff and new hashes.
+
+## Protocol and failure expectations
+
+| Scenario | Expected observable result |
+|---|---|
+| Anthropic Messages SSE | Upstream sees a sentinel, never the canary; one-byte chunks restore to the exact expected SSE bytes. |
+| OpenAI Responses SSE | Same invariant for Responses events. |
+| Ollama NDJSON | Same invariant for native newline-delimited JSON. |
+| Altered sentinel | Unknown token remains byte-exact; plaintext is not reinserted. |
+| Compressed request | Fixed, value-free HTTP 415; mock request count does not increase. |
+| Compressed response | `Content-Encoding: gzip` and encoded bytes pass through unchanged; sentinel is not restored. |
+| Refused upstream | Fixed, value-free HTTP 502; mock request count does not increase. |
+| Read timeout | Client sees an interrupted response and only the prefix emitted before the sentinel opened. |
+| Upstream interruption | Same observable result as timeout. |
+
+The timeout/interruption result is a known runtime gap tracked by
+[#86](https://github.com/Amitk3293/promtect/issues/86): although the stream
+adapter yields retained partial-sentinel bytes before its error, the real
+Axum/Hyper boundary drops that final chunk when aborting the downstream stream.
+The harness labels this `OBSERVED`; it does not call it successful restoration.
+
+## Real CLI controls and known gaps
+
+The harness executes each pinned CLI against provider-shaped mock responses and
+requires the observer to see a masked canary and the CLI to receive the
+response-only `masked:<canary>` marker after restoration. Codex uses an explicit
+custom provider with Responses transport and WebSockets disabled. Aider uses
+CLI-precedence `--openai-api-base`.
+
+The A/B control documents the automatic `guard` gap fixed by
+[#87](https://github.com/Amitk3293/promtect/issues/87):
+
+- Codex 0.144.3 routes a custom provider using its documented `base_url`.
+  Codex 0.144.3 does not let `OPENAI_BASE_URL` override an existing direct
+  custom-provider URL. The harness runs a controlled A/B pair
+  with identical home, auth, environment, prompt, and flags. The protected URL
+  produces a masked request and restored response; the direct URL sends the
+  canary to an internal tripwire, which records only metadata and returns 422.
+  The direct run must fail specifically from that 422, so setup or auth errors
+  cannot satisfy the control assertion. It then runs the pinned real Codex CLI
+  through `promtect guard codex` and requires one protected Responses request,
+  no request `content-encoding`, a masked upstream canary, and exact restored
+  stdout. The guard path runs separately with `OPENAI_API_KEY`, `CODEX_API_KEY`,
+  and a key stored by `codex login --with-api-key`. A non-sensitive forwarding
+  wrapper verifies that every Codex child sees all external proxy variables
+  removed, both `NO_PROXY` spellings pinned to loopback, and is reaped after
+  exit; the ephemeral Promtect listener must also be immediately reusable.
+  Guard rejects user config, feature, remote, and cloud overrides before launch,
+  and a failed stored-auth probe must fail before binding or provider traffic.
+
+The harness also adversarially sets a stale `AIDER_OPENAI_API_BASE` while
+providing the two variables current `guard aider` injects. Aider 0.86.2's
+`openai/` path still reaches Promtect via `OPENAI_BASE_URL`; the suspected bypass
+was not reproduced. That remains a negative regression because legacy LiteLLM
+paths may use the other variable.
+
+The direct controls prove provider behavior; the separate guard canary proves
+the shipped one-command wiring.

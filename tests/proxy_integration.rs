@@ -1,10 +1,21 @@
 //! Integration tests for the Promtect proxy: header forwarding, multi-secret masking,
 //! 502 on upstream error, sentinel deduplication, and response restore invariants.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
-use axum::{Json, Router, extract::State, http::HeaderMap, routing::post};
+use axum::{
+    Json, Router,
+    body::{Body, to_bytes},
+    extract::State,
+    http::{HeaderMap, HeaderValue, Request, header::CONTENT_ENCODING},
+    routing::post,
+};
 use serde_json::{Value, json};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tower::ServiceExt;
 
 // ── Shared mock-upstream state ────────────────────────────────────────────────
 
@@ -13,10 +24,12 @@ use serde_json::{Value, json};
 struct Seen {
     body: Arc<Mutex<String>>,
     headers: Arc<Mutex<HeaderMap>>,
+    requests: Arc<AtomicU64>,
 }
 
 /// Echo handler: stores the received headers + body, returns `{"echo": <body>}`.
 async fn mock(State(seen): State<Seen>, headers: HeaderMap, body: String) -> Json<Value> {
+    seen.requests.fetch_add(1, Ordering::Relaxed);
     *seen.headers.lock().unwrap() = headers;
     *seen.body.lock().unwrap() = body.clone();
     Json(json!({ "echo": body }))
@@ -64,11 +77,55 @@ async fn spawn_mock() -> (String, Seen) {
     (url, seen)
 }
 
+/// Start a raw HTTP receiver that counts accepted TCP sockets before returning a
+/// minimal response. This distinguishes "no upstream request" from the stronger
+/// security invariant "no upstream connection was opened".
+async fn spawn_socket_counter() -> (String, Arc<AtomicU64>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicU64::new(0));
+    let accepted = Arc::clone(&connections);
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            accepted.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            });
+        }
+    });
+
+    (format!("http://{addr}"), connections)
+}
+
 /// POST JSON body through Promtect; return the response body text.
 async fn post_through(promtect_url: &str, body: &str) -> (reqwest::StatusCode, String) {
     let resp = reqwest::Client::new()
         .post(format!("{promtect_url}/"))
         .header("content-type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    (status, text)
+}
+
+/// POST a body with an explicit request `Content-Encoding` through Promtect.
+async fn post_with_encoding(
+    promtect_url: &str,
+    body: &str,
+    encoding: &str,
+) -> (reqwest::StatusCode, String) {
+    let resp = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .header("content-encoding", encoding)
         .body(body.to_string())
         .send()
         .await
@@ -152,6 +209,141 @@ async fn output_scan_flags_model_secret_in_live_response() {
         "audit must be value-free, got: {log}"
     );
     let _ = std::fs::remove_file(&audit_path);
+}
+
+/// A downstream paid/rulebook detector participates in the fail-closed request
+/// path. If its first span is unusable, the proxy blocks immediately without a
+/// Core scan, a redundant detector pass, or an upstream connection.
+#[tokio::test]
+async fn active_extra_detector_blocks_an_unmaskable_result_before_upstream() {
+    let (mock_url, seen) = spawn_mock().await;
+    let mut c = ctx(&mock_url);
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_for_detector = Arc::clone(&calls);
+    c.extra_detect = Some(Arc::new(move |text: &str| {
+        let Some(start) = text.find("CUSTOMSECRET") else {
+            return Vec::new();
+        };
+        let end = if calls_for_detector.fetch_add(1, Ordering::SeqCst) == 0 {
+            text.len() + 1
+        } else {
+            start + "CUSTOMSECRET".len()
+        };
+        vec![promtect::detect::Match::new(
+            "custom_rulebook",
+            "CUSTOMSECRET".to_owned(),
+            start,
+            end,
+        )]
+    }));
+    let promtect_url = spawn(promtect::proxy::app(c)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(r#"{"prompt":"CUSTOMSECRET"}"#)
+        .send()
+        .await
+        .expect("post through residual detector");
+    let status = response.status();
+    let body = response.text().await.expect("read value-free rejection");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(body, "promtect: request detector failed closed");
+    assert!(!body.contains("CUSTOMSECRET"));
+}
+
+#[derive(Clone, Copy)]
+enum MalformedResidualSpan {
+    Empty,
+    Reversed,
+    OutOfRange,
+    NonCharBoundary,
+    ValueMismatch,
+}
+
+async fn assert_malformed_residual_blocks_before_upstream(case: MalformedResidualSpan) {
+    let (upstream_url, connections) = spawn_socket_counter().await;
+    let mut c = ctx(&upstream_url);
+    c.extra_detect = Some(Arc::new(move |candidate: &str| {
+        if let Some(start) = candidate.find("CUSTOMSECRET") {
+            return vec![promtect::detect::Match::new(
+                "custom_rulebook",
+                "CUSTOMSECRET".to_owned(),
+                start,
+                start + "CUSTOMSECRET".len(),
+            )];
+        }
+
+        let sentinel_start = candidate
+            .find("«promtect:custom_rulebook:")
+            .expect("the first detector pass must mint a custom sentinel");
+        let inside = sentinel_start + "«".len();
+        let (value, start, end) = match case {
+            MalformedResidualSpan::Empty => ("", inside, inside),
+            MalformedResidualSpan::Reversed => ("x", inside + 2, inside + 1),
+            MalformedResidualSpan::OutOfRange => {
+                ("CUSTOMSECRET", candidate.len(), candidate.len() + 1)
+            }
+            MalformedResidualSpan::NonCharBoundary => ("x", sentinel_start + 1, inside),
+            MalformedResidualSpan::ValueMismatch => {
+                let start = candidate
+                    .find("promtect")
+                    .expect("minted sentinel must contain its marker");
+                ("CUSTOMSECRET", start, start + "promtect".len())
+            }
+        };
+
+        vec![promtect::detect::Match::new(
+            "custom_rulebook",
+            value.to_owned(),
+            start,
+            end,
+        )]
+    }));
+    let promtect_url = spawn(promtect::proxy::app(c)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{promtect_url}/"))
+        .header("content-type", "application/json")
+        .body(r#"{"prompt":"CUSTOMSECRET"}"#)
+        .send()
+        .await
+        .expect("post through malformed residual detector");
+    let status = response.status();
+    let body = response.text().await.expect("read value-free rejection");
+
+    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(connections.load(Ordering::SeqCst), 0);
+    assert!(body.contains("custom_rulebook"));
+    assert!(!body.contains("CUSTOMSECRET"));
+}
+
+#[tokio::test]
+async fn empty_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::Empty).await;
+}
+
+#[tokio::test]
+async fn reversed_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::Reversed).await;
+}
+
+#[tokio::test]
+async fn out_of_range_residual_span_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::OutOfRange).await;
+}
+
+#[tokio::test]
+async fn non_char_boundary_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::NonCharBoundary).await;
+}
+
+#[tokio::test]
+async fn value_mismatched_residual_span_inside_a_minted_sentinel_fails_closed() {
+    assert_malformed_residual_blocks_before_upstream(MalformedResidualSpan::ValueMismatch).await;
 }
 
 /// Three distinct secrets in one body are each masked before reaching the upstream
@@ -440,9 +632,13 @@ async fn vault_does_not_bleed_secrets_across_requests() {
 #[tokio::test]
 async fn oversized_body_is_rejected_with_413() {
     let (mock_url, seen) = spawn_mock().await;
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-oversized-body-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
     let small_cap = promtect::proxy::Ctx {
         upstream: mock_url.clone(),
-        audit: Arc::new(promtect::audit::Audit::null()),
+        audit: Arc::new(promtect::audit::Audit::to_file(audit_path.clone())),
         client: reqwest::Client::new(),
         max_body_bytes: 64,
         restore: true,
@@ -454,6 +650,8 @@ async fn oversized_body_is_rejected_with_413() {
 
     let body = "x".repeat(4096); // far over the 64-byte cap, still tiny
     let (status, _text) = post_through(&promtect_url, &body).await;
+    let metrics = promtect::metrics::aggregate(&audit_path);
+    std::fs::remove_file(&audit_path).ok();
 
     assert_eq!(status, reqwest::StatusCode::PAYLOAD_TOO_LARGE);
     // Rejected before forwarding: the upstream must never have seen the body.
@@ -461,6 +659,11 @@ async fn oversized_body_is_rejected_with_413() {
         seen.body.lock().unwrap().is_empty(),
         "upstream must not receive a body that exceeded the cap"
     );
+    assert_eq!(metrics.requests_total, 1);
+    assert_eq!(metrics.requests_clean, 0);
+    assert_eq!(metrics.requests_blocked_total, 1);
+    assert_eq!(metrics.recent.len(), 1);
+    assert!(metrics.recent[0].blocked);
 }
 
 /// A body within the cap passes straight through (masked, then forwarded). The
@@ -476,6 +679,242 @@ async fn body_within_cap_passes_through() {
         seen.body.lock().unwrap().contains("hello world"),
         "a body under the cap must reach the upstream"
     );
+}
+
+/// Every non-identity request content coding is rejected before the mock upstream
+/// receives an HTTP request. The client-visible error is constant and does not
+/// reflect either the body or attacker-controlled encoding value.
+#[tokio::test]
+async fn non_identity_content_encodings_return_value_free_415_without_forwarding() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"{aws}"}}"#);
+    let encodings = [
+        "gzip",
+        "deflate",
+        "br",
+        "zstd",
+        "snappy-private-value",
+        "gzip, br",
+        "identity, gzip",
+        "GzIp",
+        "gzip , br",
+    ];
+
+    let (mock_url, seen) = spawn_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    for encoding in encodings {
+        let (status, response) = post_with_encoding(&promtect_url, &body, encoding).await;
+
+        assert_eq!(
+            status,
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{encoding:?} must be rejected"
+        );
+        assert_eq!(
+            response,
+            "promtect: unsupported request Content-Encoding; send an identity-encoded body",
+            "the 415 response must be constant and value-free"
+        );
+        assert!(
+            !response.contains(aws),
+            "the response reflected the request body"
+        );
+        assert!(
+            !response.contains(encoding),
+            "the response reflected the Content-Encoding value"
+        );
+    }
+
+    assert_eq!(
+        seen.requests.load(Ordering::Relaxed),
+        0,
+        "rejected requests must not reach the upstream handler"
+    );
+}
+
+/// Rejection happens before reqwest resolves or opens the configured upstream.
+/// The controlled receiver counts accepted TCP sockets, not merely HTTP handlers.
+#[tokio::test]
+async fn rejected_content_encoding_opens_no_upstream_socket() {
+    let (upstream_url, connections) = spawn_socket_counter().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&upstream_url))).await;
+
+    let (status, _) = post_with_encoding(
+        &promtect_url,
+        r#"{"content":"AKIAIOSFODNN7EXAMPLE"}"#,
+        "gzip",
+    )
+    .await;
+
+    assert_eq!(status, reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "Promtect opened a TCP socket to the upstream"
+    );
+}
+
+/// Opaque non-UTF-8 header bytes cannot be emitted reliably by an HTTP client,
+/// so drive the Axum router directly. The malformed value must still receive the
+/// same fixed rejection, produce only fixed audit metadata, and open no socket.
+#[tokio::test]
+async fn non_utf8_content_encoding_is_value_free_and_opens_no_upstream_socket() {
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let body_marker = "non-utf8-private-body";
+    let body = format!(r#"{{"content":"{secret}","marker":"{body_marker}"}}"#);
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect_non_utf8_encoding_{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let (upstream_url, connections) = spawn_socket_counter().await;
+    let mut proxy_ctx = ctx(&upstream_url);
+    proxy_ctx.audit = Arc::new(promtect::audit::Audit::to_file(audit_path.clone()));
+    let app = promtect::proxy::app(proxy_ctx);
+
+    let mut request = Request::post("/")
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let opaque = HeaderValue::from_bytes(b"\xff")
+        .expect("opaque non-UTF-8 header bytes are valid HeaderValue data");
+    assert!(opaque.to_str().is_err(), "test value must be non-UTF-8");
+    request.headers_mut().insert(CONTENT_ENCODING, opaque);
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let response_body = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        response_body,
+        "promtect: unsupported request Content-Encoding; send an identity-encoded body"
+    );
+    assert!(
+        !response_body
+            .as_ref()
+            .windows(secret.len())
+            .any(|w| w == secret.as_bytes())
+    );
+    assert!(
+        !response_body
+            .as_ref()
+            .windows(body_marker.len())
+            .any(|w| w == body_marker.as_bytes())
+    );
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "Promtect opened a TCP socket for a non-UTF-8 Content-Encoding"
+    );
+
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+    let metrics = promtect::metrics::aggregate(&audit_path);
+    assert!(audit.contains(r#""action":"request_rejected""#));
+    assert!(audit.contains(r#""detector":"content_encoding""#));
+    assert!(audit.contains("«unsupported-content-encoding»"));
+    assert!(
+        !audit.contains(secret),
+        "audit contains the synthetic secret"
+    );
+    assert!(
+        !audit.contains(body_marker),
+        "audit reflects request-body content"
+    );
+    assert_eq!(metrics.requests_total, 1);
+    assert_eq!(metrics.requests_clean, 0);
+    assert_eq!(metrics.requests_blocked_total, 1);
+    assert_eq!(metrics.recent.len(), 1);
+    assert!(metrics.recent[0].blocked);
+
+    let _ = std::fs::remove_file(audit_path);
+}
+
+/// Absent and identity-only request encodings keep the existing masking and
+/// restoration path, including mixed-case and optional whitespace around tokens.
+#[tokio::test]
+async fn identity_and_absent_content_encoding_continue_through_masking_and_restoration() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let body = format!(r#"{{"content":"{aws}"}}"#);
+    let encodings = [
+        None,
+        Some("identity"),
+        Some("IdEnTiTy"),
+        Some("identity , identity"),
+    ];
+
+    let (mock_url, seen) = spawn_mock().await;
+    let promtect_url = spawn(promtect::proxy::app(ctx(&mock_url))).await;
+
+    for encoding in encodings {
+        let (status, response) = match encoding {
+            Some(value) => post_with_encoding(&promtect_url, &body, value).await,
+            None => post_through(&promtect_url, &body).await,
+        };
+
+        assert!(status.is_success(), "{encoding:?} should be accepted");
+        assert!(
+            response.contains(aws),
+            "{encoding:?} response did not restore the synthetic key"
+        );
+        let upstream_body = seen.body.lock().unwrap().clone();
+        assert!(
+            !upstream_body.contains(aws),
+            "{encoding:?} bypassed request masking"
+        );
+        assert!(
+            upstream_body.contains("«promtect:aws_key:"),
+            "{encoding:?} did not reach the upstream as a sentinel"
+        );
+    }
+
+    assert_eq!(
+        seen.requests.load(Ordering::Relaxed),
+        encodings.len() as u64
+    );
+}
+
+/// The rejection audit event contains only a fixed action/reason marker and a
+/// request ID. It never records the body, secret, or attacker-controlled coding.
+#[tokio::test]
+async fn rejected_content_encoding_writes_value_free_audit_event() {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let encoding = "snappy-private-value";
+    let body = format!(r#"{{"content":"{aws}","marker":"body-private-value"}}"#);
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect_rejected_encoding_{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+
+    let (mock_url, seen) = spawn_mock().await;
+    let mut proxy_ctx = ctx(&mock_url);
+    proxy_ctx.audit = Arc::new(promtect::audit::Audit::to_file(audit_path.clone()));
+    let promtect_url = spawn(promtect::proxy::app(proxy_ctx)).await;
+
+    let (status, response) = post_with_encoding(&promtect_url, &body, encoding).await;
+    let audit = std::fs::read_to_string(&audit_path).unwrap();
+
+    assert_eq!(status, reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    assert_eq!(
+        response,
+        "promtect: unsupported request Content-Encoding; send an identity-encoded body"
+    );
+    assert!(audit.contains(r#""action":"request_rejected""#));
+    assert!(audit.contains(r#""detector":"content_encoding""#));
+    assert!(audit.contains("«unsupported-content-encoding»"));
+    assert!(!audit.contains(aws), "audit contains the synthetic secret");
+    assert!(
+        !audit.contains(encoding),
+        "audit reflects the encoding value"
+    );
+    assert!(
+        !audit.contains("body-private-value"),
+        "audit reflects request-body content"
+    );
+    assert_eq!(seen.requests.load(Ordering::Relaxed), 0);
+
+    let _ = std::fs::remove_file(audit_path);
 }
 
 // ── Streaming (SSE) restore ─────────────────────────────────────────────────
@@ -506,6 +945,175 @@ async fn spawn_stream_mock() -> (String, Seen) {
         .with_state(seen.clone());
     let url = spawn(app).await;
     (url, seen)
+}
+
+fn truncate_before_sentinel_close(masked: &str) -> String {
+    let close = masked
+        .find('»')
+        .expect("masked request contains a sentinel close");
+    masked[..close].to_string()
+}
+
+async fn mock_interrupted_stream(
+    State(seen): State<Seen>,
+    body: String,
+) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    let partial = truncate_before_sentinel_close(&body);
+    let first = futures_util::stream::once(async move {
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(partial))
+    });
+    let failure = futures_util::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("synthetic interrupted stream"))
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(futures_util::StreamExt::chain(
+            first, failure,
+        )))
+        .unwrap()
+}
+
+async fn mock_timed_out_stream(State(seen): State<Seen>, body: String) -> axum::response::Response {
+    *seen.body.lock().unwrap() = body.clone();
+    let partial = truncate_before_sentinel_close(&body);
+    let first = futures_util::stream::once(async move {
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(partial))
+    });
+    let stalled = futures_util::stream::once(async {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from_static(b"late"))
+    });
+    axum::response::Response::builder()
+        .header("content-type", "text/event-stream")
+        .body(Body::from_stream(futures_util::StreamExt::chain(
+            first, stalled,
+        )))
+        .unwrap()
+}
+
+async fn assert_interrupted_stream_is_client_visible(
+    upstream_handler: axum::routing::MethodRouter<Seen>,
+    read_timeout: Option<std::time::Duration>,
+) {
+    let aws = "AKIAIOSFODNN7EXAMPLE";
+    let request_body = format!(r#"{{"content":"{aws}"}}"#);
+    let audit_path = std::env::temp_dir().join(format!(
+        "promtect-stream-recovery-{}.jsonl",
+        uuid::Uuid::new_v4()
+    ));
+    let seen = Seen::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/", upstream_handler)
+            .with_state(seen.clone()),
+    )
+    .await;
+    let mut proxy_ctx = ctx(&upstream);
+    proxy_ctx.audit = Arc::new(promtect::audit::Audit::to_file(audit_path.clone()));
+    if let Some(timeout) = read_timeout {
+        proxy_ctx.client = reqwest::Client::builder()
+            .read_timeout(timeout)
+            .build()
+            .expect("timeout test client");
+    }
+    let proxy = spawn(promtect::proxy::app(proxy_ctx)).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{proxy}/"))
+        .header("content-type", "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("proxy response headers");
+    assert_eq!(
+        response
+            .headers()
+            .get("trailer")
+            .and_then(|v| v.to_str().ok()),
+        Some("promtect-stream-outcome")
+    );
+    let body_result = response.bytes().await;
+    let masked = seen.body.lock().unwrap().clone();
+    let audit = std::fs::read_to_string(&audit_path).expect("stream recovery audit");
+    std::fs::remove_file(&audit_path).ok();
+
+    assert!(
+        body_result.is_err(),
+        "ordinary clients must not accept a truncated upstream body as complete"
+    );
+    assert!(!masked.contains(aws));
+    assert!(audit.contains("\"action\":\"stream_interrupted\""));
+    assert!(!audit.contains(aws));
+}
+
+#[tokio::test]
+async fn interrupted_stream_is_client_visible_and_audited() {
+    assert_interrupted_stream_is_client_visible(post(mock_interrupted_stream), None).await;
+}
+
+#[tokio::test]
+async fn interrupted_stream_emits_safe_prefix_then_aborts_http1_body() {
+    let seen = Seen::default();
+    let upstream = spawn(
+        Router::new()
+            .route("/", post(mock_interrupted_stream))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let proxy = spawn(promtect::proxy::app(ctx(&upstream))).await;
+    let authority = proxy
+        .strip_prefix("http://")
+        .expect("spawn returns an HTTP URL");
+    let body = r#"{"content":"AKIAIOSFODNN7EXAMPLE"}"#;
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nTE: trailers\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+
+    let mut socket = tokio::net::TcpStream::connect(authority)
+        .await
+        .expect("connect raw HTTP/1.1 client to proxy");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("write raw HTTP/1.1 request");
+    let mut wire = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        socket.read_to_end(&mut wire),
+    )
+    .await
+    .expect("proxy closes Connection: close response")
+    .expect("read raw HTTP/1.1 response");
+    let masked = seen.body.lock().unwrap().clone();
+    let partial = truncate_before_sentinel_close(&masked);
+    let expected = partial
+        .split_once('«')
+        .map_or(partial.as_str(), |(prefix, _)| prefix);
+    let wire_text = String::from_utf8_lossy(&wire).to_ascii_lowercase();
+
+    assert!(wire_text.contains("trailer: promtect-stream-outcome\r\n"));
+    assert!(
+        wire.windows(expected.len())
+            .any(|window| window == expected.as_bytes()),
+        "bytes emitted before the held sentinel carry were not delivered before the body error"
+    );
+    assert!(
+        !wire_text.ends_with("0\r\npromtect-stream-outcome: complete\r\n\r\n")
+            && !wire_text.ends_with("0\r\npromtect-stream-outcome: interrupted\r\n\r\n"),
+        "an interrupted response must not carry a successful terminal chunk: {wire_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn timed_out_stream_is_client_visible_and_audited() {
+    assert_interrupted_stream_is_client_visible(
+        post(mock_timed_out_stream),
+        Some(std::time::Duration::from_millis(50)),
+    )
+    .await;
 }
 
 /// A sentinel split across streamed chunk boundaries is fully reassembled and
@@ -568,6 +1176,12 @@ async fn strict_mode_does_not_restore_secrets() {
     let (mock_url, seen) = spawn_stream_mock().await;
     let mut strict = ctx(&mock_url);
     strict.restore = false;
+    let scan_calls = Arc::new(AtomicU64::new(0));
+    let scan_calls_for_callback = Arc::clone(&scan_calls);
+    strict.output_scan = Some(Arc::new(move |_text: &str| {
+        scan_calls_for_callback.fetch_add(1, Ordering::SeqCst);
+        Vec::new()
+    }));
     let promtect_url = spawn(promtect::proxy::app(strict)).await;
 
     let (status, text) = post_through(&promtect_url, &body).await;
@@ -585,6 +1199,11 @@ async fn strict_mode_does_not_restore_secrets() {
     assert!(
         !text.contains(aws),
         "strict mode must NOT restore the real secret: {text:?}"
+    );
+    assert_eq!(
+        scan_calls.load(Ordering::SeqCst),
+        0,
+        "strict mode streams sentinels verbatim and must not run the restored-text output scan"
     );
 }
 

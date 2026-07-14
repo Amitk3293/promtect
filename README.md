@@ -1,30 +1,38 @@
 # Promtect
 
 [![License: SUL (fair-code)](https://img.shields.io/badge/license-SUL%20fair--code-3b82f6)](LICENSE)
-[![Latest release](https://img.shields.io/github/v/release/Amitk3293/promtect?color=10b981&label=release)](https://github.com/Amitk3293/promtect/releases)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Install: Homebrew](https://img.shields.io/badge/install-brew-f59e0b)](https://github.com/Amitk3293/homebrew-tap)
 
-### Your AI coding tool just saw your secrets. Promtect makes sure the model never does.
+### Keep recognized secrets out of supported AI-tool requests.
 
 **One file with a key in it, handed to an AI tool, is a key you no longer control. You
 can rotate it. You can't un-send it.**
 
-Promtect is a local proxy that catches every API key, token, and password before your AI tool can send them. Each secret is masked on the way out,
-then restored in the reply (or kept masked in strict mode, your call). The model
-does its job on your real code; your secrets stay on your machine.
+Promtect is a local proxy that masks recognized known-format secrets in supported
+request bodies before your AI tool sends the remaining prompt upstream. Each match
+is replaced on the way out, then restored in the reply when the sentinel is
+unchanged (or kept masked in strict mode, your call).
 
-**Source-available. Runs entirely on your machine. No cloud, no telemetry, no root
-certificate. Secrets are never written to disk.**
+**Source-available under the Sustainable Use License. The proxy runs on your
+machine, installs no root certificate, and contains no Promtect telemetry or
+hosted control-plane dependency. Its audit format is designed to remain
+value-free.**
 
-![Promtect masks every secret, keys, tokens, DB passwords, before the model sees it, and restores them in the reply](docs/demo.gif)
+![Promtect masks recognized keys, tokens, and DB passwords before the configured upstream sees those values, and restores unchanged sentinels in the reply](docs/demo.gif)
 
 <sub>Recorded with [`vhs`](https://github.com/charmbracelet/vhs) from [`docs/demo.tape`](docs/demo.tape), rebuild with `cargo build --release && vhs docs/demo.tape`.</sub>
 
-```sh
-brew install Amitk3293/tap/promtect            # or: cargo install --path .
+> **Pre-launch distribution status:** the Core repository, Homebrew tap, and
+> release artifacts are intentionally private. Homebrew is therefore not a
+> supported acquisition path yet; it becomes testable only when those assets
+> are deliberately made public at launch. Authorized evaluators can build the
+> reviewed `staging` source locally.
 
-promtect guard claude                          # one command: proxy up, claude pointed at it, secrets masked
+```sh
+cargo install --path .                         # from an authorized source checkout
+# Launch path, not currently available: brew install Amitk3293/tap/promtect
+
+promtect guard ollama run qwen2.5:0.5b         # runtime-proven local guard path
 echo "ship it with $AWS_KEY" | promtect mask   # or just see what would get masked
 ```
 
@@ -51,13 +59,15 @@ anything you sent as compromised.** The tools most developers already use have l
 - **Samsung** engineers pasted source code and secrets into ChatGPT; Samsung banned it
   company-wide.
 
-**Promtect keeps it from ever arriving.**
+**For recognized matches on a supported path, Promtect replaces the value before
+the configured upstream receives the request.**
 
 **What one slip costs you:** rotate every key in that file, force a redeploy, and write
 the note explaining why production credentials went to a third party, and the secret is
 already sitting in a log you'll never reach. **What it costs with Promtect:** nothing.
-`promtect guard claude`, and the key never leaves your laptop. Nothing to rotate, because
-nothing leaked.
+route a supported tool through Promtect, and a recognized key on a verified supported path is
+masked before forwarding. Unsupported formats and bypassing clients remain your
+responsibility; review the [threat model](THREAT-MODEL.md).
 
 **Switched to a cheap Chinese model to save on tokens?** DeepSeek, Kimi (Moonshot), and
 GLM (Zhipu) [now lead coding traffic on OpenRouter](https://www.techtimes.com/articles/317352/20260529/chinese-ai-models-lead-openrouter-traffic-coding-gains-come-china-data-risk.htm),
@@ -93,12 +103,16 @@ No TLS interception. No root certificate. The auth header (`x-api-key`,
 
 The dashboard starts automatically on `http://127.0.0.1:8799` whenever the proxy
 starts. It serves an offline view of what Promtect has caught: secrets masked,
-the per-detector breakdown (every detector, counted live, nothing hard-coded),
-the clean rate, recent requests, and bytes processed. It reads only the audit log,
-so it shows counts and detector names, never a secret value, never request/response bodies.
+the per-detector breakdown (counted from audit events), the clean rate, recent
+requests, and bytes processed. It reads only the value-free audit schema, which
+contains counts and detector names rather than request or response bodies.
 
 Pass `--no-dashboard` to start the proxy without it, or run `promtect dashboard`
 standalone to tail an existing audit log without starting a proxy.
+
+Audit aggregation is bounded and runs off the async request path. If the local
+dashboard is already at its aggregation limit or a scan fails, `/api/metrics`
+and `/metrics` return `503` explicitly instead of showing a false all-clear.
 
 The same counts are exposed for Prometheus at `/metrics`, including
 `promtect_output_secrets_total` for anything the Pro output scan caught in a
@@ -108,25 +122,11 @@ you get the signal without it cluttering the tool while you work.
 
 ![Promtect's local dashboard: secrets masked, per-detector breakdown, clean rate, and recent value-free request summaries](docs/dashboard.png)
 
-## How Promtect compares
+## Design difference
 
-|  | **Promtect** | Veil | LiteLLM masking |
-|---|:---:|:---:|:---:|
-| **Restore secrets in the response** | ✅ yes, or keep masked (`PROMTECT_RESTORE=false`) | ❌ cannot | ❌ cannot |
-| Detect secrets in transit | ✅ detectors | ⚠️ limited | ✅ |
-| Real-time restore as the answer streams in | ✅ per-token | ❌ | ❌ |
-| No root certificate to install | ✅ | ❌ installs a CA | n/a |
-| Secrets wiped from memory (Rust + zeroize) | ✅ | ❌ | ❌ |
-| Value-free audit log | ✅ | ❌ logs to SQLite | ❌ |
-| Runs locally / no cloud | ✅ | ✅ | ❌ server-side |
-| Source available | ✅ SUL (fair-code) | ✅ | ✅ |
-
-**The gap no one else fills:** other tools hand the model `[REDACTED]` and you
-get useless code back. Promtect is the only one that can restore, and it lets
-you choose: transparent restore for usable answers, or strict mode where the
-secret never comes back at all. And unlike Veil, Promtect installs no root
-certificate, it never touches your system trust store, so there's no new
-interception layer to trust.
+Transparent mode can restore an unchanged sentinel for usable answers, while
+strict mode leaves it masked. Promtect does this as an application-level proxy
+and does not install a root certificate or change the system trust store.
 
 ---
 
@@ -136,9 +136,9 @@ interception layer to trust.
 and tears it down on exit, no manual env-var wiring:
 
 ```sh
-promtect guard claude                     # Claude Code, secrets masked → Anthropic
-promtect guard codex                      # Codex → OpenAI
-promtect guard ollama run deepseek-r1     # local Ollama, nothing leaves your box
+promtect guard ollama run qwen2.5:0.5b    # runtime-proven local Ollama path
+promtect guard claude                     # beta; requires supported direct Anthropic auth/routing
+promtect guard codex                      # beta; unsupported auth/routing fails before a prompt
 promtect guard ollama --cloud run gpt-oss:120b-cloud   # Ollama Cloud → masked → ollama.com
 promtect guard aider --model openai/gpt-5.5  # Aider → masked → OpenAI-compatible
 promtect guard claude --headroom          # chain Headroom: mask → compress → Anthropic
@@ -146,12 +146,29 @@ promtect guard codex --strict             # never re-insert secrets in the respo
 promtect guard --exec <tool> --base-var OPENAI_API_BASE --base-path /v1   # wrap any tool
 ```
 
-Your API keys (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OLLAMA_API_KEY`) flow
-through untouched, Promtect only masks the request body. The base URL each tool
-needs is set for you (`ANTHROPIC_BASE_URL` for Claude, `OPENAI_BASE_URL` for Codex,
-`OLLAMA_HOST` for Ollama). Local Ollama runs on your own machine, so there is little
-to protect; `--cloud` points it at `ollama.com`, where your prompt leaves the box and
-masking earns its keep. Combine with
+`guard codex` supports OpenAI API-key sessions. It fails before opening a
+provider connection for ChatGPT subscription auth, OpenRouter, custom provider
+routing, or request-compression overrides because those modes cannot currently
+guarantee interception. Supported model-calling roots are the interactive CLI,
+`exec`/`e`, and `review`; use `exec <prompt>` for single-token prompts so they
+cannot be mistaken for a new root command. Unknown root commands fail closed.
+It also disables Codex WebSockets and provider retries, keeping each protected
+model call on one observable HTTP Responses request.
+
+`guard claude` currently supports a verified first-party, unmanaged individual
+Claude Max profile. It fails before binding for API-key, Pro, Team, Enterprise,
+gateway, remote/endpoint-managed, or unknown profiles because Claude managed
+settings outrank command-line routing and hooks. API-key users can use the
+[manual Claude proxy setup](docs/integrations/claude-code.md#start-promtect-manual),
+which does not include the automatic in-session notice.
+
+Manual proxy sessions and supported non-Claude guards forward their provider API
+keys untouched; Promtect only masks the request body. `guard claude` instead
+refuses environment auth overrides and uses the verified stored individual Max
+credential. The base URL each tool needs is set for you (`ANTHROPIC_BASE_URL` for
+Claude, `OPENAI_BASE_URL` for Codex, `OLLAMA_HOST` for Ollama). Local Ollama runs on
+your own machine, so there is little to protect; `--cloud` points it at `ollama.com`,
+where your prompt leaves the box and masking earns its keep. Combine with
 [Headroom](https://github.com/chopratejas/headroom) for secrets-safe **and** ~90%
 cheaper sessions.
 
@@ -180,7 +197,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8790 claude
 ### Prove it works (no network needed)
 
 ```sh
-promtect selftest    # masks a canary secret, confirms it never leaks, restores it
+promtect selftest    # masks and restores a synthetic detector canary locally
 ```
 
 ---
@@ -192,7 +209,7 @@ point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 
 | Tool | Setup |
 |------|-------|
-| **Claude Code** | `promtect` then `ANTHROPIC_BASE_URL=http://127.0.0.1:8790` |
+| **Claude Code** | `promtect guard claude` for reviewed Claude Code 2.1.209 + individual Max + automatic notice; manual base-URL routing remains available for API-key use ([guide](docs/integrations/claude-code.md)) |
 | **Cursor** | `PROMTECT_MODE=openai promtect`; set Cursor's OpenAI base URL to `http://127.0.0.1:8790/v1` |
 | **OpenAI Codex CLI** | `PROMTECT_MODE=openai promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |
 | **Ollama** (local/Chinese models) | `PROMTECT_MODE=ollama promtect`; `OPENAI_BASE_URL=http://127.0.0.1:8790/v1` |
@@ -205,7 +222,7 @@ point `PROMTECT_UPSTREAM` at anything (the **chaining knob**).
 
 Full guides: [`docs/integrations/`](docs/integrations/README.md). It doesn't
 matter whether you're using Claude, GPT, DeepSeek, or a local model, Promtect
-masks your secrets before any of them see them.
+masks recognized matches when the client is verified to route through it.
 
 ### Environment variables
 
@@ -227,9 +244,8 @@ masks your secrets before any of them see them.
 
 - **Transparent (default):** secret masked outbound, real value restored
   in the answer → AI output is directly usable.
-- **Strict (`PROMTECT_RESTORE=false`):** secret masked and *never* restored,
-  provably never touches the response, logs, or terminal. Maximum paranoia for
-  security-strict teams.
+- **Strict (`PROMTECT_RESTORE=false`):** a detected value is masked outbound and
+  Promtect does not restore it from the per-request vault into the response.
 
 ---
 
@@ -269,8 +285,24 @@ Promtect is a focused control, not a catch-everything. It's honest about its edg
 |---|---|
 | Known-format secrets in the request body (keys, tokens, DB-URL passwords, JWTs, PEM keys) | Unknown-format / high-entropy secrets with no recognizable shape |
 | UTF-8 text bodies of tools with a base-URL override (Claude Code, Cursor, Codex, Ollama, OpenRouter) | The model's **response** (restore only re-inserts what it masked) |
-| The streamed response (real-time restore, or strict mode) | Binary / multipart / base64 / compressed bodies |
+| The streamed response (real-time restore, or sentinels retained in strict mode) | Encoded secret values Promtect has not decoded (base64, percent-encoding, protobuf, multipart parts) |
 | | Tools without a base-URL override (VS Code Copilot, browser chat) |
+
+Promtect scans the complete raw request body only when it is valid UTF-8. A
+text-only multipart body is scanned as flat text, not parsed as multipart; a body
+containing non-UTF-8 bytes is forwarded unchanged and unscanned. Request headers,
+including `Authorization` and `x-api-key`, are forwarded and never scanned.
+Non-identity `Content-Encoding` is rejected with HTTP 415 before DNS resolution or
+an upstream connection. Decompress the body before sending it through Promtect.
+
+Request scanning has bounded admission (`min(available CPU threads, 4)`, with at
+least one slot). When every slot is occupied, Promtect returns a value-free HTTP
+503 before retaining the body or connecting upstream; retry the request after
+capacity becomes available. An admitted request must deliver its complete body
+within 30 seconds. Otherwise Promtect returns a value-free HTTP 408, releases the
+slot, and never connects upstream. These rejections are recorded as
+`request_rejected` audit events with kinds `scan_capacity` and `body_timeout` and
+fixed non-secret markers.
 
 Full scope and trust assumptions: **[THREAT-MODEL.md](THREAT-MODEL.md)**.
 
@@ -316,9 +348,9 @@ promtect --no-dashboard # start proxy only, skip the metrics dashboard
 promtect dashboard      # standalone dashboard (no proxy) — UI, /api/metrics, /metrics (Prometheus)
 ```
 
-Every mask/unmask event is appended to `promtect-audit.jsonl`, timestamp,
-action, detector kind, sentinel ID, request ID. **It never records the real
-secret value**, only the opaque placeholder, a clean, value-free audit trail.
+Every mask/unmask event is appended to `promtect-audit.jsonl`: timestamp,
+action, detector kind, sentinel ID, and request ID. The schema has no request,
+response, or detected-value field.
 
 ---
 
@@ -362,12 +394,10 @@ internal business, personal, and non-commercial use. You can read, run, modify, 
 self-host it. You cannot resell it or run it as a paid service for others. Full terms
 in [LICENSE](LICENSE).
 
-Pro adds the next layer, on the same machine, no cloud: secrets that don't match a known
-pattern, your customers' personal info (names, emails, phone numbers, addresses) and payment
-details (card and ID numbers), a check that the AI tools and plug-ins you install aren't
-quietly stealing your data, and a scan of what the model sends back. One leaked customer
-record or API key can mean a breach and a fine. Pro is coffee-price insurance against it.
-See [COMMERCIAL.md](COMMERCIAL.md).
+Pro is the beta paid layer for entropy, PII/PHI/payment, Skills/MCP static scan,
+and response scan components. It is not available for purchase until artifact,
+activation, fulfillment, and recovery gates pass. See
+[COMMERCIAL.md](COMMERCIAL.md).
 
 "Promtect" is a trademark of AK DevOps Solutions SL. See [TRADEMARK.md](TRADEMARK.md).
 
