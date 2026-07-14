@@ -382,35 +382,129 @@ pub fn plan_guard(args: &[String]) -> Result<GuardPlan, String> {
 /// Return the first Claude argument that conflicts with guard-owned routing or
 /// disables the automatic, Promtect-owned in-session notice.
 fn conflicting_claude_override(args: &[String]) -> Option<&str> {
-    args.iter().map(String::as_str).find(|arg| {
-        *arg == "--settings"
-            || arg.starts_with("--settings=")
-            || *arg == "--managed-settings"
-            || arg.starts_with("--managed-settings=")
-            || [
-                "--safe-mode=",
-                "--bare=",
-                "--background=",
-                "--bg=",
-                "--remote-control=",
-                "--tmux=",
-                "--worktree=",
-            ]
-            .iter()
-            .any(|prefix| arg.starts_with(prefix))
-            || arg.starts_with("-w")
-            || CLAUDE_UNSUPPORTED_ROOT_COMMANDS.contains(arg)
-            || matches!(
-                *arg,
-                "--safe-mode"
-                    | "--bare"
-                    | "--background"
-                    | "--bg"
-                    | "--remote-control"
-                    | "--tmux"
-                    | "--worktree"
-            )
-    })
+    args.iter()
+        .map(String::as_str)
+        .find(|arg| {
+            *arg == "--settings"
+                || arg.starts_with("--settings=")
+                || *arg == "--managed-settings"
+                || arg.starts_with("--managed-settings=")
+                || [
+                    "--safe-mode=",
+                    "--bare=",
+                    "--background=",
+                    "--bg=",
+                    "--remote-control=",
+                    "--tmux=",
+                    "--worktree=",
+                ]
+                .iter()
+                .any(|prefix| arg.starts_with(prefix))
+                || arg.starts_with("-w")
+                || matches!(
+                    *arg,
+                    "--safe-mode"
+                        | "--bare"
+                        | "--background"
+                        | "--bg"
+                        | "--remote-control"
+                        | "--tmux"
+                        | "--worktree"
+                )
+        })
+        .or_else(|| first_claude_root_command(args))
+}
+
+/// Return the root command selected by Claude's pinned CLI grammar, if it is
+/// one of the commands whose independent network/lifecycle behavior guard has
+/// not reviewed. Option values must not be mistaken for commands: for example,
+/// `claude --name doctor` names an interactive session and does not run
+/// `claude doctor`.
+fn first_claude_root_command(args: &[String]) -> Option<&str> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "--agent",
+        "--agents",
+        "--append-system-prompt",
+        "--debug-file",
+        "--effort",
+        "--fallback-model",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--model",
+        "--name",
+        "-n",
+        "--output-format",
+        "--permission-mode",
+        "--plugin-dir",
+        "--plugin-url",
+        "--remote-control-session-name-prefix",
+        "--session-id",
+        "--setting-sources",
+        "--settings",
+        "--system-prompt",
+    ];
+    const OPTIONAL_VALUE_OPTIONS: &[&str] = &[
+        "--debug",
+        "-d",
+        "--from-pr",
+        "--prompt-suggestions",
+        "--remote-control",
+        "--resume",
+        "-r",
+        "--worktree",
+        "-w",
+    ];
+    const VARIADIC_VALUE_OPTIONS: &[&str] = &[
+        "--add-dir",
+        "--allowedTools",
+        "--allowed-tools",
+        "--betas",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--file",
+        "--mcp-config",
+        "--tools",
+    ];
+
+    let mut index = 0usize;
+    while let Some(arg) = args.get(index).map(String::as_str) {
+        if arg == "--" {
+            // Commander treats everything after `--` as prompt text, not as a
+            // root command. Conflicting routing flags are still rejected by the
+            // independent scan above.
+            return None;
+        }
+        if !arg.starts_with('-') {
+            return CLAUDE_UNSUPPORTED_ROOT_COMMANDS
+                .contains(&arg)
+                .then_some(arg);
+        }
+        if arg.contains('=') || (arg.starts_with("-n") && arg != "-n") {
+            index += 1;
+            continue;
+        }
+        if VALUE_OPTIONS.contains(&arg) {
+            index = index.saturating_add(2);
+            continue;
+        }
+        if OPTIONAL_VALUE_OPTIONS.contains(&arg) {
+            index += 1;
+            if args.get(index).is_some_and(|value| !value.starts_with('-')) {
+                index += 1;
+            }
+            continue;
+        }
+        if VARIADIC_VALUE_OPTIONS.contains(&arg) {
+            index += 1;
+            while args.get(index).is_some_and(|value| !value.starts_with('-')) {
+                index += 1;
+            }
+            continue;
+        }
+        index += 1;
+    }
+    None
 }
 
 fn claude_settings_json(base_url: &str, notice_url: &str) -> String {
@@ -421,6 +515,15 @@ fn claude_settings_json(base_url: &str, notice_url: &str) -> String {
         // An explicit `0` overrides hostile persisted settings without relying on
         // inherited environment state; the pinned real-CLI harness verifies this.
         env.insert((*selector).to_string(), serde_json::json!("0"));
+    }
+    for variable in CLAUDE_AUTH_OVERRIDE_VARS
+        .iter()
+        .chain(CLAUDE_RUNTIME_OVERRIDE_VARS)
+    {
+        // Inline settings outrank ordinary user/project settings. Clearing the
+        // complete reviewed set prevents a persisted API-key/runtime selector
+        // from reappearing after the stored-profile preflight.
+        env.insert((*variable).to_string(), serde_json::json!(""));
     }
     env.insert("ANTHROPIC_UNIX_SOCKET".to_string(), serde_json::json!(""));
     for proxy in [
@@ -967,40 +1070,71 @@ fn validate_claude_remote_settings(config_dir: &std::path::Path) -> Result<(), S
 
 #[cfg(target_os = "macos")]
 fn validate_claude_os_policy() -> Result<(), String> {
-    let status = std::process::Command::new("/usr/bin/defaults")
+    let output = std::process::Command::new("/usr/bin/defaults")
         .args(["read", "com.anthropic.claudecode"])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stderr(std::process::Stdio::piped())
+        .output()
         .map_err(|error| format!("cannot verify Claude macOS managed preferences ({error})"))?;
-    if status.success() {
+    if output.status.success() {
         return Err(
             "macOS-managed Claude settings are active; managed profiles are not supported by guard claude"
                 .to_string(),
         );
     }
-    Ok(())
+    let stderr = bounded_policy_probe_text(&output.stderr)?;
+    if output.status.code() == Some(1)
+        && stderr.contains("Domain com.anthropic.claudecode does not exist")
+    {
+        Ok(())
+    } else {
+        Err("cannot verify whether Claude macOS managed preferences are active".to_string())
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn validate_claude_os_policy() -> Result<(), String> {
+    let system_root = std::env::var_os("SystemRoot")
+        .ok_or_else(|| "cannot locate the Windows system directory".to_string())?;
+    let reg = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("reg.exe");
     for key in [
         r"HKLM\SOFTWARE\Policies\ClaudeCode",
         r"HKCU\SOFTWARE\Policies\ClaudeCode",
     ] {
-        let status = std::process::Command::new("reg")
+        let output = std::process::Command::new(&reg)
             .args(["query", key, "/v", "Settings"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
+            .stderr(std::process::Stdio::piped())
+            .output()
             .map_err(|error| format!("cannot verify Claude Windows policy at {key} ({error})"))?;
-        if status.success() {
+        if output.status.success() {
             return Err(format!(
                 "Windows-managed Claude settings are active at {key}; managed profiles are not supported by guard claude"
             ));
         }
+        let stderr = bounded_policy_probe_text(&output.stderr)?;
+        if output.status.code() != Some(1)
+            || !stderr.contains("unable to find the specified registry key or value")
+        {
+            return Err(format!(
+                "cannot verify whether Claude Windows policy is active at {key}"
+            ));
+        }
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn bounded_policy_probe_text(bytes: &[u8]) -> Result<String, String> {
+    const MAX_POLICY_PROBE_BYTES: usize = 4096;
+    if bytes.len() > MAX_POLICY_PROBE_BYTES {
+        return Err("Claude managed-policy probe output exceeded its safety limit".to_string());
+    }
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| "Claude managed-policy probe returned invalid text".to_string())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1208,7 +1342,7 @@ async fn claude_notice_hook(
     State(state): State<ClaudeNoticeState>,
     Path(token): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if token != state.token.as_ref() {
+    if !constant_time_token_eq(token.as_bytes(), state.token.as_bytes()) {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({})));
     }
     if state
@@ -1260,7 +1394,19 @@ async fn claude_notice_hook(
             }
             return ClaudeNoticeRead::Degraded;
         }
-        let read = take_claude_notice(&read_state);
+        let read = if let Some(audit) = read_state.audit.as_ref() {
+            let notice = audit.take_turn_notice();
+            if notice.masked == 0 {
+                ClaudeNoticeRead::Empty
+            } else {
+                ClaudeNoticeRead::Notice(ClaudeNotice {
+                    masked: notice.masked,
+                    detectors: notice.detectors,
+                })
+            }
+        } else {
+            take_claude_notice(&read_state)
+        };
         if unhealthy() {
             if let Some(audit) = read_state.audit.as_ref() {
                 audit.mark_unhealthy();
@@ -1284,6 +1430,14 @@ async fn claude_notice_hook(
         }),
     };
     (StatusCode::OK, Json(body))
+}
+
+fn constant_time_token_eq(provided: &[u8], expected: &[u8]) -> bool {
+    let mut difference = provided.len() ^ expected.len();
+    for (index, expected_byte) in expected.iter().enumerate() {
+        difference |= usize::from(provided.get(index).copied().unwrap_or(0) ^ expected_byte);
+    }
+    difference == 0
 }
 
 async fn bind_guard_dashboard(preferred_port: u16) -> Option<(tokio::net::TcpListener, u16)> {
@@ -2400,6 +2554,12 @@ mod tests {
         for selector in CLAUDE_PROVIDER_SELECTORS {
             assert_eq!(settings["env"][*selector], "0");
         }
+        for variable in super::CLAUDE_AUTH_OVERRIDE_VARS
+            .iter()
+            .chain(super::CLAUDE_RUNTIME_OVERRIDE_VARS)
+        {
+            assert_eq!(settings["env"][*variable], "");
+        }
         for proxy in [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -2489,6 +2649,25 @@ mod tests {
             let error = plan(&["claude", command]).expect_err("root command must fail closed");
             assert!(error.contains("protected routing or automatic notice"));
         }
+
+        let error = plan(&["claude", "--name", "demo", "doctor"])
+            .expect_err("a root command after an option value must fail closed");
+        assert!(error.contains("protected routing or automatic notice"));
+    }
+
+    #[test]
+    fn claude_option_values_are_not_mistaken_for_root_commands() {
+        for args in [
+            &["claude", "--name", "doctor"][..],
+            &["claude", "-n", "doctor"][..],
+            &["claude", "--name=doctor"][..],
+            &["claude", "--model", "doctor"][..],
+            &["claude", "--resume", "doctor"][..],
+        ] {
+            plan(args).unwrap_or_else(|error| {
+                panic!("Claude option/prompt value was rejected for {args:?}: {error}")
+            });
+        }
     }
 
     #[test]
@@ -2559,6 +2738,25 @@ mod tests {
             "a Stop hook must consume each notice exactly once"
         );
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn claude_notice_token_comparison_checks_complete_value() {
+        assert!(super::constant_time_token_eq(
+            b"fixed-hook-token",
+            b"fixed-hook-token"
+        ));
+        for candidate in [
+            b"fixed-hook-toke".as_slice(),
+            b"fixed-hook-token-extra".as_slice(),
+            b"xixed-hook-token".as_slice(),
+            b"fixed-hook-tokex".as_slice(),
+        ] {
+            assert!(!super::constant_time_token_eq(
+                candidate,
+                b"fixed-hook-token"
+            ));
+        }
     }
 
     #[test]
@@ -2686,6 +2884,67 @@ mod tests {
         };
         assert_eq!(notice.masked, 1);
         assert_eq!(notice.detectors, BTreeSet::from(["aws_key".to_string()]));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn claude_notice_survives_same_inode_truncate_and_regrow() {
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "promtect-claude-notice-regrow-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let historical = format!(
+            "{}\n",
+            serde_json::json!({
+                "action": "request",
+                "request_id": "historical:request",
+                "masked": 0,
+                "blocked": false,
+                "detectors": []
+            })
+        )
+        .repeat(64);
+        std::fs::write(&path, historical).expect("write historical audit");
+        let audit = Arc::new(crate::audit::Audit::to_file_scoped(
+            path.clone(),
+            "test-token".to_string(),
+        ));
+        audit.prepare().expect("prepare audit fixture");
+        let original_len = std::fs::metadata(&path).expect("audit metadata").len();
+        let state =
+            super::ClaudeNoticeState::new(&path, "hook-token".to_string(), "test-token", false)
+                .with_audit(audit.clone());
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("truncate same audit inode");
+        audit.record_request("request-new", 1, &["aws_key"], 100, 120);
+        let regrown_len = std::fs::metadata(&path).expect("regrown metadata").len();
+        assert!(regrown_len < original_len);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open audit padding");
+        file.write_all(&vec![b' '; (original_len - regrown_len) as usize])
+            .expect("regrow audit to old cursor");
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&path).expect("audit metadata").len(),
+            original_len
+        );
+
+        let (status, Json(body)) =
+            super::claude_notice_hook(State(state), Path("hook-token".to_string())).await;
+        assert_eq!(status, StatusCode::OK);
+        let message = body["systemMessage"]
+            .as_str()
+            .expect("truncate-regrow turn must still produce a notice");
+        assert!(message.contains("masked 1 sensitive value"));
+        assert!(message.contains("AWS access key (`aws_key`)"));
         std::fs::remove_file(path).ok();
     }
 

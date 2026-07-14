@@ -679,10 +679,68 @@ if grep -Fq 'proxy 127.0.0.1:' /tmp/claude-managed.stderr; then
 fi
 printf 'PASS Claude guard: managed profile rejected before bind or provider traffic\n'
 
+assert_claude_version_rejected() {
+  mode=$1
+  expected_error=$2
+  stderr_file="/tmp/claude-version-${mode}.stderr"
+  version_marker="/tmp/claude-version-${mode}.called"
+  auth_marker="/tmp/claude-version-${mode}-auth.called"
+  pid_file="/tmp/claude-version-${mode}.pid"
+  rm -f "$stderr_file" "$version_marker" "$auth_marker" "$pid_file"
+  observations_before=$(observer_count)
+  status=0
+  HOME=/tmp/claude-guard CLAUDE_CONFIG_DIR=/tmp/claude-guard \
+    PROMTECT_CLAUDE_VERSION_MODE="$mode" \
+    PROMTECT_CLAUDE_VERSION_MARKER="$version_marker" \
+    PROMTECT_CLAUDE_VERSION_PID="$pid_file" \
+    PROMTECT_CLAUDE_AUTH_STATUS_MARKER="$auth_marker" \
+    PROMTECT_AUDIT="/tmp/claude-version-${mode}-audit.jsonl" \
+    PROMTECT_DASHBOARD_PORT=18998 \
+    promtect guard claude --upstream http://mock-provider:9000/guard-claude -- --version \
+    > "/tmp/claude-version-${mode}.stdout" 2> "$stderr_file" || status=$?
+  if [ "$status" -ne 1 ]; then
+    printf 'FAIL Claude guard: %s version preflight returned %s instead of 1\n' \
+      "$mode" "$status" >&2
+    exit 1
+  fi
+  if [ ! -e "$version_marker" ] || [ -e "$auth_marker" ]; then
+    printf 'FAIL Claude guard: %s version preflight did not stop before auth status\n' \
+      "$mode" >&2
+    exit 1
+  fi
+  observations_after=$(observer_count)
+  if [ "$observations_before" -ne "$observations_after" ]; then
+    printf 'FAIL Claude guard: %s version preflight reached the provider\n' "$mode" >&2
+    exit 1
+  fi
+  if ! grep -Fq "$expected_error" "$stderr_file" \
+    || grep -Eq 'proxy 127\.0\.0\.1:|dashboard: http://127\.0\.0\.1:' "$stderr_file"; then
+    printf 'FAIL Claude guard: %s version preflight was not bounded before bind\n' \
+      "$mode" >&2
+    sed -n '1,80p' "$stderr_file" >&2
+    exit 1
+  fi
+  if [ "$(wc -c < "$stderr_file")" -gt 4096 ]; then
+    printf 'FAIL Claude guard: %s version error output was unbounded\n' "$mode" >&2
+    exit 1
+  fi
+  if [ -e "$pid_file" ]; then
+    assert_process_gone "Claude guard $mode version preflight" "$(cat "$pid_file")"
+  fi
+  printf 'PASS Claude guard: %s version preflight failed before auth, bind, or provider\n' \
+    "$mode"
+}
+
+assert_claude_version_rejected nonzero 'Claude version preflight failed'
+assert_claude_version_rejected oversized 'Claude version preflight output exceeded its safety limit'
+assert_claude_version_rejected hanging 'Claude version preflight timed out'
+
 printf '%s\n' \
   '{' \
   '  "env": {' \
   '    "ANTHROPIC_BASE_URL": "http://mock-provider:9000/claude-bypass",' \
+  '    "ANTHROPIC_API_KEY": "fixed-dummy-persisted-key",' \
+  '    "CLAUDE_CODE_SAFE_MODE": "1",' \
   '    "CLAUDE_CODE_USE_BEDROCK": "1",' \
   '    "CLAUDE_CODE_USE_VERTEX": "1",' \
   '    "CLAUDE_CODE_USE_FOUNDRY": "1",' \
@@ -1052,14 +1110,14 @@ audit_path, prefix_path, secret = sys.argv[1:]
 raw = pathlib.Path(audit_path).read_text()
 assert secret not in raw, "stream shutdown audit retained the synthetic canary"
 events = [json.loads(line) for line in raw.splitlines() if line.strip()]
-interrupted = [event for event in events if event.get("action") == "stream_interrupted"]
-assert interrupted, f"signaled in-flight response lacked stream_interrupted evidence: {events!r}"
-assert all(event.get("detector") == "upstream" for event in interrupted), interrupted
+cancelled = [event for event in events if event.get("action") == "stream_cancelled"]
+assert cancelled, f"signaled in-flight response lacked stream_cancelled evidence: {events!r}"
+assert all(event.get("detector") == "downstream" for event in cancelled), cancelled
 prefix = pathlib.Path(prefix_path).read_bytes()
 assert b"promtect:" not in prefix and secret.encode() not in prefix, prefix
 PY
 assert_ports_reusable "Claude guard split-sentinel shutdown" 18992 18993
-printf 'PASS Claude guard: signaled split-sentinel response recorded value-free interruption evidence\n'
+printf 'PASS Claude guard: signaled split-sentinel response recorded value-free cancellation evidence\n'
 
 rm -f /tmp/claude-normal-exit.ready /tmp/claude-normal-exit.helper.pid \
   /tmp/claude-normal-exit.settings /tmp/claude-normal-exit.stdout \

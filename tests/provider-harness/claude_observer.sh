@@ -42,7 +42,36 @@ fi
 # The named guard pins the installed Claude version before auth or listener
 # setup. Fixture modes apply only to the later guard-owned --settings launch.
 if [ "${1:-}" = "--version" ] && [ "$#" -eq 1 ]; then
-  exec /opt/provider-clis/node_modules/.bin/claude "$@"
+  if [ -n "${PROMTECT_CLAUDE_VERSION_MARKER:-}" ]; then
+    : > "$PROMTECT_CLAUDE_VERSION_MARKER"
+  fi
+  case "${PROMTECT_CLAUDE_VERSION_MODE:-valid}" in
+    valid)
+      exec /opt/provider-clis/node_modules/.bin/claude "$@"
+      ;;
+    nonzero)
+      printf '%s\n' 'synthetic version failure' >&2
+      exit 42
+      ;;
+    oversized)
+      python3 - <<'PY'
+import sys
+
+sys.stdout.write("x" * 257)
+PY
+      exit 0
+      ;;
+    hanging)
+      if [ -n "${PROMTECT_CLAUDE_VERSION_PID:-}" ]; then
+        printf '%s\n' "$$" > "$PROMTECT_CLAUDE_VERSION_PID"
+      fi
+      exec sleep 300
+      ;;
+    *)
+      printf 'unknown synthetic version mode\n' >&2
+      exit 2
+      ;;
+  esac
 fi
 
 if [ "${PROMTECT_CLAUDE_STREAM_SIGNAL:-}" = "1" ]; then

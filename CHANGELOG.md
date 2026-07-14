@@ -58,8 +58,8 @@ and auto-generated notes also live on the
   and drain proxy/dashboard connections; cancelled response streams emit a
   value-free `stream_interrupted` audit event.
 - Concurrent guards serialize audit tail repair and complete JSONL appends through
-  an owner-only pathname lock. Same-inode copy-truncation now produces a degraded
-  Claude notice instead of a false empty result.
+  an owner-only pathname lock. Claude notices use a process-local outcome ledger,
+  so same-inode copy-truncation cannot hide a protected turn.
 - Named Claude guard is pinned to the reviewed Claude Code 2.1.207 contract. It
   rejects hidden managed settings, cloud/root commands, safe mode, alternate
   managed/remote settings sources, and persisted proxy routes before a prompt.

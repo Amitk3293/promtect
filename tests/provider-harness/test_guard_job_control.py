@@ -83,11 +83,37 @@ def proc_state(pid: int) -> str | None:
     return stat[close + 2 :].split()[0]
 
 
+def process_tree_groups(pid: int) -> set[int]:
+    """Snapshot every process group below pid before teardown starts."""
+    pending = [pid]
+    seen: set[int] = set()
+    groups: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        try:
+            stat = open(f"/proc/{current}/stat", encoding="utf-8").read()
+            close = stat.rfind(")")
+            groups.add(int(stat[close + 2 :].split()[2]))
+            children = open(
+                f"/proc/{current}/task/{current}/children", encoding="utf-8"
+            ).read()
+            pending.extend(int(child) for child in children.split())
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+    return groups
+
+
 def kill_session(pid: int) -> None:
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+    groups = process_tree_groups(pid)
+    groups.add(pid)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:
@@ -142,8 +168,13 @@ def test_background_refusal() -> None:
         if guard_pid == 0:
             os.setpgid(0, 0)
             os.execvp("promtect", guard_argv(background_fixture))
-        _, status = os.waitpid(guard_pid, 0)
-        foreground_preserved = os.tcgetpgrp(0) == controller_pgrp
+        foreground_preserved = True
+        while True:
+            waited, status = os.waitpid(guard_pid, os.WNOHANG)
+            foreground_preserved &= os.tcgetpgrp(0) == controller_pgrp
+            if waited == guard_pid:
+                break
+            time.sleep(0.005)
         print(f"BACKGROUND_STATUS={os.waitstatus_to_exitcode(status)}", flush=True)
         print(f"BACKGROUND_FOREGROUND_PRESERVED={foreground_preserved}", flush=True)
         os._exit(0)
@@ -157,6 +188,8 @@ def test_background_refusal() -> None:
         assert "BACKGROUND_STATUS=1" in text, text
         assert "BACKGROUND_FOREGROUND_PRESERVED=True" in text, text
         assert "started as a background job" in text, text
+        assert "proxy 127.0.0.1:" not in text, text
+        assert "dashboard: http://127.0.0.1:" not in text, text
         assert not os.path.exists(marker), "background guard spawned the tool before refusal"
     except BaseException:
         kill_session(pid)

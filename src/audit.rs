@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: LicenseRef-SUL-1.0
 // Copyright (c) 2026 AK DevOps Solutions SL
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Read, Seek, Write};
 use std::path::PathBuf;
@@ -29,6 +29,24 @@ pub(crate) struct AuditSessionStats {
     pub(crate) output_secrets: u64,
 }
 
+#[derive(Debug, Default)]
+struct AuditTurnRequest {
+    masked: u64,
+    detectors: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct AuditTurnLedger {
+    requests: BTreeMap<String, AuditTurnRequest>,
+    unsuccessful: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AuditTurnNotice {
+    pub(crate) masked: u64,
+    pub(crate) detectors: BTreeSet<String>,
+}
+
 /// Append-only JSONL audit log. Records mask/unmask events — never secret values.
 ///
 /// The log is FAIL-OPEN by contract: every open or write failure is swallowed so
@@ -45,6 +63,10 @@ pub struct Audit {
     /// these instead of diffing a shared JSONL file, so concurrent guards cannot
     /// inflate one another's session totals.
     session_stats: Mutex<AuditSessionStats>,
+    /// Process-local request outcomes waiting for the next Claude Stop hook.
+    /// This is authoritative for the in-session notice: a mutable JSONL cursor
+    /// cannot distinguish same-inode truncate-and-regrow from no new records.
+    turn_ledger: Mutex<AuditTurnLedger>,
     /// Set once, the first time a write fails, to gate a one-shot stderr warning.
     warned: AtomicBool,
 }
@@ -58,6 +80,7 @@ impl Audit {
             })),
             request_scope: None,
             session_stats: Mutex::new(AuditSessionStats::default()),
+            turn_ledger: Mutex::new(AuditTurnLedger::default()),
             warned: AtomicBool::new(false),
         }
     }
@@ -70,6 +93,7 @@ impl Audit {
             })),
             request_scope: Some(request_scope.into()),
             session_stats: Mutex::new(AuditSessionStats::default()),
+            turn_ledger: Mutex::new(AuditTurnLedger::default()),
             warned: AtomicBool::new(false),
         }
     }
@@ -80,6 +104,7 @@ impl Audit {
             sink: Mutex::new(None),
             request_scope: None,
             session_stats: Mutex::new(AuditSessionStats::default()),
+            turn_ledger: Mutex::new(AuditTurnLedger::default()),
             warned: AtomicBool::new(false),
         }
     }
@@ -111,6 +136,28 @@ impl Audit {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    /// Atomically drain the value-free successful request outcomes recorded
+    /// since the preceding Stop hook. Requests later marked failed, blocked, or
+    /// interrupted are excluded even if their request summary was written first.
+    pub(crate) fn take_turn_notice(&self) -> AuditTurnNotice {
+        let ledger = {
+            let mut ledger = self
+                .turn_ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *ledger)
+        };
+        let mut notice = AuditTurnNotice::default();
+        for (request_id, request) in ledger.requests {
+            if ledger.unsuccessful.contains(&request_id) {
+                continue;
+            }
+            notice.masked = notice.masked.saturating_add(request.masked);
+            notice.detectors.extend(request.detectors);
+        }
+        notice
     }
 
     fn scoped_request_id(&self, request_id: &str) -> String {
@@ -207,7 +254,23 @@ impl Audit {
         }
         // Audit is fail-open. A paused/crashed peer must never stall request
         // masking or guard startup while it holds this advisory lock.
-        lock.try_lock()?;
+        // Serialize ordinary short appends across independent Audit instances,
+        // while preserving fail-open behavior if a paused peer holds the lock.
+        // A normal JSONL append completes well inside this bounded window; a
+        // genuinely stuck owner cannot stall masking indefinitely.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        loop {
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(Error::from(ErrorKind::WouldBlock));
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error),
+            }
+        }
         if !same_audit_file(&lock, &lock_path)? {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -415,7 +478,7 @@ impl Audit {
     /// Appends one JSONL line of the form:
     /// ```json
     /// {"ts_ms":N,"action":"request","request_id":"...","masked":N,
-    ///  "detectors":["aws_key",...],"bytes_in":N,"bytes_out":N}
+    ///  "detectors":["aws_key",...],"bytes_in":N,"bytes_out":N,"blocked":false}
     /// ```
     pub fn record_request(
         &self,
@@ -446,6 +509,21 @@ impl Audit {
         bytes_out: usize,
         blocked: bool,
     ) {
+        {
+            let mut ledger = self
+                .turn_ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if blocked {
+                ledger.unsuccessful.insert(request_id.to_string());
+            } else if masked > 0 {
+                let request = ledger.requests.entry(request_id.to_string()).or_default();
+                request.masked = request.masked.saturating_add(masked as u64);
+                request
+                    .detectors
+                    .extend(detectors.iter().map(|detector| (*detector).to_string()));
+            }
+        }
         let request_id = self.scoped_request_id(request_id);
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -466,6 +544,16 @@ impl Audit {
 
     /// Record one event. `placeholder` is a sentinel id, NOT a secret.
     pub fn record(&self, action: &str, kind: &str, placeholder: &str, request_id: &str) {
+        if matches!(
+            action,
+            "request_blocked" | "request_rejected" | "request_failed" | "stream_interrupted"
+        ) {
+            self.turn_ledger
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unsuccessful
+                .insert(request_id.to_string());
+        }
         {
             let mut stats = self
                 .session_stats
@@ -502,7 +590,7 @@ impl Audit {
 #[cfg(unix)]
 fn configure_no_follow(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(unix_no_follow_flag());
+    options.custom_flags(nix::libc::O_NOFOLLOW);
 }
 
 #[cfg(windows)]
@@ -570,32 +658,6 @@ fn same_audit_file(file: &std::fs::File, path: &std::path::Path) -> std::io::Res
 fn same_audit_file(_file: &std::fs::File, path: &std::path::Path) -> std::io::Result<bool> {
     Audit::open_read(path).map(|_| true)
 }
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-const fn unix_no_follow_flag() -> i32 {
-    0o400_000
-}
-
-#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-const fn unix_no_follow_flag() -> i32 {
-    0o100_000
-}
-
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const fn unix_no_follow_flag() -> i32 {
-    0x100
-}
-
-#[cfg(all(
-    unix,
-    not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "linux", target_arch = "aarch64"),
-        target_os = "macos",
-        target_os = "ios"
-    ))
-))]
-compile_error!("audit log O_NOFOLLOW is not defined for this Unix target");
 
 #[cfg(unix)]
 fn effective_user_id() -> std::io::Result<u32> {
@@ -907,7 +969,7 @@ mod tests {
             .collect();
         remove_audit_fixture(&path);
         assert!(!records.is_empty());
-        assert!(records.len() <= WRITERS * RECORDS_PER_WRITER);
+        assert_eq!(records.len(), WRITERS * RECORDS_PER_WRITER);
     }
 
     #[test]

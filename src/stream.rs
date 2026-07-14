@@ -377,14 +377,10 @@ struct ObservedStream<S> {
 }
 
 impl<S> ObservedStream<S> {
-    fn record_interruption(&self) {
+    fn record_outcome(&self, action: &str, detector: &str, placeholder: &str) {
         if !self.interrupted.swap(true, Ordering::AcqRel) {
-            self.audit.record(
-                "stream_interrupted",
-                "upstream",
-                "«stream-interrupted»",
-                &self.request_id,
-            );
+            self.audit
+                .record(action, detector, placeholder, &self.request_id);
         }
     }
 }
@@ -400,7 +396,7 @@ where
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
             Poll::Ready(Some(Err(error))) => {
-                this.record_interruption();
+                this.record_outcome("stream_interrupted", "upstream", "«stream-interrupted»");
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
@@ -415,7 +411,11 @@ where
 impl<S> Drop for ObservedStream<S> {
     fn drop(&mut self) {
         if !self.completed {
-            self.record_interruption();
+            // Dropping an otherwise healthy upstream stream means the
+            // downstream client stopped consuming it. Record that separately:
+            // it is operationally useful, but it does not invalidate the fact
+            // that Promtect masked the outbound request.
+            self.record_outcome("stream_cancelled", "downstream", "«stream-cancelled»");
         }
     }
 }
@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn downstream_cancellation_is_audited_as_interrupted() {
+    async fn downstream_cancellation_is_distinct_from_upstream_interruption() {
         let path = std::env::temp_dir().join(format!(
             "promtect-stream-cancelled-{}.jsonl",
             uuid::Uuid::new_v4()
@@ -860,7 +860,9 @@ mod tests {
         let mut lock_name = path.into_os_string();
         lock_name.push(".lock");
         std::fs::remove_file(std::path::PathBuf::from(lock_name)).ok();
-        assert!(log.contains("\"action\":\"stream_interrupted\""));
+        assert!(log.contains("\"action\":\"stream_cancelled\""));
+        assert!(log.contains("\"detector\":\"downstream\""));
+        assert!(!log.contains("\"action\":\"stream_interrupted\""));
         assert!(log.contains("\"request_id\":\"request-cancelled\""));
     }
 }
