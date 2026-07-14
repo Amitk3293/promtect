@@ -205,7 +205,9 @@ impl Audit {
                 lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             }
         }
-        lock.lock()?;
+        // Audit is fail-open. A paused/crashed peer must never stall request
+        // masking or guard startup while it holds this advisory lock.
+        lock.try_lock()?;
         if !same_audit_file(&lock, &lock_path)? {
             return Err(Error::new(
                 ErrorKind::NotFound,
@@ -832,10 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn independent_audits_wait_for_the_same_path_lock() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
+    fn independent_audit_contention_fails_open_without_waiting() {
         let path = std::env::temp_dir().join(format!(
             "promtect-lock-contention-{}.jsonl",
             uuid::Uuid::new_v4()
@@ -843,29 +842,24 @@ mod tests {
         std::fs::write(&path, b"{\"truncated\"").expect("seed incomplete audit tail");
         let held_lock = Audit::acquire_path_lock(&path).expect("hold audit pathname lock");
         let second = Audit::to_file(path.clone());
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            started_tx.send(()).expect("announce blocked writer");
-            second.record("mask", "aws_key", "opaque", "second-process");
-            done_tx.send(()).expect("announce completed writer");
-        });
-
-        started_rx.recv().expect("writer started");
+        let started = std::time::Instant::now();
+        second.record("mask", "aws_key", "opaque", "contended-process");
         assert!(
-            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "an independent Audit must not append while another process-like lock is held"
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "audit contention must remain fail-open"
         );
+        assert!(!second.is_healthy());
+        assert_eq!(second.session_stats().masked, 1);
         drop(held_lock);
-        done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("writer continues after lock release");
-        writer.join().expect("join independent audit writer");
+
+        let recovery = Audit::to_file(path.clone());
+        recovery.record("mask", "aws_key", "opaque", "recovery-process");
 
         let contents = std::fs::read_to_string(&path).expect("read serialized audit record");
         remove_audit_fixture(&path);
         assert_eq!(contents.lines().count(), 1);
-        assert!(contents.contains("second-process"));
+        assert!(contents.contains("recovery-process"));
+        assert!(!contents.contains("contended-process"));
         assert!(
             contents
                 .lines()
@@ -875,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_independent_audits_keep_all_jsonl_records_intact() {
+    fn concurrent_independent_audits_never_write_partial_jsonl_records() {
         const WRITERS: usize = 8;
         const RECORDS_PER_WRITER: usize = 64;
 
@@ -912,7 +906,8 @@ mod tests {
             .map(|line| serde_json::from_str(line).expect("every concurrent line is valid JSON"))
             .collect();
         remove_audit_fixture(&path);
-        assert_eq!(records.len(), WRITERS * RECORDS_PER_WRITER);
+        assert!(!records.is_empty());
+        assert!(records.len() <= WRITERS * RECORDS_PER_WRITER);
     }
 
     #[test]

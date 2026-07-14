@@ -51,7 +51,7 @@ WORKDIR /harness
 COPY --from=promtect-builder /build/target/release/promtect /usr/local/bin/promtect
 COPY tests/provider-harness/codex_observer.sh /usr/local/bin/codex
 COPY tests/provider-harness/claude_observer.sh /usr/local/bin/claude
-COPY tests/provider-harness/mock_provider.py tests/provider-harness/run_protocols.py tests/provider-harness/verify_cli_observations.py tests/provider-harness/run_clis.sh ./
+COPY tests/provider-harness/mock_provider.py tests/provider-harness/run_protocols.py tests/provider-harness/verify_cli_observations.py tests/provider-harness/test_guard_job_control.py tests/provider-harness/run_clis.sh ./
 RUN chmod 0755 /usr/local/bin/codex /usr/local/bin/claude
 
 USER harness

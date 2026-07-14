@@ -62,6 +62,9 @@ promtect selftest        # → promtect selftest: PASS — no leak
   commands (`ultrareview`, `gateway`, `agents`, update/install, and similar).
   Those commands have independent network or lifecycle behavior that Promtect
   has not verified, so guard rejects them before binding or authentication.
+- On Unix, guarded interactive sessions disable `Ctrl-Z` suspension so Promtect
+  can retain terminal ownership and reliably clean up Claude plus its helper
+  processes. Exit Claude normally or use `Ctrl-C` to stop the guarded session.
 - The unmanaged-profile check is a launch-time preflight, not an operating-system
   sandbox. Promtect cannot prevent a newly installed higher-precedence policy from
   changing a running Claude process; stop Claude and restart the guard before continuing.

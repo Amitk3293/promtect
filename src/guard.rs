@@ -78,6 +78,7 @@ const CLAUDE_AUTH_OVERRIDE_VARS: &[&str] = &[
 ];
 const CLAUDE_RUNTIME_OVERRIDE_VARS: &[&str] = &[
     "CLAUDE_CODE_SAFE_MODE",
+    "CLAUDE_CODE_SIMPLE",
     "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
     "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
     "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
@@ -386,6 +387,18 @@ fn conflicting_claude_override(args: &[String]) -> Option<&str> {
             || arg.starts_with("--settings=")
             || *arg == "--managed-settings"
             || arg.starts_with("--managed-settings=")
+            || [
+                "--safe-mode=",
+                "--bare=",
+                "--background=",
+                "--bg=",
+                "--remote-control=",
+                "--tmux=",
+                "--worktree=",
+            ]
+            .iter()
+            .any(|prefix| arg.starts_with(prefix))
+            || arg.starts_with("-w")
             || CLAUDE_UNSUPPORTED_ROOT_COMMANDS.contains(arg)
             || matches!(
                 *arg,
@@ -1676,8 +1689,59 @@ fn set_foreground_process_group(pgrp: nix::unistd::Pid) -> nix::Result<()> {
 }
 
 #[cfg(unix)]
+fn set_guard_termios(termios: &nix::sys::termios::Termios) -> nix::Result<()> {
+    use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+
+    // tcsetattr can also raise SIGTTOU when the guard is temporarily behind
+    // the child process group. Block it only for this call, just like tcsetpgrp.
+    let mut blocked = SigSet::empty();
+    blocked.add(Signal::SIGTTOU);
+    let mut previous = SigSet::empty();
+    pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&blocked), Some(&mut previous))?;
+    let changed = nix::sys::termios::tcsetattr(
+        std::io::stdin(),
+        nix::sys::termios::SetArg::TCSANOW,
+        termios,
+    );
+    let restored = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+    changed.and(restored)
+}
+
+#[cfg(unix)]
 struct GuardTerminalLease {
     original_pgrp: nix::unistd::Pid,
+    original_termios: nix::sys::termios::Termios,
+}
+
+#[cfg(unix)]
+fn require_foreground_guard(
+    foreground_pgrp: nix::unistd::Pid,
+    guard_pgrp: nix::unistd::Pid,
+) -> Result<(), String> {
+    if foreground_pgrp == guard_pgrp {
+        Ok(())
+    } else {
+        Err(
+            "guard was started as a background job and cannot take terminal ownership; run it in the foreground"
+                .to_string(),
+        )
+    }
+}
+
+#[cfg(unix)]
+fn preflight_guard_terminal() -> Result<(), String> {
+    use nix::errno::Errno;
+
+    match nix::unistd::tcgetpgrp(std::io::stdin()) {
+        Ok(foreground_pgrp) => require_foreground_guard(foreground_pgrp, nix::unistd::getpgrp()),
+        Err(Errno::ENOTTY) => Ok(()),
+        Err(error) => Err(format!("cannot inspect terminal job control ({error})")),
+    }
+}
+
+#[cfg(not(unix))]
+fn preflight_guard_terminal() -> Result<(), String> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1692,15 +1756,30 @@ impl GuardTerminalLease {
             Err(Errno::ENOTTY) => return Ok(None),
             Err(error) => return Err(format!("cannot inspect terminal job control ({error})")),
         };
+        require_foreground_guard(original_pgrp, nix::unistd::getpgrp())?;
         let child_pgrp = Pid::from_raw(i32::try_from(child_pid).map_err(|_| {
             "guarded tool process identifier exceeded the platform limit".to_string()
         })?);
-        set_foreground_process_group(child_pgrp)
-            .map_err(|error| format!("cannot give the terminal to the guarded tool ({error})"))?;
+        let original_termios = nix::sys::termios::tcgetattr(std::io::stdin())
+            .map_err(|error| format!("cannot inspect terminal controls ({error})"))?;
+        let mut guarded_termios = original_termios.clone();
+        guarded_termios.control_chars[nix::sys::termios::SpecialCharacterIndices::VSUSP as usize] =
+            nix::libc::_POSIX_VDISABLE;
+        set_guard_termios(&guarded_termios)
+            .map_err(|error| format!("cannot disable terminal suspension ({error})"))?;
+        if let Err(error) = set_foreground_process_group(child_pgrp) {
+            let _ = set_guard_termios(&original_termios);
+            return Err(format!(
+                "cannot give the terminal to the guarded tool ({error})"
+            ));
+        }
         // The child can attempt a terminal read in the short spawn-to-transfer
         // window and receive SIGTTIN. Resume the whole owned group after transfer.
         let _ = killpg(child_pgrp, Signal::SIGCONT);
-        Ok(Some(Self { original_pgrp }))
+        Ok(Some(Self {
+            original_pgrp,
+            original_termios,
+        }))
     }
 }
 
@@ -1711,6 +1790,9 @@ impl Drop for GuardTerminalLease {
             eprintln!(
                 "promtect guard: warning: could not restore terminal foreground ownership ({error})"
             );
+        }
+        if let Err(error) = set_guard_termios(&self.original_termios) {
+            eprintln!("promtect guard: warning: could not restore terminal controls ({error})");
         }
     }
 }
@@ -1808,6 +1890,11 @@ pub async fn guard(plan: GuardPlan) -> i32 {
         )
     {
         return run_codex_dry_run(&plan).await;
+    }
+
+    if let Err(error) = preflight_guard_terminal() {
+        eprintln!("promtect guard: refusing to continue: {error}");
+        return 1;
     }
 
     if plan.claude_fail_closed {
@@ -2260,6 +2347,17 @@ mod tests {
         plan_guard(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn background_guard_cannot_claim_foreground_terminal() {
+        use nix::unistd::Pid;
+
+        let error = require_foreground_guard(Pid::from_raw(1200), Pid::from_raw(1300))
+            .expect_err("different process groups must be rejected");
+        assert!(error.contains("background job"));
+        assert!(require_foreground_guard(Pid::from_raw(1200), Pid::from_raw(1200)).is_ok());
+    }
+
     #[test]
     fn stale_stub_detection() {
         // ephemeral ports → stale
@@ -2397,12 +2495,18 @@ mod tests {
     fn claude_rejects_modes_that_disable_the_automatic_notice() {
         for arg in [
             "--safe-mode",
+            "--safe-mode=true",
             "--bare",
             "--background",
             "--bg",
             "--remote-control",
+            "--remote-control=demo",
             "--tmux",
+            "--tmux=classic",
             "--worktree",
+            "--worktree=demo",
+            "-w",
+            "-wdemo",
         ] {
             let error = plan(&["claude", arg]).unwrap_err();
             assert!(

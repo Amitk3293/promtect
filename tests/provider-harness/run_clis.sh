@@ -442,6 +442,7 @@ assert_version Codex "$CODEX_VERSION" codex --version
 assert_version "Claude Code" "$CLAUDE_VERSION" claude --version
 assert_version Ollama "$OLLAMA_VERSION" ollama --version
 assert_version Aider "$AIDER_VERSION" aider --version
+python3 /harness/test_guard_job_control.py
 
 dry_run_capture=/tmp/codex-dry-run-env
 for dry_run in "root help" "exec help" "exec version" "review help"; do
@@ -801,6 +802,7 @@ assert_claude_runtime_override_rejected() {
 
 for runtime_var in \
   CLAUDE_CODE_SAFE_MODE \
+  CLAUDE_CODE_SIMPLE \
   CLAUDE_CODE_MANAGED_SETTINGS_PATH \
   CLAUDE_CODE_REMOTE_SETTINGS_PATH \
   CLAUDE_CODE_MOCK_REMOTE_SETTINGS \
@@ -849,6 +851,10 @@ assert_claude_arg_rejected() {
 assert_claude_arg_rejected managed-settings-separated --managed-settings '{}'
 assert_claude_arg_rejected managed-settings-attached '--managed-settings={}'
 assert_claude_arg_rejected ultrareview ultrareview
+assert_claude_arg_rejected tmux-attached '--tmux=classic'
+assert_claude_arg_rejected worktree-attached '--worktree=demo'
+assert_claude_arg_rejected worktree-short -w demo
+assert_claude_arg_rejected remote-control-attached '--remote-control=demo'
 
 assert_claude_auth_status_rejected() {
   mode=$1
