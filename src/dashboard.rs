@@ -157,7 +157,7 @@ async fn aggregate_off_thread(
         return Err(AggregationError::Busy);
     };
 
-    run_aggregation_task(permit, move || metrics::aggregate(&audit_path)).await
+    run_aggregation_task(permit, move || metrics::try_aggregate(&audit_path)).await
 }
 
 async fn run_aggregation_task<F>(
@@ -165,7 +165,7 @@ async fn run_aggregation_task<F>(
     task: F,
 ) -> Result<metrics::Metrics, AggregationError>
 where
-    F: FnOnce() -> metrics::Metrics + Send + 'static,
+    F: FnOnce() -> std::io::Result<metrics::Metrics> + Send + 'static,
 {
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -173,7 +173,8 @@ where
     })
     .await
     {
-        Ok(metrics) => Ok(metrics),
+        Ok(Ok(metrics)) => Ok(metrics),
+        Ok(Err(_)) => Err(AggregationError::Failed),
         // A runtime shutdown or panic must not expose file contents or crash the
         // dashboard. The handler reports explicit unavailability instead of a
         // false all-zero snapshot.
@@ -204,6 +205,32 @@ mod tests {
         let result = run_aggregation_task(permit, || panic!("synthetic task failure")).await;
 
         assert!(matches!(result, Err(AggregationError::Failed)));
+    }
+
+    #[tokio::test]
+    async fn real_audit_read_failure_is_explicit_unavailability() {
+        let audit_directory = std::env::temp_dir().join(format!(
+            "promtect-dashboard-unreadable-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&audit_directory).unwrap();
+        let state = DashState {
+            ctx: DashCtx {
+                audit_path: Arc::new(audit_directory.clone()),
+                restore_enabled: true,
+            },
+            aggregation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+        };
+
+        let response = api_metrics(State(state)).await;
+        std::fs::remove_dir(&audit_directory).ok();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("metrics temporarily unavailable"));
+        assert!(!body.contains("requests_clean"));
+        assert!(!body.contains("requests_total"));
     }
 
     #[tokio::test]

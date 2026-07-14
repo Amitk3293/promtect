@@ -122,7 +122,7 @@ fn is_valid_detector_name(name: &str) -> bool {
 /// Visit newline-delimited records without ever retaining more than `limit`
 /// bytes for one record. Oversized records are discarded through their newline;
 /// later valid records remain readable.
-fn for_each_bounded_record<R, F>(reader: &mut R, limit: usize, mut visit: F)
+fn for_each_bounded_record<R, F>(reader: &mut R, limit: usize, mut visit: F) -> std::io::Result<()>
 where
     R: BufRead,
     F: FnMut(&[u8]),
@@ -131,17 +131,13 @@ where
     let mut oversized = false;
 
     loop {
-        let available = match reader.fill_buf() {
-            Ok(bytes) => bytes,
-            // Best-effort aggregation: preserve records already visited.
-            Err(_) => return,
-        };
+        let available = reader.fill_buf()?;
 
         if available.is_empty() {
             if !oversized && !record.is_empty() {
                 visit(&record);
             }
-            return;
+            return Ok(());
         }
 
         if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
@@ -196,13 +192,14 @@ fn retain_recent(recent: &mut Vec<RecentRequest>, candidate: RecentRequest) {
 /// Aggregate value-free metrics from an audit JSONL file.
 ///
 /// # Behaviour
-/// - Missing or empty file returns `Metrics::default()` (all zeros / empty).
+/// - A missing or empty file returns `Ok(Metrics::default())` (all zeros / empty).
 /// - The file is read line-by-line through a buffered reader; it is never loaded
 ///   into memory in one allocation, so a pathologically large audit log cannot
 ///   OOM the dashboard.
-/// - Malformed lines (bad JSON, or an I/O error mid-stream) are skipped
-///   (best-effort), so a partially-written log still produces useful counts for
-///   the lines that are valid.
+/// - Malformed JSON records are skipped so a partially-written final record does
+///   not make the dashboard unavailable. File open, metadata, read, and seek
+///   failures are returned by [`try_aggregate`] instead of being misreported as
+///   a clean or partial snapshot.
 /// - Detector names that are not `[a-z0-9_]+` are dropped (see
 ///   [`is_valid_detector_name`]) so an untrusted name cannot inject a label line.
 /// - Known lifecycle actions contribute to separate mask, block, restore,
@@ -213,16 +210,17 @@ fn retain_recent(recent: &mut Vec<RecentRequest>, candidate: RecentRequest) {
 /// # Safety
 /// This function never surfaces secret values. The audit log is designed to be
 /// value-free, and this aggregator only reads the numeric/string metadata fields.
-pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
+pub fn try_aggregate(audit_path: &std::path::Path) -> std::io::Result<Metrics> {
     let mut file = match std::fs::File::open(audit_path) {
         Ok(f) => f,
-        // Missing or unreadable file is normal before the first request.
-        Err(_) => return Metrics::default(),
+        // A missing file is normal before the first request. Every other open
+        // failure is observable so callers cannot render a false all-clear.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Metrics::default());
+        }
+        Err(error) => return Err(error),
     };
-    let snapshot_len = match file.metadata() {
-        Ok(metadata) => metadata.len(),
-        Err(_) => return Metrics::default(),
-    };
+    let snapshot_len = file.metadata()?.len();
 
     let mut m = Metrics::default();
     {
@@ -332,7 +330,13 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
                 }
                 _ => {}
             }
-        });
+        })?;
+        if first_pass.get_ref().limit() != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "audit snapshot truncated during first pass",
+            ));
+        }
     }
 
     sort_recent_newest_first(&mut m.recent);
@@ -343,40 +347,45 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
         .map(|request| (request.request_id.clone(), RequestEvents::default()))
         .collect();
 
-    if file.seek(std::io::SeekFrom::Start(0)).is_ok() {
-        let mut second_pass = std::io::BufReader::new(file.take(snapshot_len));
-        for_each_bounded_record(&mut second_pass, MAX_RECORD_BYTES, |record| {
-            let Ok(val) = serde_json::from_slice::<serde_json::Value>(record) else {
-                return;
-            };
-            let Some(action) = val.get("action").and_then(|value| value.as_str()) else {
-                return;
-            };
-            let Some(request_id) = val.get("request_id").and_then(|value| value.as_str()) else {
-                return;
-            };
-            let Some(events) = request_events.get_mut(request_id) else {
-                return;
-            };
+    file.seek(std::io::SeekFrom::Start(0))?;
+    let mut second_pass = std::io::BufReader::new(file.take(snapshot_len));
+    for_each_bounded_record(&mut second_pass, MAX_RECORD_BYTES, |record| {
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(record) else {
+            return;
+        };
+        let Some(action) = val.get("action").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some(request_id) = val.get("request_id").and_then(|value| value.as_str()) else {
+            return;
+        };
+        let Some(events) = request_events.get_mut(request_id) else {
+            return;
+        };
 
-            match action {
-                "output_secret" => {
-                    events.output_secrets = events.output_secrets.saturating_add(1);
-                }
-                "unmask" => {
-                    events.restored = events.restored.saturating_add(1);
-                }
-                "request_blocked" | "request_rejected" => events.blocked = true,
-                "stream_interrupted" => {
-                    events.failures = events.failures.saturating_add(1);
-                    events.interrupted = true;
-                }
-                "request_failed" | "unmask_miss" | "mask_skip" => {
-                    events.failures = events.failures.saturating_add(1);
-                }
-                _ => {}
+        match action {
+            "output_secret" => {
+                events.output_secrets = events.output_secrets.saturating_add(1);
             }
-        });
+            "unmask" => {
+                events.restored = events.restored.saturating_add(1);
+            }
+            "request_blocked" | "request_rejected" => events.blocked = true,
+            "stream_interrupted" => {
+                events.failures = events.failures.saturating_add(1);
+                events.interrupted = true;
+            }
+            "request_failed" | "unmask_miss" | "mask_skip" => {
+                events.failures = events.failures.saturating_add(1);
+            }
+            _ => {}
+        }
+    })?;
+    if second_pass.get_ref().limit() != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "audit snapshot truncated during second pass",
+        ));
     }
 
     for recent in &mut m.recent {
@@ -389,7 +398,14 @@ pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
         }
     }
 
-    m
+    Ok(m)
+}
+
+/// Best-effort compatibility API for callers that historically treated audit
+/// I/O as non-fatal. Dashboard HTTP handlers use [`try_aggregate`] so an
+/// unreadable or unstable audit file becomes explicit service unavailability.
+pub fn aggregate(audit_path: &std::path::Path) -> Metrics {
+    try_aggregate(audit_path).unwrap_or_default()
 }
 
 /// Sort recent-request summaries newest-first by `ts_ms` (descending).
@@ -527,6 +543,10 @@ fn push_counter(out: &mut String, name: &str, help: &str, value: u64, label: Opt
 mod tests {
     use super::*;
     use std::io::Write;
+
+    fn aggregate(path: &std::path::Path) -> Metrics {
+        super::try_aggregate(path).expect("aggregate test audit")
+    }
 
     /// Aggregate the fixture and return the resulting Metrics.
     fn fixture_metrics() -> (Metrics, std::path::PathBuf) {
@@ -758,6 +778,23 @@ mod tests {
         assert_eq!(m.requests_total, 0);
         assert_eq!(m.secrets_masked_total, 0);
         assert!(m.recent.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn aggregate_reports_existing_non_file_path_as_error() {
+        let path = std::env::temp_dir().join(format!(
+            "promtect-metrics-scan-error-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let listener =
+            std::os::unix::net::UnixListener::bind(&path).expect("create non-file audit path");
+
+        let result = super::try_aggregate(&path);
+
+        drop(listener);
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err());
     }
 
     #[test]
