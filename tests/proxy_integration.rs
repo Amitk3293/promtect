@@ -251,7 +251,7 @@ async fn active_extra_detector_blocks_an_unmaskable_result_before_upstream() {
     assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
     assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(body.contains("custom_rulebook"));
+    assert_eq!(body, "promtect: request detector failed closed");
     assert!(!body.contains("CUSTOMSECRET"));
 }
 

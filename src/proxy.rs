@@ -35,6 +35,7 @@ const SCAN_CAPACITY_MESSAGE: &str = "promtect: request scanning is at capacity; 
 const SCAN_CAPACITY_AUDIT_MARKER: &str = "«scan-capacity-exhausted»";
 const REQUEST_BODY_TIMEOUT_MESSAGE: &str = "promtect: request body timed out";
 const REQUEST_BODY_TIMEOUT_AUDIT_MARKER: &str = "«request-body-timeout»";
+const SCAN_TASK_FAILURE_LOG_MESSAGE: &str = "promtect: request scanning task failed";
 const REQUEST_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const MAX_CONCURRENT_SCANS: usize = 4;
 
@@ -268,6 +269,32 @@ fn residual_block_response(
     )
 }
 
+fn preflight_block_response(ctx: &Ctx, request_id: &str, failure_kinds: &[&str]) -> Response {
+    let kind = failure_kinds
+        .first()
+        .copied()
+        .unwrap_or("detector_preflight");
+    eprintln!(
+        "[promtect] req {}: detector preflight failed closed",
+        &request_id[..8]
+    );
+    ctx.audit.record_blocked_request(request_id);
+    ctx.audit.record(
+        "request_rejected",
+        kind,
+        "«detector-preflight-rejected»",
+        request_id,
+    );
+    text_response(400, "promtect: request detector failed closed")
+}
+
+fn scan_task_failure_log_message(_: &tokio::task::JoinError) -> &'static str {
+    // JoinError's Display includes a panic payload when one is available. A
+    // downstream detector panic may have inspected request text, so never format
+    // either Display/Debug or extract the panic payload into logs.
+    SCAN_TASK_FAILURE_LOG_MESSAGE
+}
+
 /// Perform UTF-8 validation, detection, masking, and the residual scan away from
 /// Tokio's async workers. Detector regexes are synchronous and may inspect the
 /// complete configured body limit; running them on an async worker can prevent
@@ -292,15 +319,7 @@ fn prepare_body(body_bytes: Bytes, ctx: &Ctx, vault: &Vault, request_id: &str) -
     // immediately, before copying/masking the body or running Core and residual
     // detector passes. This is how a bounded Pro rulebook rejects excess work.
     if matches.iter().any(|hit| !match_is_maskable(text, hit)) {
-        return PreparedBody::Block(residual_block_response(
-            ctx,
-            request_id,
-            hit_count,
-            &kinds,
-            body_bytes.len(),
-            body_bytes.len(),
-            &matches,
-        ));
+        return PreparedBody::Block(preflight_block_response(ctx, request_id, &kinds));
     }
 
     let masked = mask_with_matches(text, matches, vault, &ctx.audit, request_id);
@@ -608,7 +627,7 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
         Err(error) => {
             // A blocking detector task can fail only if it panics or the runtime
             // shuts down. Either case fails closed and remains value-free.
-            eprintln!("promtect: request scanning task failed: {error}");
+            eprintln!("{}", scan_task_failure_log_message(&error));
             ctx.audit.record_blocked_request(&request_id);
             ctx.audit.record(
                 "request_blocked",
@@ -1056,6 +1075,59 @@ mod tests {
             !composed.iter().any(|hit| hit.kind == "aws_key"),
             "Core must not scan after a downstream detector fails closed"
         );
+    }
+
+    #[test]
+    fn unmaskable_extra_preflight_is_blocked_without_claiming_masked_traffic() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        let audit_path = std::env::temp_dir().join(format!(
+            "promtect-preflight-audit-{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
+        let extra: super::ExtraDetector = Arc::new(|_| {
+            vec![super::detect::Match::new(
+                "rulebook_scan_limit",
+                String::new(),
+                usize::MAX,
+                usize::MAX,
+            )]
+        });
+        let ctx = super::Ctx {
+            upstream: "http://127.0.0.1:1".to_owned(),
+            audit: Arc::new(crate::audit::Audit::to_file(audit_path.clone())),
+            client: reqwest::Client::new(),
+            max_body_bytes: super::DEFAULT_MAX_BODY_BYTES,
+            restore: true,
+            requests: Arc::new(AtomicU64::new(0)),
+            extra_detect: Some(extra),
+            output_scan: None,
+        };
+
+        let prepared = super::prepare_body(
+            bytes::Bytes::from_static(b"ordinary request body"),
+            &ctx,
+            &crate::vault::Vault::new(),
+            "preflight-request",
+        );
+        assert!(matches!(prepared, super::PreparedBody::Block(_)));
+
+        let audit = std::fs::read_to_string(&audit_path).unwrap();
+        let metrics = crate::metrics::aggregate(&audit_path);
+        std::fs::remove_file(&audit_path).ok();
+
+        assert!(audit.contains(r#""action":"request""#));
+        assert!(audit.contains(r#""masked":0"#));
+        assert!(audit.contains(r#""blocked":true"#));
+        assert!(audit.contains(r#""action":"request_rejected""#));
+        assert!(audit.contains(r#""detector":"rulebook_scan_limit""#));
+        assert_eq!(metrics.requests_total, 1);
+        assert_eq!(metrics.requests_clean, 0);
+        assert_eq!(metrics.requests_with_secrets, 0);
+        assert_eq!(metrics.requests_blocked_total, 1);
+        assert_eq!(metrics.recent[0].masked, 0);
+        assert!(metrics.recent[0].blocked);
     }
 
     #[tokio::test]
