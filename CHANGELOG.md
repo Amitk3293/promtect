@@ -8,7 +8,13 @@ and auto-generated notes also live on the
 
 ## [Unreleased]
 
+## [0.1.83] - 2026-09-08
+
 ### Added
+- Public launch: the Core repository and the Homebrew tap are now public.
+  `brew install Amitk3293/tap/promtect` is a supported install path.
+- Release artifacts are attested GitHub Releases with SHA-256 checksum
+  sidecars for all 4 build targets. See RELEASING.md for the release process.
 - New detectors: `xai_key` (xAI / Grok), `supabase_key` (Supabase secret keys and
   personal access tokens), `render_key` (Render), `fly_token` (Fly.io).
 - 21 more prefix-anchored detectors following GitHub secret-scanning's design:
@@ -122,7 +128,8 @@ First public release, renamed from Airlock to Promtect and relicensed Apache-2.0
   dashboard (`dashboard` subcommand).
 - Body-size cap, binary content-type guard, and SHA-pinned CI.
 
-[Unreleased]: https://github.com/amitk3293/promtect/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Amitk3293/promtect/compare/v0.1.83...HEAD
+[0.1.83]: https://github.com/Amitk3293/promtect/compare/v0.1.23...v0.1.83
 [0.1.2]: https://github.com/amitk3293/promtect/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/amitk3293/promtect/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/amitk3293/promtect/releases/tag/v0.1.0

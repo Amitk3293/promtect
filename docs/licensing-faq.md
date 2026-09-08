@@ -62,9 +62,8 @@ OEM terms.
 **Is this open source?**
 No, and we do not call it that. It is source-available and fair-code. OSI "open source" allows
 unrestricted commercial use, including reselling and hosting-as-a-service. The SUL does not.
-We chose this so the project can be public, readable, and free for real use after launch while
-remaining sustainable. During pre-launch the repository and distribution channels are
-intentionally private.
+We chose this so the project can be public, readable, and free for real use while
+remaining sustainable.
 
 **Which code is actually covered?**
 Only the source in this repository, and only on the `main` branch. Content on other branches

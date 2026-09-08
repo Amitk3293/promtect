@@ -2,8 +2,13 @@ name: release
 run-name: Core release candidate ${{ inputs.tag }}${{ inputs.publish && ' (publish)' || '' }}
 
 # A tag never publishes by itself. A manual candidate run builds and verifies all
-# four targets first. Publication is a separate, environment-gated job and the
-# Homebrew tap is deliberately not mutated by this workflow.
+# four targets first. Publication is a separate job that runs only when the
+# dispatcher opts in with `publish` and retypes the exact tag, because a solo
+# maintainer has no second reviewer to act as the authorization boundary. Every
+# artifact-integrity check still runs: the tag is pinned to the reviewed main
+# commit, re-fetched before publication, and the release set is verified against
+# its checksums both before and after upload. The Homebrew tap is deliberately
+# not mutated by this workflow.
 on:
   workflow_dispatch:
     inputs:
@@ -75,24 +80,6 @@ jobs:
           tag_oid="$(git rev-parse "refs/tags/${TAG}")"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "tag_oid=$tag_oid" >> "$GITHUB_OUTPUT"
-
-  release-controls:
-    if: inputs.publish
-    needs: validate
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ github.workflow_sha }}
-      - name: Fail closed unless release controls already exist
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
-          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
-          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
-          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
-        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
 
   readiness:
     needs: validate
@@ -183,26 +170,27 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 14
-      - name: Record candidate for the environment reviewer
+      # The maintainer inspects this candidate before dispatching the publishing
+      # run, so the digest has to be recorded where it can be compared later.
+      - name: Record the verified candidate
         env:
           CANDIDATE_DIGEST: ${{ steps.candidate.outputs.artifact-digest }}
         run: |
           {
-            echo "### Core candidate awaiting publication review"
+            echo "### Core candidate verified"
             echo
             echo "- Tag: \`$TAG\`"
             echo "- Source: \`${{ needs.validate.outputs.source_sha }}\`"
             echo "- Artifact: \`core-${TAG}-verified\`"
             echo "- Artifact digest: \`$CANDIDATE_DIGEST\`"
             echo
-            echo "Approve the core-release environment only after reviewing this artifact from this run."
+            echo "Inspect this artifact from this run before dispatching a publishing run."
           } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     if: inputs.publish
-    needs: [validate, verify, release-controls]
+    needs: [validate, verify]
     runs-on: ubuntu-latest
-    environment: core-release
     permissions:
       attestations: write
       contents: write
@@ -216,13 +204,6 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.source_sha }}
           fetch-depth: 0
-      - name: Recheck controls after environment approval
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
-          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
-          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
-          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
-        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
       - name: Require exact publication confirmation
         env:
           CONFIRMATION: ${{ inputs.publish_confirmation }}
@@ -232,7 +213,7 @@ jobs:
             || { echo "anonymous Core release requires a public repository" >&2; exit 1; }
           [ "$CONFIRMATION" = "publish $TAG" ] \
             || { echo "publication confirmation does not match tag" >&2; exit 1; }
-      - name: Revalidate reviewed tag after environment approval
+      - name: Revalidate reviewed tag immediately before publication
         run: bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:

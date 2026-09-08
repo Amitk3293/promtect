@@ -82,8 +82,9 @@ bind proxy/dashboard to a non-loopback address — off-loopback bind exits 1 wit
 - **Branch flow:** `feature/*` → PR → `staging` (integration, CI must be green) → PR → `main`
   (released) → tag `vX.Y.Z`. Never push `main` directly. See BRANCHING.md / RELEASING.md.
 - **Release:** an annotated, protected `main` tag does not publish by itself. Manually run
-  `release.yml`; its same-run candidate must pass environment review before GitHub Release
-  publication. GHCR and the Homebrew tap are separate reviewed flows. See RELEASING.md.
+  `release.yml`; publication needs an explicit `publish` input plus the exact typed
+  confirmation, and it verifies its own same-run candidate. GHCR and the Homebrew tap are
+  separate manual flows. See RELEASING.md.
 - CI (`.github/workflows/ci.yml`): fmt, clippy, test, smoke, cargo-audit on Linux + macOS.
 
 ## Reference docs
