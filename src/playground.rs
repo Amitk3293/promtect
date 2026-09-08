@@ -22,9 +22,11 @@ use crate::proxy::{self, Ctx};
 
 // Synthetic, non-functional credentials. Each matches a detector's format but
 // none is a real key: the AWS pair is AWS's own documented example value, and the
-// rest are invented. They exist only so the demo has something to mask.
+// rest are invented. They exist only so the demo has something to mask. The
+// Stripe value spells out what it is, so no reader can mistake it for a live
+// key or paste a vendor sample into a search box and land on real traffic.
 const AWS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
-const STRIPE_KEY: &str = "sk_live_4eC39HqLyjWDarjtT1zdp7dc";
+const STRIPE_KEY: &str = "sk_live_PLAYGROUND00TEST";
 const DB_PASSWORD: &str = "s3cr3t_pw_42";
 
 /// Records the exact body the mock upstream received, so the demo can show that

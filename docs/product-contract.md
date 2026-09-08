@@ -44,7 +44,10 @@ public kinds backed by 99 registry entries because a kind may need more than one
 bounded pattern. Both numbers are locked by the Core test suite.
 
 Validate the checked-out staging trees together from the workspace root. The
-validator checks Core claims plus Site display prices and checkout URL absence:
+validator checks that Core documents make no prohibited claim, that the Site
+still carries every price substitution token and still binds each one to the
+contract field it renders, and that the Site commits no Stripe purchase URL
+while checkout is disabled:
 
 ```sh
 docker run --rm -v "$PWD:/workspace:ro" python:3.13-alpine \

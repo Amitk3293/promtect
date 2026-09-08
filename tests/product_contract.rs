@@ -20,12 +20,14 @@ fn contract_locks_detector_count_and_prices() {
     assert_eq!(contract["pricing_usd"]["team"]["annual_per_developer"], 240);
     assert_eq!(contract["pricing_usd"]["checkout_enabled"], false);
 
-    // The public contract carries prices only. Stripe price identifiers live in
-    // Worker configuration, so the contract must never grow them back.
-    for tier in ["pro", "team"] {
+    // The Core repository is public. The contract carries prices only; Stripe
+    // identifiers and purchase destinations live in Worker configuration and
+    // must never reappear anywhere in this document (see #82).
+    let raw = include_str!("../PRODUCT-CONTRACT.json");
+    for marker in ["price_1", "plink_", "prod_", "acct_", "buy.stripe.com"] {
         assert!(
-            contract["pricing_usd"][tier]["price_ids"].is_null(),
-            "{tier} must not carry Stripe price identifiers"
+            !raw.contains(marker),
+            "PRODUCT-CONTRACT.json must not contain the Stripe marker {marker}"
         );
     }
 }

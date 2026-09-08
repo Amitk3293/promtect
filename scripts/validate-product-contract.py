@@ -18,20 +18,26 @@ def load_contract(core: Path) -> dict:
     return json.loads((core / "PRODUCT-CONTRACT.json").read_text())
 
 
+# The Site substitutes prices into its HTML at request time, so its deployable
+# source carries tokens, never price literals. Each pair is the visible copy the
+# token must still reach, and the binding that must still tie it to the contract.
+SITE_PRICE_COPY = (
+    ("$__PRO_MONTHLY__", '"__PRO_MONTHLY__": PRODUCT_CONTRACT.pricing_usd.pro.monthly_per_developer'),
+    ("$__PRO_ANNUAL__/yr", '"__PRO_ANNUAL__": PRODUCT_CONTRACT.pricing_usd.pro.annual_per_developer'),
+    ("$__TEAM_MONTHLY__", '"__TEAM_MONTHLY__": PRODUCT_CONTRACT.pricing_usd.team.monthly_per_developer'),
+    ("$__TEAM_ANNUAL__/dev-yr", '"__TEAM_ANNUAL__": PRODUCT_CONTRACT.pricing_usd.team.annual_per_developer'),
+    ("__TEAM_MIN_SEATS__ seats min", '"__TEAM_MIN_SEATS__": PRODUCT_CONTRACT.pricing_usd.team.minimum_seats'),
+)
+
+
 def validate_site(contract: dict, site: Path) -> None:
     source = (site / "worker.js").read_text()
-    pricing = contract["pricing_usd"]
-    required_copy = (
-        f'${pricing["pro"]["monthly_per_developer"]}',
-        f'${pricing["pro"]["annual_per_developer"]}/yr',
-        f'${pricing["team"]["monthly_per_developer"]}',
-        f'${pricing["team"]["annual_per_developer"]}/dev-yr',
-        f'{pricing["team"]["minimum_seats"]} seats min',
-    )
-    missing = [text for text in required_copy if text not in source]
+    missing = [text for pair in SITE_PRICE_COPY for text in pair if text not in source]
     if missing:
-        fail(f"Site pricing copy drifted from contract: missing {missing}")
-    if not pricing["checkout_enabled"] and "buy.stripe.com" in source:
+        fail(f"Site pricing copy drifted from the contract tokens: missing {missing}")
+    # Match a committed purchase URL, not the bare hostname: the Worker carries
+    # "buy.stripe.com" as the allow-list constant its catalog validation checks.
+    if not contract["pricing_usd"]["checkout_enabled"] and "https://buy.stripe.com/" in source:
         fail("checkout is disabled but Site still embeds a Stripe purchase URL")
 
 
