@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "2026-07-13",
+  "contract_version": "2026-09-08",
   "source_of_truth": "staging",
   "launch_user": "An individual developer using a supported AI CLI with a configurable provider base URL",
   "states": {
@@ -48,32 +48,12 @@
     "checkout_enabled": false,
     "pro": {
       "monthly_per_developer": 12,
-      "annual_per_developer": 96,
-      "price_ids": {
-        "live": {
-          "monthly": "price_1TmIfoQe7VTzhvan8QLAohMr",
-          "annual": "price_1TmIg8Qe7VTzhvanvcMmhgfl"
-        },
-        "staging": {
-          "monthly": "price_1Tm98jHT7We9h5JcmZLwg8t3",
-          "annual": "price_1Tm98yHT7We9h5JcqfkSIBr1"
-        }
-      }
+      "annual_per_developer": 96
     },
     "team": {
       "monthly_per_developer": 25,
       "annual_per_developer": 240,
-      "minimum_seats": 3,
-      "price_ids": {
-        "live": {
-          "monthly": "price_1TmIgLQe7VTzhvanL6ZIUdlh",
-          "annual": "price_1TmIgYQe7VTzhvanxjN2RacV"
-        },
-        "staging": {
-          "monthly": "price_1Tm992HT7We9h5Jc6tL8C3lM",
-          "annual": "price_1Tm99HHT7We9h5JcDc87cxrq"
-        }
-      }
+      "minimum_seats": 3
     },
     "enterprise": {"pricing": "contact sales"}
   },
