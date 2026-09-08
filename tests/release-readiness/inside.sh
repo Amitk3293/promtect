@@ -23,15 +23,18 @@ faq = Path("docs/faq.md").read_text(encoding="utf-8")
 licensing = Path("docs/licensing-faq.md").read_text(encoding="utf-8")
 assert "github/v/release" not in readme
 assert "install-brew" not in readme
-assert "Homebrew is therefore not a" in readme
-assert "supported acquisition path yet" in readme
-assert "# Launch path, not currently available: brew install" in readme
+# Launch-era wording: Homebrew is the primary public install path and no
+# pre-launch caveat survives in the public docs.
+assert "brew install Amitk3293/tap/promtect" in readme
+assert "Homebrew is therefore not a" not in readme
+assert "not currently available" not in readme
 assert "runtime-proven local Ollama path" in readme
 assert "guard claude                     # beta" in readme
 assert "guard codex                      # beta" in readme
-assert "after public launch, a Homebrew installation" in faq
-assert "During pre-launch the repository and distribution channels are" in licensing
-assert "intentionally private" in licensing
+assert "brew uninstall promtect" in faq
+assert "after public launch" not in faq
+assert "pre-launch" not in licensing
+assert "intentionally private" not in licensing
 PY
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"

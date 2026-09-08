@@ -8,7 +8,7 @@ and auto-generated notes also live on the
 
 ## [Unreleased]
 
-## [0.1.82] - 2026-09-08
+## [0.1.83] - 2026-09-08
 
 ### Added
 - Public launch: the Core repository and the Homebrew tap are now public.
@@ -128,8 +128,8 @@ First public release, renamed from Airlock to Promtect and relicensed Apache-2.0
   dashboard (`dashboard` subcommand).
 - Body-size cap, binary content-type guard, and SHA-pinned CI.
 
-[Unreleased]: https://github.com/Amitk3293/promtect/compare/v0.1.82...HEAD
-[0.1.82]: https://github.com/Amitk3293/promtect/compare/v0.1.23...v0.1.82
+[Unreleased]: https://github.com/Amitk3293/promtect/compare/v0.1.83...HEAD
+[0.1.83]: https://github.com/Amitk3293/promtect/compare/v0.1.23...v0.1.83
 [0.1.2]: https://github.com/amitk3293/promtect/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/amitk3293/promtect/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/amitk3293/promtect/releases/tag/v0.1.0

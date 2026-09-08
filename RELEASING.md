@@ -33,7 +33,7 @@ Before the first public release:
 
 Both publication workflows refuse to run unless they are dispatched from `main`,
 the dispatched workflow commit is the exact commit the tag points at, and the tag
-version matches `Cargo.toml`. The Core workflow additionally refuses to publish
+version matches `Cargo.toml`. Both workflows refuse to publish
 from a private repository. An older tag therefore cannot reuse newer release
 governance or execute its own older verifier scripts.
 
