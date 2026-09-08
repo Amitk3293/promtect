@@ -22,19 +22,20 @@ value-free.**
 
 <sub>Recorded with [`vhs`](https://github.com/charmbracelet/vhs) from [`docs/demo.tape`](docs/demo.tape), rebuild with `cargo build --release && vhs docs/demo.tape`.</sub>
 
-> **Pre-launch distribution status:** the Core repository, Homebrew tap, and
-> release artifacts are intentionally private. Homebrew is therefore not a
-> supported acquisition path yet; it becomes testable only when those assets
-> are deliberately made public at launch. Authorized evaluators can build the
-> reviewed `staging` source locally.
+```sh
+brew install Amitk3293/tap/promtect
+promtect --version
+promtect selftest
+```
+
+From source: `cargo install --path .` (from a clone of this repo).
 
 ```sh
-cargo install --path .                         # from an authorized source checkout
-# Launch path, not currently available: brew install Amitk3293/tap/promtect
-
 promtect guard ollama run qwen2.5:0.5b         # runtime-proven local guard path
 echo "ship it with $AWS_KEY" | promtect mask   # or just see what would get masked
 ```
+
+Releases are attested GitHub Releases with SHA-256 sidecars for all 4 targets: https://github.com/Amitk3293/promtect/releases
 
 ---
 
