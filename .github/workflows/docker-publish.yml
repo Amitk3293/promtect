@@ -82,32 +82,14 @@ jobs:
       - name: Test
         run: cargo test
 
-  release-controls:
-    needs: test
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          ref: ${{ github.workflow_sha }}
-      - name: Fail closed unless release controls already exist
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
-          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
-          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
-          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
-        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
-
   build-push:
     runs-on: ubuntu-latest
-    environment: core-container-release
     permissions:
       actions: read
       contents: read
       packages: write
     # Only publish after the test suite passes.
-    needs: [test, release-controls]
+    needs: test
     env:
       SOURCE_SHA: ${{ needs.test.outputs.source_sha }}
       TAG_OID: ${{ needs.test.outputs.tag_oid }}
@@ -116,14 +98,7 @@ jobs:
         with:
           ref: ${{ needs.test.outputs.source_sha }}
           fetch-depth: 0
-      - name: Recheck controls after environment approval
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_READINESS_TOKEN }}
-          PROMTECT_RELEASE_BYPASS_ACTORS: ${{ vars.RELEASE_BYPASS_ACTORS }}
-          PROMTECT_RELEASE_REVIEWERS: ${{ vars.RELEASE_REVIEWERS }}
-          PROMTECT_ADMIN_BYPASS_EVIDENCE_JSON: ${{ vars.RELEASE_ADMIN_BYPASS_EVIDENCE }}
-        run: bash scripts/check-release-controls.sh "$GITHUB_REPOSITORY"
-      - name: Revalidate reviewed tag after environment approval
+      - name: Revalidate reviewed tag immediately before publication
         run: bash scripts/verify-release-tag.sh "$TAG" "$SOURCE_SHA" "$TAG_OID"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0

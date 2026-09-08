@@ -8,71 +8,37 @@ release.
 
 ## Required repository controls
 
+Promtect Core is maintained by a single person, so there is no second reviewer
+and no environment approval in the release path. The authorization boundary is
+the manual dispatch itself: a run publishes only when the maintainer sets
+`publish` and retypes the exact tag. Everything that protects artifact integrity
+is still enforced by the workflows and still fails closed.
+
 Before the first public release:
 
 - Make the Core and Homebrew tap repositories anonymously readable. Promtect Pro
   remains private and must never be included in a Core artifact.
-- Configure the GitHub environments `core-release` and
-  `core-container-release` with required reviewers and a single custom
-  deployment-branch policy for `main`. `prevent_self_review` must be the exact
-  boolean `true`, and **Allow administrators to bypass configured protection
-  rules** must be disabled. The workflows also require exact typed confirmation;
-  environment protection is the human authorization boundary.
-- Configure two active repository rulesets for `refs/tags/v*`. The first must
-  restrict creation and list only the approved release operators as `always`
-  bypass actors. The second must restrict updates and deletion with **no bypass
-  actors**. GitHub bypass is ruleset-wide, so combining creation and immutability
-  would also let creation operators bypass update/deletion protection. The
-  workflows re-fetch and compare both the annotated tag object ID and commit
-  after every environment wait, but the separate rulesets are the preventive
-  controls.
-- Require the full staging suite and independent `/code-review` before promotion
-  to `main`. A staging-to-main promotion must contain no unreviewed changes.
+- Configure an active repository ruleset for `refs/tags/v*` that restricts tag
+  updates and deletion with **no bypass actors**. A published release must keep
+  pointing at the commit it was built from, and this is the preventive control
+  that guarantees it. The workflows also re-fetch and compare both the annotated
+  tag object ID and its target commit immediately before any release or package
+  mutation, but that is detection, not prevention.
+- Require the full staging suite and an independent `/code-review` before
+  promotion to `main`. A staging-to-main promotion must contain no unreviewed
+  changes.
 - Keep release tags annotated. Signed tags are preferred when the release
   operator has a configured signing identity; GitHub artifact attestations are
   mandatory for the four published archives.
-- Add a read-only fine-grained `RELEASE_READINESS_TOKEN` Actions secret that can
-  inspect environments and repository rulesets. Add repository variables
-  `RELEASE_REVIEWERS` and `RELEASE_BYPASS_ACTORS` containing
-  the exact approved tag-creation operator types and numeric IDs as comma-separated
-  `Type:id` entries (for example, `User:123` or `RepositoryRole:5`). The workflows
-  compare both fields so a same-number actor of another type cannot satisfy the
-  gate. They only issue GET requests with this token; control provisioning
-  remains a manual administrator action.
-- Record a fresh `RELEASE_ADMIN_BYPASS_EVIDENCE` repository variable when the
-  GitHub environment API does not expose an administrator-bypass field. The
-  compact JSON record must be valid for no more than 24 hours, be recorded by an
-  approved reviewer, bind both environment `updated_at` values, state that
-  administrator bypass is disabled, and reference a private screenshot or
-  recording plus its SHA-256:
 
-  ```json
-  {"schema_version":1,"repository":"Amitk3293/promtect","source":"github-environment-settings-ui","evidence_reference":"https://github.com/Amitk3293/promtect/issues/ISSUE#issuecomment-COMMENT","evidence_sha256":"64-lowercase-hex-characters","recorded_by_reviewer_type":"User","recorded_by_reviewer_id":123,"recorded_at":"2026-07-13T19:00:00Z","expires_at":"2026-07-13T20:00:00Z","environments":{"core-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"},"core-container-release":{"administrators_can_bypass":false,"updated_at":"API-updated-at"}}}
-  ```
+Both publication workflows refuse to run unless they are dispatched from `main`,
+the dispatched workflow commit is the exact commit the tag points at, and the tag
+version matches `Cargo.toml`. The Core workflow additionally refuses to publish
+from a private repository. An older tag therefore cannot reuse newer release
+governance or execute its own older verifier scripts.
 
-Both publication workflows verify the required API-visible controls described
-above before a protected environment is referenced, so a missing environment
-cannot be silently
-auto-created as the authorization boundary. They verify the same state again
-immediately after approval and before any release or package mutation. A future
-API administrator-bypass field must be the exact boolean `false`; any other
-value fails closed. When that field is absent, the workflow validates the fresh
-manual record above against the current API timestamps.
-
-This record is manual launch-gate evidence, not automatic proof of the UI
-setting. GitHub documents that administrators can bypass environment rules by
-default and that an environment can disable that bypass, but the REST OpenAPI
-schema retrieved on 2026-07-13 exposes `prevent_self_review` and does not expose
-the administrator-bypass setting. The evidence expiry and `updated_at` binding
-limit staleness; an approved human must still inspect the referenced capture.
-See [Deployments and environments](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments),
-[Reviewing deployments](https://docs.github.com/en/actions/managing-workflow-runs/reviewing-deployments),
-and the [official REST description](https://github.com/github/rest-api-description).
-Missing credentials, controls, exact actors, evidence, or a main-only deployment
-policy fails closed.
-
-Until those controls and anonymous-read checks are green, run candidate builds
-with `publish=false` only.
+Until the anonymous-read checks are green, run candidate builds with
+`publish=false` only.
 
 ## 1. Verify the staging candidate in Docker
 
@@ -144,16 +110,16 @@ promoted across workflow runs. To publish, dispatch a new workflow run with:
 - `publish`: `true`;
 - `publish_confirmation`: `publish vX.Y.Z`.
 
-That run builds and verifies its own candidate before the protected `core-release`
-job becomes eligible for approval. The reviewer must download
-`core-vX.Y.Z-verified` from that same run, compare its artifact digest with the
-verification job summary, inspect the archives, sidecars, embedded source SHA,
-and formula, and only then approve the environment. Reject the job if the
-candidate is not acceptable; never approve based on an artifact from another
-run. Core release runs are serialized across tags so an older version cannot
-finish after a newer version and move GitHub's `latest` marker backwards.
+That run builds and verifies its own candidate before the publish job starts;
+artifacts are never promoted across runs. Because nobody else approves the run,
+do the candidate inspection first: from the earlier `publish=false` run, download
+`core-vX.Y.Z-verified`, compare its artifact digest with the verification job
+summary, and inspect the archives, sidecars, embedded source SHA, and formula.
+Dispatch the publishing run only once that candidate is acceptable. Core release
+runs are serialized across tags so an older version cannot finish after a newer
+version and move GitHub's `latest` marker backwards.
 
-After approval, the job checks out the already validated commit, re-fetches the
+The publish job checks out the already validated commit, re-fetches the
 remote annotated tag, and requires both its tag object ID and target commit to
 remain unchanged. It downloads and reverifies the same-run artifact and creates
 GitHub build-provenance attestations. An existing unpublished draft may have its
@@ -197,9 +163,9 @@ Docker environment before merging the formula. Finally repeat
 
 The GHCR image is not part of the Homebrew release and is never triggered by a
 tag. Dispatch `.github/workflows/docker-publish.yml` separately **from the
-`main` workflow ref** with the same tag and `publish container vX.Y.Z`; approve
-the `core-container-release` environment only when container distribution is
-intentionally in scope. The job checks out the exact pre-approval commit and
+`main` workflow ref** with the same tag and `publish container vX.Y.Z`. Dispatch
+it only when container distribution is intentionally in scope; the typed
+confirmation is the whole gate. The job checks out the exact validated commit and
 rejects a changed remote tag.
 
 The build first pushes content by digest without a customer-facing tag. Only
@@ -212,7 +178,7 @@ requires both the package API and direct registry reads for all three tags to
 resolve to the pushed digest. Missing or deleted provenance fails closed rather
 than guessing from flattened tag history.
 
-Before the first customer-facing tag write, the protected job stores the chosen
+Before the first customer-facing tag write, the publish job stores the chosen
 digest, tag, and exact source SHA in an immutable 90-day workflow artifact. A
 retry selects the oldest unexpired record bound to that `main` source and reuses
 its digest even when a fresh rebuild has another digest. An absent alias is
