@@ -20,17 +20,15 @@ fn contract_locks_detector_count_and_prices() {
     assert_eq!(contract["pricing_usd"]["team"]["annual_per_developer"], 240);
     assert_eq!(contract["pricing_usd"]["checkout_enabled"], false);
 
-    let mut price_ids = std::collections::HashSet::new();
-    for tier in ["pro", "team"] {
-        for environment in ["live", "staging"] {
-            for period in ["monthly", "annual"] {
-                let price_id = contract["pricing_usd"][tier]["price_ids"][environment][period]
-                    .as_str()
-                    .expect("price id must be a string");
-                assert!(price_id.starts_with("price_"));
-                assert!(price_ids.insert(price_id), "duplicate price id {price_id}");
-            }
-        }
+    // The Core repository is public. The contract carries prices only; Stripe
+    // identifiers and purchase destinations live in Worker configuration and
+    // must never reappear anywhere in this document (see #82).
+    let raw = include_str!("../PRODUCT-CONTRACT.json");
+    for marker in ["price_1", "plink_", "prod_", "acct_", "buy.stripe.com"] {
+        assert!(
+            !raw.contains(marker),
+            "PRODUCT-CONTRACT.json must not contain the Stripe marker {marker}"
+        );
     }
 }
 
