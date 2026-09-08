@@ -34,20 +34,23 @@ documentation, and release validation then adopt that contract. A feature moves
 to `available` only after its customer delivery path and Docker runtime journey
 are both evidenced.
 
+The contract carries prices, never Stripe identifiers. Price, Payment Link, and
+product IDs are deployment configuration and live only in the Worker
+environments that need them, so this public file stays free of billing-account
+detail. Core tests fail if a `price_ids` block reappears.
+
 The public detector count means unique detector kinds. Staging currently has 96
 public kinds backed by 99 registry entries because a kind may need more than one
 bounded pattern. Both numbers are locked by the Core test suite.
 
 Validate the checked-out staging trees together from the workspace root. The
-validator checks Core claims, Site display prices and checkout URL absence, plus
-the Worker's production and staging Stripe price maps:
+validator checks Core claims plus Site display prices and checkout URL absence:
 
 ```sh
 docker run --rm -v "$PWD:/workspace:ro" python:3.13-alpine \
   python /workspace/promtect/scripts/validate-product-contract.py \
   --core /workspace/promtect \
-  --site /workspace/promtect-site \
-  --worker /workspace/promtect-license-worker
+  --site /workspace/promtect-site
 ```
 
 Run it against isolated worktree paths when validating an unmerged change. The

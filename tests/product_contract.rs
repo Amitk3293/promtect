@@ -20,17 +20,13 @@ fn contract_locks_detector_count_and_prices() {
     assert_eq!(contract["pricing_usd"]["team"]["annual_per_developer"], 240);
     assert_eq!(contract["pricing_usd"]["checkout_enabled"], false);
 
-    let mut price_ids = std::collections::HashSet::new();
+    // The public contract carries prices only. Stripe price identifiers live in
+    // Worker configuration, so the contract must never grow them back.
     for tier in ["pro", "team"] {
-        for environment in ["live", "staging"] {
-            for period in ["monthly", "annual"] {
-                let price_id = contract["pricing_usd"][tier]["price_ids"][environment][period]
-                    .as_str()
-                    .expect("price id must be a string");
-                assert!(price_id.starts_with("price_"));
-                assert!(price_ids.insert(price_id), "duplicate price id {price_id}");
-            }
-        }
+        assert!(
+            contract["pricing_usd"][tier]["price_ids"].is_null(),
+            "{tier} must not carry Stripe price identifiers"
+        );
     }
 }
 
