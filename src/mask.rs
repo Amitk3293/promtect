@@ -12,8 +12,8 @@ pub fn mask_text(text: &str, vault: &Vault, audit: &Audit, request_id: &str) -> 
 }
 
 /// Mask `text` using an externally supplied match list — the core detectors plus
-/// any extra detection passes a downstream binary (`promtect-pro`) adds. This is
-/// the composition seam: a Pro build runs `detect()`, appends its own
+/// any extra detection passes a downstream closed build adds. This is
+/// the composition seam: that build runs `detect()`, appends its own
 /// `Match::new(..)` values, and masks the merged list here.
 ///
 /// Unlike [`detect`], a merged list may be unsorted and may contain OVERLAPPING
@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(restored, original);
     }
 
-    /// Composition seam: a downstream binary (promtect-pro) runs the core
+    /// Composition seam: a downstream closed build runs the core
     /// detectors AND its own extra passes, building matches via `Match::new`,
     /// then masks the merged list through `mask_with_matches`. Masking the
     /// merged list must round-trip byte-for-byte.

@@ -163,7 +163,7 @@ async fn auth_header_forwarded_untouched() {
 }
 
 /// End-to-end output scan: a secret the model places in the RESPONSE (never in the
-/// request) is flagged by the Pro response scan through the real proxy app —
+/// request) is flagged by the injected response scan through the real proxy app —
 /// recorded value-free in the audit log, with the response bytes left unchanged.
 #[tokio::test]
 async fn output_scan_flags_model_secret_in_live_response() {

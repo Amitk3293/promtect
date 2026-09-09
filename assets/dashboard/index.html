@@ -96,7 +96,7 @@
     --leak-400: #ea6850;
     --leak-500: #df4a31;
 
-    /* Pro (violet) — paid-class detectors */
+    /* Violet accent for extended detector kinds */
     --pro-300: #b69cff;
     --pro-400: #9a78f0;
     --pro-500: #8159e6;
@@ -275,8 +275,6 @@
     border: 1px solid var(--border-subtle);
   }
   .al-detector__mark { width: 7px; height: 7px; border-radius: 2px; background: var(--caught-400); flex: none; }
-  .al-detector--pro { color: var(--pro); border-color: var(--pro-border); }
-  .al-detector--pro .al-detector__mark { background: var(--pro-400); }
 
   /* ---- Card: numbered, hairline, hover-lift ---- */
   .al-card {
@@ -460,7 +458,6 @@
   .al-headline .al-metric { flex: 1; min-width: 0; }
 
   .al-grid { display: grid; grid-template-columns: 1.5fr 1fr; gap: var(--space-4); margin-bottom: var(--space-5); }
-  .al-grid--license { grid-template-columns: 1fr 1fr; gap: var(--space-4); margin-bottom: var(--space-5); }
 
   /* ---- Panel ---- */
   .al-panel { padding: var(--space-6); }
@@ -491,18 +488,9 @@
   .al-detrow { display: grid; grid-template-columns: 142px 1fr 52px; align-items: center; gap: var(--space-4); }
   .al-detrow__track { height: 7px; background: var(--surface-inset); border-radius: var(--radius-pill); overflow: hidden; }
   .al-detrow__fill { height: 100%; background: linear-gradient(90deg, var(--seal-600), var(--seal-400)); border-radius: var(--radius-pill); transition: width var(--dur-slow) var(--ease-out); }
-  .al-detrow--pro .al-detrow__fill { background: linear-gradient(90deg, var(--pro-500), var(--pro-300)); }
   .al-detrow__count { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--text-body); text-align: right; }
 
   /* ---- License panel ---- */
-  .al-license { display: flex; flex-direction: column; gap: var(--space-5); }
-  .al-license__tier { display: flex; align-items: baseline; gap: var(--space-3); }
-  .al-license__tiername { font-family: var(--font-mono); font-size: var(--text-xl); letter-spacing: -0.01em; color: var(--text-strong); font-weight: var(--weight-medium); }
-  .al-license__rows { display: flex; flex-direction: column; gap: var(--space-3); }
-  .al-license__row { display: flex; align-items: center; justify-content: space-between; gap: var(--space-4); padding: var(--space-3) 0; border-top: 1px solid var(--border-subtle); }
-  .al-license__row:first-child { border-top: none; }
-  .al-license__k { font-family: var(--font-mono); font-size: var(--text-xs); letter-spacing: var(--tracking-caps); text-transform: uppercase; color: var(--text-muted); }
-  .al-license__v { font-family: var(--font-mono); font-size: var(--text-sm); color: var(--text-body); }
 
   /* ---- Table ---- */
   .al-tablewrap { width: 100%; overflow-x: auto; overscroll-behavior-inline: contain; }
@@ -537,7 +525,7 @@
      ============================================================ */
   @media (max-width: 980px) {
     .al-headline { grid-template-columns: 1fr; }
-    .al-grid, .al-grid--license { grid-template-columns: 1fr; }
+    .al-grid { grid-template-columns: 1fr; }
     .al-endpoints { grid-template-columns: 1fr; }
     .al-pipeline__flow { grid-template-columns: 1fr; gap: var(--space-3); }
     .al-wire { width: 2px; height: 28px; min-width: 0; margin: 0 auto; }
@@ -657,20 +645,6 @@
     }
     function rid8(id) { return (id || "").replace(/-/g, "").slice(0, 8) || "--------"; }
 
-    // ---- Pro-class detector heuristic -----------------------------------------
-    // The free core masks provider credentials (kinds ending in _key/_token/_pat/
-    // _secret, e.g. aws_key, github_token). The paid promtect-pro crate adds a
-    // DIFFERENT CLASS of detector: entropy-based and PII/PHI. We do NOT hardcode
-    // the free list — instead we recognise the small, stable set of Pro-class kind
-    // names. If any Pro-class kind appears in the live audit, Pro is "active".
-    // (/api/metrics has no explicit license field today; presence is the signal.)
-    var PRO_KINDS = {
-      entropy: 1, email: 1, credit_card: 1, ssn: 1, phone: 1, ipv4: 1, ipv6: 1,
-      iban: 1, swift: 1, us_passport: 1, dob: 1, mrn: 1, npi: 1, dea: 1,
-      ip_address: 1, jwt_pii: 1, pii: 1, phi: 1
-    };
-    function isProKind(kind) { return Object.prototype.hasOwnProperty.call(PRO_KINDS, String(kind)); }
-
     // ---- reusable component builders ------------------------------------------
     function Badge(opts) {
       var tone = opts.tone || "neutral";
@@ -681,8 +655,7 @@
       return node;
     }
     function DetectorTag(kind) {
-      var pro = isProKind(kind);
-      return el("span", { class: "al-detector" + (pro ? " al-detector--pro" : ""), title: pro ? "Pro-class detector" : null }, [
+      return el("span", { class: "al-detector" }, [
         el("span", { class: "al-detector__mark" }),
         kind
       ]);
@@ -887,7 +860,7 @@
     }
 
     // ===========================================================================
-    //  DETECTORS — horizontal bars by kind, sorted desc (Pro kinds tinted violet)
+    //  DETECTORS — horizontal bars by kind, sorted desc (extended kinds tinted violet)
     // ===========================================================================
     function Detectors(d) {
       var top = d.byDetector.slice(0, 8);
@@ -902,7 +875,7 @@
       } else {
         var max = top.reduce(function (a, x) { return Math.max(a, x.count); }, 1);
         body = el("div", { class: "al-detlist" }, top.map(function (row) {
-          return el("div", { class: "al-detrow" + (row.pro ? " al-detrow--pro" : "") }, [
+          return el("div", { class: "al-detrow" }, [
             DetectorTag(row.kind),
             el("div", { class: "al-detrow__track" }, [
               el("div", { class: "al-detrow__fill", style: "width: " + (row.count / max) * 100 + "%" })
@@ -915,41 +888,6 @@
     }
 
     // ===========================================================================
-    //  LICENSE — Pro / license status driven by Pro-class kind presence
-    // ===========================================================================
-    function License(d) {
-      var active = d.pro.active;
-      var head = panelHead("License · detector tier",
-        active ? "Pro detectors active" : "Free core active",
-        Badge({ tone: active ? "pro" : "neutral", dot: true, label: active ? "pro" : "free" }));
-
-      var tier = el("div", { class: "al-license__tier" }, [
-        el("span", { class: "al-license__tiername" }, active ? "Promtect Pro" : "Promtect Free"),
-        Badge({ tone: active ? "pro" : "clear", staticDot: true, dot: true, label: active ? "entropy · PII/PHI" : "known detectors" })
-      ]);
-
-      var rows = el("div", { class: "al-license__rows" }, [
-        row("Free-core kinds", fmt(d.pro.freeKinds) + " active"),
-        row("Pro-class kinds", active ? fmt(d.pro.proKinds) + " active" : "none observed"),
-        row("Status", active ? "Pro-class detectors firing" : "Inferred from audit")
-      ]);
-
-      var note = el("p", { class: "al-note", style: "margin-top: var(--space-2)" },
-        active
-          ? "Pro-class detectors (entropy, PII/PHI) have masked secrets in this log. The tier is inferred from the kinds present in the value-free audit feed."
-          : "Only known free-core detectors have fired. Pro adds a different class — entropy and PII/PHI. The tier is inferred from kind presence; the metrics feed exposes no license value.");
-
-      function row(k, v) {
-        return el("div", { class: "al-license__row" }, [
-          el("span", { class: "al-license__k" }, k),
-          el("span", { class: "al-license__v" }, v)
-        ]);
-      }
-
-      return Card({ className: "al-panel", index: "06" }, [head, el("div", { class: "al-license" }, [tier, rows, note])]);
-    }
-
-    // ===========================================================================
     //  BYTES — real bytes_in / bytes_out totals
     // ===========================================================================
     function Bytes(d) {
@@ -959,7 +897,7 @@
         Card({ index: "in" }, [MetricStat({ label: "Bytes in", value: bytes(d.bytesIn), tone: "accent", foot: fmt(d.bytesIn) + " B before masking" })]),
         Card({ index: "out" }, [MetricStat({ label: "Bytes out", value: bytes(d.bytesOut), foot: fmt(d.bytesOut) + " B after masking" })])
       ]);
-      return Card({ className: "al-panel", index: "07" }, [head, body]);
+      return Card({ className: "al-panel", index: "06" }, [head, body]);
     }
 
     // ===========================================================================
@@ -1006,7 +944,7 @@
           ]);
         });
       }
-      return Card({ className: "al-panel", index: "08" }, [head,
+      return Card({ className: "al-panel", index: "07" }, [head,
         el("div", { class: "al-tablewrap", tabindex: "0", "aria-label": "Recent requests table" },
           el("table", { class: "al-table" }, [thead, el("tbody", null, rows)]))]);
     }
@@ -1076,7 +1014,7 @@
 
     // ===========================================================================
     //  DATA — map the live /api/metrics payload into the render model.
-    //  Identical field reads to the previous version, plus a Pro-tier inference
+    //  Identical field reads to the previous version, plus a detector-tier inference
     //  derived purely from which detector kinds are present (no new API field).
     // ===========================================================================
     function buildModel(m) {
@@ -1087,13 +1025,8 @@
       var byDetObj = m.by_detector || {};
 
       var byDetector = Object.keys(byDetObj)
-        .map(function (k) { return { kind: k, count: Number(byDetObj[k]) || 0, pro: isProKind(k) }; })
+        .map(function (k) { return { kind: k, count: Number(byDetObj[k]) || 0 }; })
         .sort(function (a, b) { return b.count - a.count; });
-
-      // Pro-tier inference: count free-core vs Pro-class kinds among those that
-      // actually fired. Any Pro-class kind present => Pro is active.
-      var proKinds = 0, freeKinds = 0;
-      byDetector.forEach(function (x) { if (x.pro) proKinds += 1; else freeKinds += 1; });
 
       var recent = (Array.isArray(m.recent) ? m.recent : []).map(function (r) {
         return {
@@ -1131,8 +1064,7 @@
         recent: recent,
         bytesIn: Number(m.bytes_in_total) || 0,
         bytesOut: Number(m.bytes_out_total) || 0,
-        restoreOn: m.restore_enabled === true,
-        pro: { active: proKinds > 0, proKinds: proKinds, freeKinds: freeKinds }
+        restoreOn: m.restore_enabled === true
       };
     }
 
@@ -1197,7 +1129,7 @@
         } else {
           main.appendChild(el("div", { class: "al-stack" }, Headline(d)));
           main.appendChild(el("div", { class: "al-grid al-rise", style: "animation-delay: 120ms" }, [Timeline(d), Detectors(d)]));
-          main.appendChild(el("div", { class: "al-grid--license al-rise", style: "animation-delay: 160ms" }, [License(d), Bytes(d)]));
+          main.appendChild(el("div", { class: "al-stack al-rise", style: "animation-delay: 160ms" }, Bytes(d)));
           main.appendChild(el("div", { class: "al-rise", style: "animation-delay: 200ms" }, Recent(d)));
         }
       } else {

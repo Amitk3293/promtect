@@ -8,8 +8,8 @@ ever disagree, the LICENSE text wins. This is not legal advice.
 
 Promtect's core is **source-available**, not "open source" in the OSI sense. You can read it,
 run it, change it, and self-host it for your own work, for free, forever. What you cannot do
-is sell it, or run it as a paid service for other people. The valuable paid detectors are a
-separate product under a separate commercial license and are not in this repository.
+is sell it, or run it as a paid service for other people. Paid detector classes are
+distributed separately under a commercial license and are not in this repository.
 
 ## What you CAN do (no permission, no payment)
 
@@ -46,8 +46,8 @@ derivative works, subject to the same limitations above. So you can fork it and 
 your team. You cannot take that fork and sell it, or run it as a paid service for others.
 
 **Can my company use it without paying?**
-Yes. Internal business use is free. Paying is only for the closed Pro detectors (a separate
-product), not for the core.
+Yes. Internal business use is free. Paying only applies to the paid detector classes
+distributed separately under a commercial license, not to the core.
 
 **Can a consultant use Promtect while doing paid client work?**
 Using the tool to do your job is internal business use and is fine. What is not allowed is
@@ -67,10 +67,8 @@ remaining sustainable.
 
 **Which code is actually covered?**
 Only the source in this repository, and only on the `main` branch. Content on other branches
-is not licensed. The paid Pro detectors (entropy and generic-secret detection, personal and
-payment-data detection, response scanning, tool and skill scanning, fleet policy, enterprise
-integrations) are not in this repository and are licensed separately. See
-[COMMERCIAL.md](../COMMERCIAL.md).
+is not licensed. Paid detector classes are distributed separately under a commercial
+license and are not in this repository.
 
 **Can I get different terms?**
 Yes. If the SUL does not fit your use case, we offer commercial licensing. Email

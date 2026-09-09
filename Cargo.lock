@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "promtect"
-version = "0.1.85"
+version = "0.1.87"
 dependencies = [
  "axum",
  "bytes",

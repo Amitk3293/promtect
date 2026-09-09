@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 
-/// A response-side detection pass, injected by `promtect-pro` (license-gated):
+/// A response-side detection pass, injected by a downstream closed build:
 /// it scans the restored response text for secrets the model echoed back or
 /// generated itself (which were never in the request, so the request-side mask
 /// never saw them). `None` in the public core.
@@ -84,7 +84,7 @@ pub struct StreamRestorer {
     /// Sentinels already written to the audit log, so each is recorded exactly
     /// once across the whole stream rather than once per chunk it appears in.
     audited: HashSet<String>,
-    /// Optional response-side detection pass (Pro, license-gated). `None` leaves
+    /// Optional response-side detection pass. `None` leaves
     /// the restorer byte-for-byte identical to the public core.
     scanner: Option<ResponseScanner>,
     /// Trailing window of already-restored text, prepended to the next chunk so a
@@ -123,7 +123,7 @@ impl StreamRestorer {
         }
     }
 
-    /// Attach an optional response-side output scanner (Pro). `None` is a no-op,
+    /// Attach an optional response-side output scanner. `None` is a no-op,
     /// keeping the public core's behavior unchanged. Builder style so existing
     /// call sites and tests that don't scan stay untouched.
     #[must_use]

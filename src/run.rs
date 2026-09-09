@@ -9,7 +9,7 @@
 //! off-loopback bind, bind the listener, auto-start the dashboard, and run
 //! `axum::serve` with graceful shutdown.
 //!
-//! It is exposed so a downstream binary (`promtect-pro`) can run the exact same
+//! It is exposed so a downstream closed build can run the exact same
 //! proxy while injecting an extra detection pass. The public core calls it with
 //! `extra_detect = None`, which is byte-for-behavior identical to the previous
 //! inlined startup.
@@ -102,7 +102,7 @@ pub async fn run_proxy(
     // falsey → strict mode (secrets never re-enter the response).
     let restore = proxy::parse_restore(std::env::var("PROMTECT_RESTORE").ok().as_deref());
 
-    // The output scan runs whenever a scanner is supplied (Pro, entitled), unless
+    // The output scan runs whenever a scanner is supplied, unless
     // the operator disables it. PROMTECT_OUTPUT_SCAN shares the default-on /
     // explicit-falsey convention of PROMTECT_RESTORE. The public core supplies no
     // scanner, so this is a no-op there regardless of the variable.
