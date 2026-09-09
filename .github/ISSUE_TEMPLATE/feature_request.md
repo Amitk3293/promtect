@@ -15,5 +15,5 @@ labels: enhancement
 <!-- Other approaches, workarounds, or related tools. -->
 
 **Scope check**
-<!-- Is this a free/OSS feature (known-format detection, proxy behaviour, DX) or
-a paid-tier capability (compliance, fleet, entropy, response scanning)? -->
+<!-- Does this belong in the local single-user proxy, or in an integration
+guide? -->

@@ -23,7 +23,7 @@ pub struct Match {
 
 impl Match {
     /// Build a match for an externally-detected secret. Used by downstream
-    /// composition (`promtect-pro`) that runs extra detection passes on top of
+    /// composition (a downstream closed build) that runs extra detection passes on top of
     /// the core and feeds the merged list to [`crate::mask::mask_with_matches`].
     ///
     /// `value` must equal `text[start..end]`, and `start`/`end` must be byte
@@ -1005,7 +1005,7 @@ mod tests {
         assert_eq!(&openrouter[hits[0].start..hits[0].end], openrouter);
     }
 
-    /// The OSS registry ships broad coverage of known credential formats.
+    /// The public registry ships broad coverage of known credential formats.
     #[test]
     fn registry_has_expected_breadth() {
         let contract: serde_json::Value =

@@ -20,7 +20,7 @@ static VALUE_FREE_PANIC_HOOK: Once = Once::new();
 /// hook, and ignores stderr write failures to avoid a second panic while unwinding.
 ///
 /// This changes global process behavior. Library embedders should not call it;
-/// the Core and Pro entrypoints own the process and install it at startup.
+/// every binary entrypoint owns the process and installs it at startup.
 ///
 /// # Panics
 ///

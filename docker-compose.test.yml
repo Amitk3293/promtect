@@ -1,4 +1,4 @@
-# Dockerized test harness (Pro buildout #1b).
+# Dockerized test harness.
 #
 # WHY: the project mandates Docker-only build/test (nothing on the host), and
 # GitHub Actions is at its CI limit this week, so this compose file is the gate:

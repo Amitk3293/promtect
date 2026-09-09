@@ -1,35 +1,46 @@
 use serde_json::Value;
 
+const RAW: &str = include_str!("../PRODUCT-CONTRACT.json");
+
 fn contract() -> Value {
-    serde_json::from_str(include_str!("../PRODUCT-CONTRACT.json"))
-        .expect("PRODUCT-CONTRACT.json must be valid JSON")
+    serde_json::from_str(RAW).expect("PRODUCT-CONTRACT.json must be valid JSON")
 }
 
 #[test]
-fn contract_locks_detector_count_and_prices() {
+fn contract_locks_detector_count_and_publishes_core_only() {
     let contract = contract();
 
+    assert_eq!(contract["schema_version"], 2);
     assert_eq!(contract["editions"]["core"]["detector_count"], 96);
     assert_eq!(
         contract["editions"]["core"]["detector_registry_entries"],
         99
     );
-    assert_eq!(contract["pricing_usd"]["pro"]["monthly_per_developer"], 12);
-    assert_eq!(contract["pricing_usd"]["pro"]["annual_per_developer"], 96);
-    assert_eq!(contract["pricing_usd"]["team"]["monthly_per_developer"], 25);
-    assert_eq!(contract["pricing_usd"]["team"]["annual_per_developer"], 240);
-    assert_eq!(contract["pricing_usd"]["checkout_enabled"], false);
 
-    // The Core repository is public. The contract carries prices only; Stripe
-    // identifiers and purchase destinations live in Worker configuration and
-    // must never reappear anywhere in this document (see #82).
-    let raw = include_str!("../PRODUCT-CONTRACT.json");
-    for marker in ["price_1", "plink_", "prod_", "acct_", "buy.stripe.com"] {
+    // The Core repository is public. Schema 2 publishes no prices and no
+    // commerce identifiers; those live outside this repository. Paid edition
+    // names are locked out separately, by the exact-keys assertion in
+    // `every_edition_and_capability_uses_a_public_status`.
+    for marker in [
+        "price_",
+        "plink_",
+        "prod_",
+        "acct_",
+        "buy.stripe.com",
+        "pricing_usd",
+    ] {
         assert!(
-            !raw.contains(marker),
-            "PRODUCT-CONTRACT.json must not contain the Stripe marker {marker}"
+            !RAW.contains(marker),
+            "PRODUCT-CONTRACT.json must not contain the commerce marker {marker}"
         );
     }
+    // A bare `$` is legitimate inside prose; a price is `$` next to a digit.
+    assert!(
+        !RAW.chars()
+            .zip(RAW.chars().skip(1))
+            .any(|(a, b)| a == '$' && b.is_ascii_digit()),
+        "PRODUCT-CONTRACT.json must not contain a price literal"
+    );
 }
 
 #[test]
@@ -53,7 +64,8 @@ fn every_edition_and_capability_uses_a_public_status() {
         editions.keys().map(String::as_str).collect();
     assert_eq!(
         edition_names,
-        std::collections::BTreeSet::from(["core", "enterprise", "pro", "team"])
+        std::collections::BTreeSet::from(["core"]),
+        "the public contract must describe the Core edition and no other"
     );
 
     for (edition, value) in editions {

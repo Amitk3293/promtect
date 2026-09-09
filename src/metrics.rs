@@ -45,9 +45,9 @@ pub struct Metrics {
     pub bytes_out_total: u64,
     /// Most-recent request summaries, value-free, newest first (capped at 20).
     pub recent: Vec<RecentRequest>,
-    /// Total secrets the Pro output scan flagged in responses — ones the model
+    /// Total secrets the output scan flagged in responses — ones the model
     /// echoed back or generated, which were never in the request. Stays `0` unless
-    /// the Pro response output scan ran (the public core emits no such events).
+    /// a response output scan ran (the public core emits no such events).
     pub output_secrets_total: u64,
     /// Per-detector counts of output-scan findings (same kind names as
     /// [`Metrics::by_detector`], e.g. `"aws_key" -> 2`).
@@ -69,7 +69,7 @@ pub struct RecentRequest {
     pub blocked: bool,
     /// Number of distinct sentinels restored in this response.
     pub restored: u64,
-    /// Number of response-side secrets reported by the paid output scanner.
+    /// Number of response-side secrets reported by a response-side output scanner.
     pub output_secrets: u64,
     /// Number of value-free failure events associated with this request.
     pub failures: u64,
@@ -303,7 +303,7 @@ pub fn try_aggregate(audit_path: &std::path::Path) -> std::io::Result<Metrics> {
                         increment_detector(&mut m.by_detector, det);
                     }
                 }
-                // Pro output scan: a secret found in the RESPONSE (model-echoed or
+                // Output scan: a secret found in the RESPONSE (model-echoed or
                 // generated). Same value-free shape as a mask event; counted into its
                 // own totals so the dashboard can distinguish inbound-reply leaks from
                 // outbound request masking.
@@ -489,7 +489,7 @@ impl Metrics {
             None,
         );
 
-        // Pro output scan: secrets found in the RESPONSE (model-echoed/generated).
+        // Output scan: secrets found in the RESPONSE (model-echoed/generated).
         push_counter(
             &mut out,
             "promtect_output_secrets_total",

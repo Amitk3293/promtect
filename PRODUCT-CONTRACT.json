@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "contract_version": "2026-09-08",
+  "schema_version": 2,
+  "contract_version": "2026-09-09",
   "source_of_truth": "staging",
   "launch_user": "An individual developer using a supported AI CLI with a configurable provider base URL",
   "states": {
@@ -12,7 +12,10 @@
     "core_license": "Sustainable Use License",
     "core_license_abbreviation": "SUL",
     "core_distribution": "source-available fair-code",
-    "forbidden_core_distribution_terms": ["open source", "open-source"]
+    "forbidden_core_distribution_terms": [
+      "open source",
+      "open-source"
+    ]
   },
   "protection_scope": {
     "protected_input": "Recognized detector matches in supported, uncompressed UTF-8 request bodies routed through Promtect",
@@ -44,19 +47,6 @@
       "open source"
     ]
   },
-  "pricing_usd": {
-    "checkout_enabled": false,
-    "pro": {
-      "monthly_per_developer": 12,
-      "annual_per_developer": 96
-    },
-    "team": {
-      "monthly_per_developer": 25,
-      "annual_per_developer": 240,
-      "minimum_seats": 3
-    },
-    "enterprise": {"pricing": "contact sales"}
-  },
   "editions": {
     "core": {
       "availability": "beta",
@@ -64,47 +54,46 @@
       "detector_count_definition": "Unique public detector kinds",
       "detector_registry_entries": 99,
       "capabilities": [
-        {"id": "known_format_detection", "state": "available"},
-        {"id": "request_masking", "state": "available"},
-        {"id": "streaming_restoration", "state": "available"},
-        {"id": "strict_mode", "state": "available"},
-        {"id": "value_free_audit", "state": "beta"},
-        {"id": "local_dashboard", "state": "beta"},
-        {"id": "ollama_guard", "state": "available"},
-        {"id": "claude_guard", "state": "beta"},
-        {"id": "codex_guard", "state": "beta"},
-        {"id": "cursor_and_other_static_integrations", "state": "beta"}
-      ]
-    },
-    "pro": {
-      "availability": "beta",
-      "capabilities": [
-        {"id": "entropy_detection", "state": "beta"},
-        {"id": "pii_phi_payment_detection", "state": "beta"},
-        {"id": "skills_mcp_static_scan", "state": "beta"},
-        {"id": "response_output_scan", "state": "beta"}
-      ]
-    },
-    "team": {
-      "availability": "planned",
-      "capabilities": [
-        {"id": "shared_rulebook", "state": "beta"},
-        {"id": "shared_policy", "state": "beta"},
-        {"id": "roles_invitations_and_seats", "state": "beta"},
-        {"id": "team_siem_delivery", "state": "beta"},
-        {"id": "central_dashboard", "state": "planned"}
-      ]
-    },
-    "enterprise": {
-      "availability": "planned",
-      "capabilities": [
-        {"id": "explicit_offline_license", "state": "beta"},
-        {"id": "sso_saml", "state": "planned"},
-        {"id": "fleet_ui", "state": "planned"},
-        {"id": "central_audit_ui", "state": "planned"},
-        {"id": "air_gap_distribution", "state": "planned"},
-        {"id": "compliance_mapping", "state": "planned"},
-        {"id": "contractual_sla", "state": "planned"}
+        {
+          "id": "known_format_detection",
+          "state": "available"
+        },
+        {
+          "id": "request_masking",
+          "state": "available"
+        },
+        {
+          "id": "streaming_restoration",
+          "state": "available"
+        },
+        {
+          "id": "strict_mode",
+          "state": "available"
+        },
+        {
+          "id": "value_free_audit",
+          "state": "beta"
+        },
+        {
+          "id": "local_dashboard",
+          "state": "beta"
+        },
+        {
+          "id": "ollama_guard",
+          "state": "available"
+        },
+        {
+          "id": "claude_guard",
+          "state": "beta"
+        },
+        {
+          "id": "codex_guard",
+          "state": "beta"
+        },
+        {
+          "id": "cursor_and_other_static_integrations",
+          "state": "beta"
+        }
       ]
     }
   }
