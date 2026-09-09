@@ -2281,7 +2281,7 @@ fn is_stale_stub(url: &str) -> bool {
 }
 
 /// Print a value-free end-of-session summary for a guard run: how many secrets it
-/// masked outbound, and how many the Pro output scan caught in the model's replies.
+/// masked outbound, and how many the output scan caught in the model's replies.
 /// Counts come from this guard's process-local audit instance, so concurrent
 /// guards sharing a JSONL path cannot contaminate one another's summaries.
 fn print_guard_summary(stats: &crate::audit::AuditSessionStats) {

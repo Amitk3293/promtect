@@ -10,8 +10,8 @@ Public availability is governed by [`PRODUCT-CONTRACT.json`](PRODUCT-CONTRACT.js
 96 known-format detector kinds, mask + restore, strict mode, the value-free audit log
 and dashboard — is licensed under the Sustainable Use License (fair-code,
 source-available), free to use, modify, and self-host, and always will be. Paid
-work is a *different class*
-of detection and team tooling built on top, never a paywall around what's here.
+work is a *different class* of detection built on top, never a paywall around
+what's here.
 
 ## Shipped (v0.1)
 
@@ -35,19 +35,9 @@ of detection and team tooling built on top, never a paywall around what's here.
   require a local CA. Tracked, deliberately not done yet — see
   [integrations/vscode-copilot.md](docs/integrations/vscode-copilot.md).
 
-## Paid extensions (open-core, separate)
+## Beyond the core
 
-Promtect follows a source-available core model: the core is free; commercial extensions
-target needs that don't belong in a local single-user tool. These are **not** in
-this repo and don't phone home from it. Current product state:
+A deeper detection layer is in the works. It is distributed separately under a
+commercial license, is not in this repo, and does not phone home from it.
 
-- **Pro beta** — entropy, PII/PHI/payment, Skills/MCP static scan, and response
-  scanning are implemented but not generally available.
-- **Team planned** — shared policy, rulebooks, roles, seats, and SIEM have beta
-  components but no launch-ready operational product.
-- **Enterprise planned** — offline licensing has beta components. SSO/SAML,
-  fleet UI, central audit, air-gap distribution, compliance mapping, and a
-  contractual SLA are not shipped.
-
-If one of these is the only thing standing between you and adopting Promtect,
-say so in an issue — it helps prioritize.
+Missing something from the free core? Say so in an issue, it helps prioritize.

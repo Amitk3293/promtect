@@ -29,8 +29,7 @@ streamed reply so the answer stays useful.
 ## What Promtect does NOT protect (by design, today)
 
 - **Unknown-format / high-entropy secrets.** Detection is pattern-based. A custom or
-  internal token with no recognizable prefix is **not** caught. (Entropy-based
-  detection is a planned, separate capability.)
+  internal token with no recognizable prefix is **not** caught.
 - **The model's response is not scanned for secrets.** Restore only re-inserts
   sentinels minted for *this* request; a secret the model itself emits is not detected.
 - **Encoded and non-text body content.** Promtect scans raw request bytes only when the
@@ -46,10 +45,9 @@ streamed reply so the answer stays useful.
 - **Auth headers.** The API key in `Authorization` / `x-api-key` is forwarded
   verbatim, never masked, that is the tool's own credential to the provider, and
   masking it would break auth.
-- **Response surfaces outside restored text.** Response output scanning is a paid,
-  observe-only capability and runs only on textual, uncompressed responses while
-  transparent restoration is enabled. Strict mode, binary responses, and compressed
-  responses stream without response scanning or mutation.
+- **Response surfaces outside restored text.** This build scans nothing on the way
+  back. Restoration only re-inserts sentinels this request minted, and strict mode,
+  binary responses, and compressed responses stream without any mutation at all.
 
 ## Trust assumptions
 

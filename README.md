@@ -115,11 +115,10 @@ Audit aggregation is bounded and runs off the async request path. If the local
 dashboard is already at its aggregation limit or a scan fails, `/api/metrics`
 and `/metrics` return `503` explicitly instead of showing a false all-clear.
 
-The same counts are exposed for Prometheus at `/metrics`, including
-`promtect_output_secrets_total` for anything the Pro output scan caught in a
-model's reply. And `promtect guard` prints a one-line session summary when your
-tool exits — how many secrets it masked this session and by which detectors — so
-you get the signal without it cluttering the tool while you work.
+The same counts are exposed for Prometheus at `/metrics`. And `promtect guard`
+prints a one-line session summary when your tool exits, how many secrets it
+masked this session and by which detectors, so you get the signal without it
+cluttering the tool while you work.
 
 ![Promtect's local dashboard: secrets masked, per-detector breakdown, clean rate, and recent value-free request summaries](docs/dashboard.png)
 
@@ -374,8 +373,6 @@ See [TESTING.md](TESTING.md), [CONTRIBUTING.md](CONTRIBUTING.md), and
 - **[Detector reference](docs/detectors.md)** — every detector, by provider, with the current count.
 - **[Architecture](docs/architecture.md)** — how a request flows through detect → vault → mask → streaming restore.
 - **[Integrations](docs/integrations/README.md)** — Claude Code, Cursor, Codex, Ollama, OpenRouter, chaining.
-- **[Pro overview](docs/pro.md)** — what the paid layer adds and how it composes with the core.
-- **[Pricing & editions](COMMERCIAL.md)** — Free, Pro, Team, Enterprise.
 - **[Threat model](THREAT-MODEL.md)** · **[Roadmap](ROADMAP.md)** · **[Security policy](SECURITY.md)**
 
 Full index: **[docs/](docs/README.md)**.
@@ -395,10 +392,8 @@ internal business, personal, and non-commercial use. You can read, run, modify, 
 self-host it. You cannot resell it or run it as a paid service for others. Full terms
 in [LICENSE](LICENSE).
 
-Pro is the beta paid layer for entropy, PII/PHI/payment, Skills/MCP static scan,
-and response scan components. It is not available for purchase until artifact,
-activation, fulfillment, and recovery gates pass. See
-[COMMERCIAL.md](COMMERCIAL.md).
+A deeper detection layer is in the works. It will be distributed separately
+under a commercial license. Everything in this repo stays free.
 
 "Promtect" is a trademark of AK DevOps Solutions SL. See [TRADEMARK.md](TRADEMARK.md).
 

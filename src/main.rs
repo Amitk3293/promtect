@@ -209,7 +209,7 @@ async fn main() {
 
     // ── default: the proxy + dashboard ──────────────────────────────────────
     // The startup itself lives in promtect::run::run_proxy so a downstream binary
-    // (promtect-pro) can run the exact same proxy with an injected extra detector.
+    // (a downstream closed build) can run the exact same proxy with an injected extra detector.
     // The public core passes `None`, which is behavior-identical to the previous
     // inlined startup. run_proxy returns the exit code rather than exiting itself.
     let no_dashboard = args.iter().any(|a| a == "--no-dashboard");

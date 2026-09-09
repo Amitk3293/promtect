@@ -16,8 +16,8 @@ is still enforced by the workflows and still fails closed.
 
 Before the first public release:
 
-- Make the Core and Homebrew tap repositories anonymously readable. Promtect Pro
-  remains private and must never be included in a Core artifact.
+- Make the Core and Homebrew tap repositories anonymously readable. The closed
+  detector crate stays private and must never be included in a Core artifact.
 - Configure an active repository ruleset for `refs/tags/v*` that restricts tag
   updates and deletion with **no bypass actors**. A published release must keep
   pointing at the commit it was built from, and this is the preventive control

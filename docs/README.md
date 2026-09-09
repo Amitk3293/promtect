@@ -21,12 +21,11 @@ Promtect telemetry or hosted control-plane dependency. Start here.
 - **[Architecture](architecture.md)** — the per-request mask, forward, and restore pipeline.
 - **[Threat model](../THREAT-MODEL.md)** — what Promtect protects, and what it does not.
 
-## Pro & commercial
+## Licensing
 
-- **[Pro overview](pro.md)** — the paid detection layer and how it composes with the free core.
-- **[Pricing & editions](../COMMERCIAL.md)** — Free, Pro, Team, Enterprise.
-- **[Canonical product contract](product-contract.md)** — versioned prices,
-  availability states, terminology, and bounded claims.
+- **[Licensing FAQ](licensing-faq.md)** — the Sustainable Use License in plain language.
+- **[Canonical product contract](product-contract.md)** — versioned availability
+  states, terminology, and bounded claims.
 
 ## Project
 

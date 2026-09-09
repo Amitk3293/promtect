@@ -72,8 +72,8 @@ fn text_response(status: u16, msg: impl Into<String>) -> Response {
 /// An extra detection pass composed on top of the core detectors at mask time.
 ///
 /// The public core always leaves this `None` and never depends on anything that
-/// sets it. A downstream build (`promtect-pro`) sets it to merge its own
-/// detectors (entropy, PII/PCI) into the SAME mask / restore / value-free-audit
+/// sets it. A downstream closed build sets it to merge its own extra
+/// detectors into the SAME mask / restore / value-free-audit
 /// path. It is a leak-only seam: it can ADD matches, never remove the core's.
 pub type ExtraDetector = Arc<dyn Fn(&str) -> Vec<crate::detect::Match> + Send + Sync>;
 
@@ -116,10 +116,10 @@ pub struct Ctx {
     /// masking) — a tripwire worth warning about.
     pub requests: Arc<std::sync::atomic::AtomicU64>,
     /// Optional extra detection pass (see [`ExtraDetector`]). `None` in the public
-    /// core; set by `promtect-pro` to compose its detectors into masking.
+    /// core; set by a downstream closed build to compose its detectors into masking.
     pub extra_detect: Option<ExtraDetector>,
     /// Optional response-side output scan (see [`crate::stream::ResponseScanner`]).
-    /// `None` in the public core; set by `promtect-pro` to flag secrets the model
+    /// `None` in the public core; set by a downstream closed build to flag secrets the model
     /// echoes back or generates. Observe-only — never alters the response bytes.
     pub output_scan: Option<crate::stream::ResponseScanner>,
 }
@@ -150,7 +150,7 @@ fn match_is_maskable(text: &str, hit: &detect::Match) -> bool {
             .is_some_and(|value| value == hit.value.as_str())
 }
 
-/// Extra (Pro) detectors run before the Core detector set so a bounded
+/// Extra detectors run before the Core detector set so a bounded
 /// downstream pass can reject work before Core scans the complete body. A
 /// malformed extra hit is a fail-closed control result: return it immediately
 /// and let the request path block without running Core. Valid extra matches are
@@ -317,7 +317,7 @@ fn prepare_body(body_bytes: Bytes, ctx: &Ctx, vault: &Vault, request_id: &str) -
 
     // Invalid downstream spans are fail-closed control results. Block them
     // immediately, before copying/masking the body or running Core and residual
-    // detector passes. This is how a bounded Pro rulebook rejects excess work.
+    // detector passes. This is how a bounded extra rulebook rejects excess work.
     if matches.iter().any(|hit| !match_is_maskable(text, hit)) {
         return PreparedBody::Block(preflight_block_response(ctx, request_id, &kinds));
     }
@@ -1027,8 +1027,8 @@ mod tests {
     }
 
     /// The composition seam: `compose_matches` returns exactly the core's detect()
-    /// output when there is no extra pass, and merges an extra (Pro) pass on top
-    /// when one is set. This is how the proxy injects promtect-pro's detectors.
+    /// output when there is no extra pass, and merges an extra pass on top
+    /// when one is set. This is how the proxy injects a closed build's detectors.
     #[test]
     fn compose_matches_merges_extra_pass() {
         let text = "key AKIAIOSFODNN7EXAMPLE and CUSTOMSECRET here";

@@ -4,11 +4,8 @@ Promtect is open-core software.
 
 - All source code in this repository is licensed under the "Sustainable Use
   License" as defined below. The Licensor is AK DevOps Solutions SL.
-- Paid Promtect features (the "Pro" detector classes such as entropy/generic
-  detection, PII/PHI/PCI compliance detection and LLM response scanning, plus
-  fleet policy and enterprise integrations) are NOT part of this repository.
-  They are distributed separately under a proprietary commercial license. See
-  COMMERCIAL.md.
+- Paid Promtect detector classes are NOT part of this repository. They are
+  distributed separately under a proprietary commercial license.
 - Content of branches other than the main branch (i.e. "main") is not licensed.
 - All third-party components incorporated into the Promtect software are licensed
   under the original license provided by the owner of the applicable component.

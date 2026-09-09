@@ -62,9 +62,9 @@ Use the issue templates. For security vulnerabilities, follow
 ## Contributor License Agreement
 
 Promtect is open-core: the core ships under the Sustainable Use License (see
-[LICENSE](LICENSE)) and AK DevOps Solutions SL also offers paid editions under a
-separate commercial license (see [COMMERCIAL.md](COMMERCIAL.md)). For that model to
-work, the maintainer must be able to license every contribution under both.
+[LICENSE](LICENSE)) and AK DevOps Solutions SL also distributes paid detector
+classes separately under a commercial license. For that model to work, the
+maintainer must be able to license every contribution under both.
 
 By submitting a contribution (a pull request, a patch, or any other work) you:
 

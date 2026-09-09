@@ -7,8 +7,8 @@ Promtect: a local-first security proxy (Rust, Axum). It sits on loopback, masks 
 (API keys, DB passwords, JWTs, PEM keys — 96 detectors) in outbound AI-tool requests
 before they reach a provider (Anthropic/OpenAI/Ollama/OpenRouter), then restores them in
 the streamed response. No root CA, no cloud, no telemetry. Free core is under the
-Sustainable Use License (fair-code, source-available);
-`../promtect-pro` is a separate crate for paid detectors (entropy/PII-PHI/output-scan).
+Sustainable Use License (fair-code, source-available). A separate closed crate carries
+the paid detector classes and is never built into this repo's artifacts.
 
 ## Commands
 Run from the crate root (this dir). Toolchain pinned via `rust-toolchain.toml`.
@@ -68,8 +68,9 @@ high-context detectors.
 ## Config (env vars)
 `PROMTECT_PORT`(8790) · `PROMTECT_MODE`(anthropic|openai|ollama|openrouter) ·
 `PROMTECT_UPSTREAM`(explicit URL, overrides mode) · `PROMTECT_RESTORE`(true; `false`=strict,
-secrets never reinserted) · `PROMTECT_OUTPUT_SCAN`(true; `false`=disabled; gates the
-Pro response output scan, no-op in core) · `PROMTECT_BLOCK_RISKY`(false) · `PROMTECT_BIND`(127.0.0.1) ·
+secrets never reinserted) · `PROMTECT_OUTPUT_SCAN`(true; `false`=disabled; gates an
+optional response-side scanner, no-op in this build) · `PROMTECT_BLOCK_RISKY`(false) ·
+`PROMTECT_BIND`(127.0.0.1) ·
 `PROMTECT_AUDIT`(promtect-audit.jsonl) · `PROMTECT_MAX_BODY_BYTES`(33554432) ·
 `PROMTECT_DASHBOARD_PORT`(8799) · `PROMTECT_READ_TIMEOUT`(120s; per-chunk inter-read
 timeout, safe for long SSE streams) · `PROMTECT_ALLOW_PUBLIC_BIND`(false; set truthy to
